@@ -62,11 +62,13 @@ def int4_child_names(quant_config: dict, *, component: str | None = None) -> set
     return set(_ALL_PROJ) - keep
 
 
-def pack_int4_projections_inplace(decoder, int4_children: set[str], *, attn_num_cores: int, group_size: int = 32) -> int:
+def pack_int4_projections_inplace(decoder, int4_children: set[str], *, attn_num_cores: int,
+                                  group_size: int = 32, mlp_num_cores: int = 8) -> int:
     """Pack selected [N,K] projections to N32K32 physical storage in place.
 
     Other projections use their normal swizzle. Packed INT4 is identified by
     an explicit N32K32 marker; NVFP4 retains its distinct packed marker.
+    NVFP4 MLP projections stripe over ``mlp_num_cores`` lanes; INT4 keeps TP8.
     Returns the number of newly packed projections.
     """
     if type(group_size) is not int or group_size not in (32, 64, 128):
@@ -86,7 +88,7 @@ def pack_int4_projections_inplace(decoder, int4_children: set[str], *, attn_num_
                         continue
                     from rpu_backend.quant.nvfp4_pack import swizzle_pack_nvfp4_v2
                     scale = module.weight_scale
-                    cores = attn_num_cores if proj_name in _ATTN else 8
+                    cores = attn_num_cores if proj_name in _ATTN else mlp_num_cores
                     packed, packed_scale = swizzle_pack_nvfp4_v2(
                         w.detach().cpu(), scale.detach().cpu(), _PROJ_PARTITION[proj_name], cores)
                     module.weight = nn.Parameter(packed.to(w.device), requires_grad=False)

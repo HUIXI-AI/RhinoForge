@@ -34,6 +34,7 @@ from rpu_backend.runtime.control import rpu_env_bool
 from rpu_backend.runtime._native_retirement import _InstalledNativeResource
 from rpu_backend.runtime.topology import (
     execution_core_count, resolve_decoder_topology, decoder_mlp_intermediate_size,
+    decoder_packed_w4_mlp_intermediate_size, decoder_nvfp4_mlp_intermediate_size,
     require_same_decoder_topology, validate_decoder_cache_topology,
 )
 from rpu_backend.runtime.execution_planner import (
@@ -1697,6 +1698,10 @@ def _validate_decoder_w4_scale_lists(model, scale_lists, topology, *, audio_comp
         from rpu_backend.api._execution import qwen3_vl_text_core_profile, qwen3_vl_text_topology
         profile = qwen3_vl_text_core_profile(model.config, topology.num_cores)
         expected_topology = qwen3_vl_text_topology(model.config, topology.num_cores, packed_w4=True)
+    elif audio_component is None and getattr(model.config, "model_type", None) == "llama":
+        from rpu_backend.api._execution import llama_dense_quant_profile
+        profile = llama_dense_quant_profile(model.config)
+        expected_topology = resolve_decoder_topology(num_cores=topology.num_cores, **profile.geometry())
     elif audio_component is None:
         profile = qwen3_dense_quant_profile(model.config)
         expected_topology = qwen3_w4_topology(model.config, topology.num_cores)
@@ -1737,22 +1742,45 @@ def _validate_decoder_w4_scale_lists(model, scale_lists, topology, *, audio_comp
                 raise ValueError(f"packed Qwen3 layer {index} {role} requires its actual UINT8/G32 payload")
 
 
-def _validate_asr_nvfp4_payload(model, scale_lists, tensor_scales, topology):
-    from rpu_backend.api._qwen3_audio_precision import asr_decoder_profile
-
-    profile = asr_decoder_profile(model.config)
-    if (topology != resolve_decoder_topology(num_cores=topology.num_cores, **profile.geometry())
+def _validate_nvfp4_payload(model, scale_lists, tensor_scales, topology, *, arch="qwen3", audio_component=None):
+    """Bind the reviewed ASR, dense Qwen3, Llama-3.2-1B or Qwen3-VL text NVFP4 payload to its exact geometry."""
+    if audio_component == "asr":
+        from rpu_backend.api._qwen3_audio_precision import asr_decoder_profile
+        label, profile = "ASR NVFP4", asr_decoder_profile(model.config)
+    elif arch == "qwen3_vl_text":
+        from rpu_backend.api._execution import qwen3_vl_text_core_profile
+        label = "Qwen3-VL text NVFP4"
+        profile = qwen3_vl_text_core_profile(model.config, topology.num_cores if topology is not None else 8)
+        if profile is None:
+            raise ValueError(f"{label} requires its exact text profile")
+    elif arch == "llama":
+        from rpu_backend.api._execution import llama_dense_quant_profile
+        label, profile = "Llama text NVFP4", llama_dense_quant_profile(model.config)
+    else:
+        from rpu_backend.quant.qwen3_profiles import qwen3_dense_quant_profile
+        label, profile = "Qwen3 text NVFP4", qwen3_dense_quant_profile(model.config)
+    expected_topology = None
+    # The ordinary Qwen3-VL 8-core install carries no bound topology.
+    if topology is not None:
+        expected_topology = resolve_decoder_topology(num_cores=topology.num_cores, **profile.geometry())
+    if (topology != expected_topology
             or len(model.layers) != profile.num_layers
             or scale_lists is None or len(scale_lists) != 7
             or len(tensor_scales) != 7):
-        raise ValueError("ASR NVFP4 requires seven complete component scale families")
+        raise ValueError(f"{label} requires seven complete component scale families")
+    # A six-lane NVFP4 MLP uses the 384-aligned physical width (zero
+    # rows/columns); four and eight lanes and aligned widths stay logical.
     h, i = profile.hidden_size, profile.intermediate_size
-    roles = (("self_attn.q_proj", 2048, h), ("self_attn.k_proj", 1024, h),
-             ("self_attn.v_proj", 1024, h), ("self_attn.o_proj", h, 2048),
+    if topology is not None:
+        i = decoder_nvfp4_mlp_intermediate_size(i, topology.mlp_tp)
+    q, kv = profile.num_q_heads * profile.head_dim, profile.num_kv_heads * profile.head_dim
+    roles = (("self_attn.q_proj", q, h), ("self_attn.k_proj", kv, h),
+             ("self_attn.v_proj", kv, h), ("self_attn.o_proj", h, q),
              ("mlp.gate_proj", i, h), ("mlp.up_proj", i, h), ("mlp.down_proj", h, i))
+    table_size = (profile.num_layers + 7) // 8 * 8
     for (role, n, k), scales, tensor_scale in zip(roles, scale_lists, tensor_scales, strict=True):
         if len(scales) != profile.num_layers:
-            raise ValueError("ASR NVFP4 requires one block scale per decoder layer")
+            raise ValueError(f"{label} requires one block scale per decoder layer")
         for layer, scale in zip(model.layers, scales, strict=True):
             projection = layer.get_submodule(role)
             weight = projection.weight
@@ -1763,11 +1791,11 @@ def _validate_asr_nvfp4_payload(model, scale_lists, tensor_scales, topology):
                     or scale is not getattr(projection, "weight_scale", None)
                     or scale.dtype != torch.uint8 or tuple(scale.shape) != (k // 16, n)
                     or scale.device != weight.device or not scale.is_contiguous()):
-                raise ValueError(f"ASR NVFP4 {role} requires its actual packed weight and FP8 scales")
+                raise ValueError(f"{label} {role} requires its actual packed weight and FP8 scales")
         if (not isinstance(tensor_scale, torch.Tensor) or tensor_scale.dtype != torch.float32
-                or tuple(tensor_scale.shape) != (32,) or not tensor_scale.is_contiguous()
+                or tuple(tensor_scale.shape) != (table_size,) or not tensor_scale.is_contiguous()
                 or tensor_scale.device != weight.device):
-            raise ValueError("ASR NVFP4 requires a padded FP32 tensor-scale owner per projection")
+            raise ValueError(f"{label} requires a padded FP32 tensor-scale owner per projection")
 
 
 def _validate_mrope_decoder_topology(
@@ -1786,9 +1814,12 @@ def _validate_mrope_decoder_topology(
         raise ValueError("reduced-core M-RoPE requires the exact Qwen3-VL text profile")
     profile = qwen3_vl_text_core_profile(config, topology.num_cores)
     bound_profile = qwen3_vl_text_core_profile(model.config, topology.num_cores)
-    packed_w4 = (bool(model.layers)
+    # NVFP4 also stores uint8 weights, padded like packed W4, with its own payload validator.
+    nvfp4 = (bool(scale_lists) and bool(scale_lists[0])
+             and scale_lists[0][0].dtype == torch.uint8)
+    packed_w4 = (bool(model.layers) and not nvfp4
                  and model.layers[0].self_attn.q_proj.weight.dtype == torch.uint8)
-    w8a16 = scale_lists is not None and not packed_w4
+    w8a16 = scale_lists is not None and not packed_w4 and not nvfp4
     if profile != bound_profile or len(model.layers) != profile.num_layers:
         raise ValueError("reduced-core M-RoPE requires all layers of its exact dense profile")
     if packed_w4:
@@ -1807,7 +1838,9 @@ def _validate_mrope_decoder_topology(
                        for item in value)):
             raise ValueError(f"reduced-core Qwen3-VL requires {label} {list(expected)}")
     hidden = profile.hidden_size
-    intermediate = decoder_mlp_intermediate_size(profile.intermediate_size, topology.mlp_tp)
+    intermediate = (decoder_packed_w4_mlp_intermediate_size if packed_w4 else
+                    decoder_nvfp4_mlp_intermediate_size if nvfp4 else
+                    decoder_mlp_intermediate_size)(profile.intermediate_size, topology.mlp_tp)
     shapes = {
         "q_proj": (profile.num_q_heads * profile.head_dim, hidden),
         "k_proj": (profile.num_kv_heads * profile.head_dim, hidden),
@@ -1816,7 +1849,7 @@ def _validate_mrope_decoder_topology(
         "gate_proj": (intermediate, hidden), "up_proj": (intermediate, hidden),
         "down_proj": (hidden, intermediate),
     }
-    projection_dtype = torch.uint8 if packed_w4 else torch.int8 if w8a16 else torch.float16
+    projection_dtype = torch.uint8 if packed_w4 or nvfp4 else torch.int8 if w8a16 else torch.float16
     for index, layer in enumerate(model.layers):
         for owner, names in (
             (layer.self_attn, ("q_proj", "k_proj", "v_proj", "o_proj")),
@@ -1830,6 +1863,8 @@ def _validate_mrope_decoder_topology(
                     cores = topology.mlp_tp if name in ("gate_proj", "up_proj", "down_proj") else topology.attn_tp
                     partition = int(name not in ("o_proj", "down_proj"))
                     storage_shape = w4_storage_shape(n, k, partition, cores)
+                elif nvfp4:
+                    storage_shape = (n, k // 2)
                 else:
                     storage_shape = (n, k)
                 if (projection.weight.dtype != projection_dtype
@@ -1858,6 +1893,7 @@ def install_mrope_text_decoder_for_rpu(
     deepstack_lang_layers: list[int] | None = None,
     enable_deepstack: bool = True,
     scale_lists=None,
+    nvfp4_tensor_scales=None,
     execution_config=None,
     topology=None,
     logical_vocab_size=None,
@@ -1897,10 +1933,11 @@ def install_mrope_text_decoder_for_rpu(
             projection. When provided, the decoder's 7 projection weights must
             already be int8 (swizzled dwidth=1) and the install routes to
             `causal_decoder_set_weights_w8a16`. None → fp16 (default).
-
-        topology: cold decoder ownership. Reduced budgets require the complete
-            FP16 Qwen3-VL 2B/4B/8B profile, M-RoPE [24,20,20], and DeepStack
-            consumers [0,1,2].
+        nvfp4_tensor_scales: the seven padded FP32 tables of an on-install NVFP4
+            text decoder; `scale_lists` then holds its uint8 block scales.
+        topology: cold decoder ownership supplied by the adapter. Reduced
+            budgets require the complete FP16 Qwen3-VL 2B/4B/8B profile with
+            M-RoPE [24,20,20] and DeepStack consumers [0,1,2].
 
     Returns the C++ handle (also stashed at `text_model._rpu_decoder_handle`).
     """
@@ -2010,6 +2047,7 @@ def install_mrope_text_decoder_for_rpu(
             _kv_capacity=kv_capacity,
             deepstack_lang_layers=ds_layers,
             scale_lists=scale_lists,
+            nvfp4_tensor_scales=nvfp4_tensor_scales,
             chunk_envelope_for=chunk_envelope_for,
             execution_config=execution_config,
             topology=topology,
@@ -2195,8 +2233,19 @@ def _install_causal_decoder_forward(
     if execution_config is None and arch != "qwen3_vl_text":
         execution_config = getattr(model, "_rpu_execution", None)
     execution_config = dict(execution_config or {})
-    if nvfp4_tensor_scales is not None and _audio_component != "asr":
-        raise ValueError("explicit NVFP4 installer payload is restricted to the reviewed ASR component")
+    prefill_w8a8 = execution_config.get("prefill", {}).get("linear_w8a8", False)
+    if type(prefill_w8a8) is not bool:
+        raise ValueError("prefill.linear_w8a8 must be a boolean")
+    if prefill_w8a8 and (arch != "qwen3" or _audio_component is not None
+                        or scale_lists is None or nvfp4_tensor_scales is not None):
+        raise ValueError("Prefill W8A8 is restricted to the exact plain W8 Qwen3 installer")
+    if nvfp4_tensor_scales is not None and not (
+            (arch == "qwen3_vl_text" and _audio_component is None)
+            or (topology is not None and (
+                _audio_component == "asr"
+                or (arch in ("qwen3", "llama") and _audio_component is None)))):
+        raise ValueError("explicit NVFP4 installer payload is restricted to the reviewed ASR, "
+                         "dense Qwen3, Llama-3.2-1B and Qwen3-VL text components with a bound topology")
     if _audio_component is not None:
         from rpu_backend.api._qwen3_audio_precision import asr_decoder_profile
         if (_audio_component != "asr" or arch != "qwen3" or topology is None
@@ -2217,17 +2266,18 @@ def _install_causal_decoder_forward(
                 deepstack_lang_layers=deepstack_lang_layers, scale_lists=scale_lists,
             )
         elif arch == "llama":
-            # Exact FP16 Llama-3.2-1B: no scales and no Q/K norm tensors.
+            # Exact Llama-3.2-1B without Q/K norm tensors. FP16 has no scales;
+            # the on-install W8A16 / G32 W4A16 / NVFP4 payloads are validated
+            # with the bound topology below.
             from rpu_backend.api._execution import llama_core_profile
             profile = llama_core_profile(model.config, topology.num_cores)
-            if (len(model.layers) != profile.num_layers or scale_lists is not None
-                    or qk_norm_lists is not None):
-                raise ValueError(f"reduced-core Llama install requires all {profile.num_layers} FP16 layers without Q/K norms")
+            if len(model.layers) != profile.num_layers or qk_norm_lists is not None:
+                raise ValueError(f"reduced-core Llama install requires all {profile.num_layers} layers without Q/K norms")
             if resolve_decoder_topology(num_cores=topology.num_cores,
                                         **profile.geometry()) != topology:
                 raise ValueError("decoder geometry differs from the bound cold topology")
-        elif _audio_component == "asr":
-            # Speech precision payloads are validated below before native creation.
+        elif _audio_component == "asr" or nvfp4_tensor_scales is not None:
+            # NVFP4 and speech precision payloads are validated below before native creation.
             pass
         elif (model.layers and getattr(model.layers[0].self_attn.q_proj.weight, "dtype", None) == torch.uint8):
             _validate_decoder_w4_scale_lists(model, scale_lists, topology)
@@ -2344,14 +2394,19 @@ def _install_causal_decoder_forward(
     hidden_size = attn0.o_proj.out_features
     intermediate_size = model.layers[0].mlp.gate_proj.out_features
     eps = model.layers[0].input_layernorm.variance_epsilon
+    if nvfp4_tensor_scales is not None:
+        _validate_nvfp4_payload(model, scale_lists, nvfp4_tensor_scales, topology, arch=arch,
+                                audio_component=_audio_component)
     if topology is not None:
         if nvfp4_tensor_scales is not None:
-            _validate_asr_nvfp4_payload(model, scale_lists, nvfp4_tensor_scales, topology)
-        elif arch == "qwen3" and any(getattr(weight, "dtype", None) == torch.uint8
+            pass  # Validated above, with or without a bound topology.
+        elif arch in ("qwen3", "llama") and any(getattr(weight, "dtype", None) == torch.uint8
                 for group in (q_w_list, k_w_list, v_w_list, o_w_list, gate_list, up_list, down_list)
                 for weight in group):
             _validate_decoder_w4_scale_lists(model, scale_lists, topology,
                                              audio_component=_audio_component)
+        elif arch == "llama" and scale_lists is not None:
+            _validate_decoder_w8_scale_lists(model, scale_lists)
         elif _audio_component == "asr" and scale_lists is not None:
             _validate_decoder_w8_scale_lists(model, scale_lists)
         elif _audio_component == "asr":
@@ -2367,19 +2422,23 @@ def _install_causal_decoder_forward(
         # Model config remains logical after one-time CPU weight padding.
         # Native admission takes logical geometry, while weight/SPM execution
         # uses the physical width selected by the same cold template. Packed
-        # signed W4 (not NVFP4) mirrors the native 192-aligned six-lane width.
+        # signed W4 mirrors the native 192-aligned six-lane width; NVFP4 uses 384.
         intermediate_size = model.config.intermediate_size
-        packed_w4 = (nvfp4_tensor_scales is None
+        nvfp4 = nvfp4_tensor_scales is not None
+        packed_w4 = (not nvfp4
                      and getattr(q_w_list[0], "dtype", None) == torch.uint8)
-        physical_intermediate = decoder_mlp_intermediate_size(intermediate_size, topology.mlp_tp)
+        packed_storage = getattr(q_w_list[0], "dtype", None) == torch.uint8
+        physical_intermediate = (decoder_packed_w4_mlp_intermediate_size if packed_w4 else
+                                 decoder_nvfp4_mlp_intermediate_size if nvfp4 else
+                                 decoder_mlp_intermediate_size)(intermediate_size, topology.mlp_tp)
         if arch == "qwen3_vl_text":
             from rpu_backend.api._execution import qwen3_vl_text_topology
             actual = qwen3_vl_text_topology(
-                model.config, topology.num_cores, packed_w4=q_w_list[0].dtype == torch.uint8)
+                model.config, topology.num_cores, packed_w4=packed_w4)
         elif (arch == "qwen3" and _audio_component is None
                 and getattr(q_w_list[0], "dtype", None) == torch.uint8):
-            # The packed validator above binds every projection to config,
-            # including the zero-padded six-lane physical MLP width.
+            # The packed or NVFP4 validator above binds every projection to
+            # config, including the zero-padded six-lane packed MLP width.
             from rpu_backend.quant.qwen3_profiles import qwen3_w4_topology
             actual = qwen3_w4_topology(model.config, topology.num_cores)
         else:
@@ -2400,12 +2459,14 @@ def _install_causal_decoder_forward(
                         from rpu_backend.quant.int4_pgrp_pack import w4_storage_shape
                         storage = w4_storage_shape(
                             *shape, int(name != "down_proj"), topology.mlp_tp)
+                    elif nvfp4:
+                        storage = (shape[0], shape[1] // 2)
                     else:
                         storage = shape
                     if ((projection.out_features, projection.in_features) != shape
                             or tuple(projection.weight.shape) != storage
                             or projection.weight.dtype != (
-                                torch.uint8 if packed_w4 else
+                                torch.uint8 if packed_storage else
                                 torch.int8 if scale_lists is not None and
                                 q_w_list[0].dtype == torch.int8 else torch.float16)):
                         raise ValueError(f"decoder layer {index} {name} physical MLP shape differs from cold padding")
@@ -2531,6 +2592,14 @@ def _install_causal_decoder_forward(
         and not (num_layers == 64 and hidden_size == 5120))
     decoder_num_layers = int(num_layers)
     decoder_hidden_size = int(hidden_size)
+    qwen3_c512_prefill = (
+        arch == "qwen3" and decoder_num_layers == 64
+        and decoder_hidden_size == 5120
+        and execution_config.get("prefill", {}).get("chunk_size") == 512)
+    if qwen3_c512_prefill and (
+            not prefill_w8a8
+            or execution_config.get("prefill", {}).get("linear_acc32", False)):
+        raise ValueError("Qwen3-32B C512 requires prefill.linear_w8a8=true and linear_acc32=false")
     # FNV1a-style hash tiebreaker so plain qwen3 (empty list → 0) and
     # qwen3-vl text-only smoke (non-empty layer list) cannot alias on a
     # shared model instance. Mirrors adapters/qwen3_vl/text.py:194-198.
@@ -2778,6 +2847,19 @@ def _install_causal_decoder_forward(
             torch.ops.rpu.causal_decoder_set_linear_acc32(
                 handle, bool(_prefill_cfg.get("linear_acc32", False)))
         _requested_chunk = _prefill_cfg.get("chunk_size", "auto")
+        if (arch == "qwen3" and decoder_num_layers == 64
+                and decoder_hidden_size == 5120 and _requested_chunk == 192):
+            # The exact layout is shared by A16/A8 and bound before the A8
+            # setter validates its envelope. Native validates actual weights,
+            # topology and math; smaller Qwen3 and other owners keep their path.
+            torch.ops.rpu.causal_decoder_set_qwen3_c192(handle, True)
+        if (arch == "qwen3" and decoder_num_layers == 64
+                and decoder_hidden_size == 5120 and _requested_chunk == 256):
+            torch.ops.rpu.causal_decoder_set_qwen3_c256(handle, True)
+        if qwen3_c512_prefill:
+            torch.ops.rpu.causal_decoder_set_qwen3_c512(handle, True)
+        if prefill_w8a8:
+            torch.ops.rpu.causal_decoder_set_prefill_w8a8(handle, True)
         torch.ops.rpu.causal_decoder_set_chunk_size_override(
             handle,
             0 if _requested_chunk == "auto" else int(_requested_chunk),

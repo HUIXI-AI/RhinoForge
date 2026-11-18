@@ -25,9 +25,11 @@ from safetensors.torch import load_file, save_file
 try:
     from ._common import quantize_linear_per_channel
     from .int4_pgrp_pack import quantize_int4_group_wise
+    from .precision_recipes import RECORD, produced, write_record
 except ImportError:  # standalone import (no rpu_backend package)
     from _common import quantize_linear_per_channel
     from int4_pgrp_pack import quantize_int4_group_wise
+    from precision_recipes import RECORD, produced, write_record
 
 # Fused on-disk decoder projections (see adapters/wall_oss/llm.py weight build).
 WALL_OSS_QUANT_SUFFIXES = (
@@ -44,6 +46,13 @@ WALL_OSS_QUANT_SUFFIXES = (
 # int4-legal at load by padding INTER -> 11264 (adapters/wall_oss/llm.py). Kept as an
 # empty tuple so the --keep-int8 retreat (extra_int8_suffixes) and config split still work.
 WALL_OSS_FORCED_INT8_SUFFIXES = ()
+FAMILY = "wall_oss"
+# Registered precision recipes this converter produces, as the arguments that produce them.
+# The G32 recipe keeps expert-0 down_proj INT8, as the sorting Action W4 loader requires.
+RECIPES = {
+    "w4a16_g32": {"group_size": 32, "extra_int8_suffixes": ("moe.experts.0.down_proj.weight",)},
+    "w4a16_channel": {"group_size": 0, "extra_int8_suffixes": ()},
+}
 
 
 def _scale_name(weight_name: str) -> str:
@@ -74,12 +83,18 @@ def _checkpoint_layout(src: Path):
 def _copy_sidecar_files(src: Path, dst: Path, shards: set[str]) -> None:
     skip = set(shards) | {
         "model.safetensors", "model.safetensors.index.json",
-        "config.json", "rpu_quant_config.json",
+        "config.json", "rpu_quant_config.json", RECORD,
     }
     for path in sorted(src.iterdir()):
         if path.name in skip or not path.is_file():
             continue
         shutil.copy2(path, dst / path.name)
+
+
+def produced_recipe(extra_int8_suffixes=(), group_size=32):
+    """The registered recipe these arguments produce; None for any other INT8 retreat or group."""
+    arguments = {"group_size": group_size, "extra_int8_suffixes": tuple(extra_int8_suffixes)}
+    return next((name for name, row in RECIPES.items() if row == arguments), None)
 
 
 def _convert_tensor(name, tensor, extra_int8_suffixes, group_size=32):
@@ -127,15 +142,17 @@ def _quant_config(src: Path, extra_int8_suffixes, group_size=32):
     }
 
 
-def convert_checkpoint(src, dst, *, extra_int8_suffixes=(), group_size=32):
+def convert_checkpoint(src, dst, *, extra_int8_suffixes=(), group_size=32, recipe=None):
+    """RECIPE, when given, must be the registered recipe the other arguments produce."""
     src, dst = Path(src).expanduser().resolve(), Path(dst).expanduser().resolve()
+    recipe = produced(FAMILY, produced_recipe(extra_int8_suffixes, group_size), recipe)
     if not src.is_dir():
         raise FileNotFoundError(f"--src not a dir: {src}")
     if dst.exists():
         raise FileExistsError(f"--dst exists: {dst}")
     is_sharded, shards, weight_map, index = _checkpoint_layout(src)
     tmp = dst.with_name(f".{dst.name}.tmp-{os.getpid()}")
-    stats = {"n_quantized": 0, "n_copied": 0, "n_shards": len(shards), "quant_proj": 0}
+    stats = {"recipe": recipe, "n_quantized": 0, "n_copied": 0, "n_shards": len(shards), "quant_proj": 0}
     new_weight_map = dict(weight_map) if is_sharded else {}
     try:
         tmp.mkdir(parents=True)
@@ -164,6 +181,7 @@ def convert_checkpoint(src, dst, *, extra_int8_suffixes=(), group_size=32):
         json.dump(_quant_config(src, tuple(extra_int8_suffixes), group_size),
                   (tmp / "rpu_quant_config.json").open("w"), indent=2)
         _copy_sidecar_files(src, tmp, set(shards))
+        write_record(tmp, FAMILY, recipe)
         tmp.rename(dst)
     except Exception:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -178,12 +196,17 @@ def main(argv=None):
     ap.add_argument("--keep-int8", default="",
                     help="extra full-suffix tokens to retreat to int8 if the cos gate fails, "
                          "e.g. 'self_attn.qkv_proj_experts.0.weight,self_attn.qkv_proj_experts.1.weight'")
-    ap.add_argument("--group-size", type=int, default=32,
+    ap.add_argument("--group-size", type=int,
                     help="32 (default) = group-wise int4 (pgrp/AWQ, scale "
                          "[G=K/group_size, N]). 0 keeps legacy per-channel quantization "
                          "math, but runtime still expands it into the pgrp physical ABI. "
                          "Must divide K of every int4 layer.")
+    ap.add_argument("--recipe", choices=sorted(RECIPES),
+                    help="registered precision recipe; sets the group size and the INT8 "
+                         "layers (w4a16_g32 keeps expert-0 down_proj INT8)")
     args = ap.parse_args(argv)
+    if args.recipe is not None and (args.keep_int8 or args.group_size is not None):
+        ap.error("--recipe sets the group size and INT8 layers; drop --group-size/--keep-int8")
     extra = tuple(t.strip() for t in args.keep_int8.split(",") if t.strip())
     bad = [t for t in extra if t not in WALL_OSS_QUANT_SUFFIXES]
     if bad:
@@ -199,14 +222,16 @@ def main(argv=None):
               f"w4a16 runtime loader (it reads no int8_suffixes) → would be re-packed int4 at load "
               f"→ corruption. Drop --keep-int8.", file=sys.stderr)
         return 2
+    arguments = (RECIPES[args.recipe] if args.recipe is not None else
+                 {"extra_int8_suffixes": extra, "group_size": 32 if args.group_size is None else args.group_size})
     try:
-        stats = convert_checkpoint(args.src, args.dst, extra_int8_suffixes=extra,
-                                   group_size=args.group_size)
+        stats = convert_checkpoint(args.src, args.dst, recipe=args.recipe, **arguments)
     except (FileExistsError, FileNotFoundError, TypeError, ValueError) as exc:
         print(f"[convert_wall_oss] error: {exc}", file=sys.stderr)
         return 1
     print(f"[convert_wall_oss] {args.src} -> {args.dst}")
     print(f"  quantized proj: {stats['quant_proj']}  copied tensors: {stats['n_copied']}")
+    print(f"  recipe: {stats['recipe'] or 'none registered (no record written)'}")
     return 0
 
 

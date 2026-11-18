@@ -21,7 +21,7 @@ _TEXT_PROFILES = {
 # so a future core-count change cannot silently inherit the reduced template.
 _COMPONENT_CORE_LAYOUT = {
     4: (4, 4, 4),
-    6: (4, 6, 4),
+    6: (4, 6, 6),
     8: (8, 8, 8),
 }
 
@@ -85,6 +85,31 @@ def _validate_dense_vision_profile(config):
         raise ValueError("Vision requires an exact dense FP16 Qwen3.5 0.8B/2B/4B/9B/27B tower")
 
 
+def g05_owner(config):
+    """Return "action"/"text" for a private G05 decoder config, else None.
+
+    Only the G05 composite builds configs that declare ``input_type``; the
+    exact profile itself is checked by the shared G05 cold validators.
+    """
+    if getattr(config, "input_type", None) is None:
+        return None
+    return "action" if getattr(config, "adaptive_mode", None) == "adaLN" else "text"
+
+
+def _validate_g05_reduced_profile(config, topology):
+    from ._g05_cold import _check_g05_action_profile, _check_g05_vlm_profile, g05_w8_quant_config
+    action = g05_owner(config) == "action"
+    if action:
+        _check_g05_action_profile(config)
+        if topology.num_cores != 4:
+            # I4096 does not split over six lanes; a 6-core G05 runs the expert on 4.
+            raise ValueError("the G05 action expert runs on four cores at a reduced budget")
+    else:
+        _check_g05_vlm_profile(config)
+    if getattr(config, "quant_config", None) not in (None, g05_w8_quant_config(action=action)):
+        raise ValueError("reduced G05 accepts FP16 or its exact per-channel W8 scope")
+
+
 def validate_core_profile(config, execution=None):
     """Reject reduced near-neighbours before any model/weight/handle mutation.
 
@@ -104,6 +129,9 @@ def validate_core_profile(config, execution=None):
     if validate_modern_27b_profile(config, allow_fp16=True):
         return topology
     if topology.num_cores == 8:
+        return topology
+    if g05_owner(config) is not None:
+        _validate_g05_reduced_profile(config, topology)
         return topology
     from rpu_backend.adapters.qwen3_5.quant_scope import validate_legacy_text_profile
     if validate_legacy_text_profile(config):
@@ -152,13 +180,14 @@ def _reduced_quant_specs(config):
     quant = getattr(config, "quant_config", None)
     if not quant:
         return None
-    from .quant_scope import FP16, W8A16, W4A16_PGRP, is_full_from_layer_types, resolve_quant_specs
+    from .quant_scope import (FP16, W8A16, W4A16_PGRP, NVFP4, is_full_from_layer_types,
+                              resolve_quant_specs)
     tc = getattr(config, "text_config", config)
     specs = resolve_quant_specs(is_full_from_layer_types(getattr(tc, "layer_types", ())), quant)
-    if not specs or any(spec.method not in (FP16, W8A16, W4A16_PGRP)
+    if not specs or any(spec.method not in (FP16, W8A16, W4A16_PGRP, NVFP4)
                         or (spec.method == W4A16_PGRP and spec.group_size != 32)
                         for spec in specs.values()):
-        raise ValueError("reduced Qwen3.5 supports FP16, W8 and signed W4 group32 projections")
+        raise ValueError("reduced Qwen3.5 supports FP16, W8, signed W4 group32 and NVFP4 projections")
     families = {"mlp": set(), "attn": set(), "gdn": set(), "scalar": set()}
     for name, spec in specs.items():
         family = ("mlp" if ".mlp." in name else "attn" if ".self_attn." in name
@@ -175,7 +204,7 @@ def _reduced_quant_specs(config):
 def text_mlp_intermediate_size(config, topology):
     """Select a physical width compatible with each MLP's packed K stripe."""
     from rpu_backend.runtime.topology import decoder_mlp_intermediate_size
-    from .quant_scope import (W4A16_AWQ, W4A16_PGRP, is_full_from_layer_types,
+    from .quant_scope import (W4A16_AWQ, W4A16_PGRP, NVFP4, is_full_from_layer_types,
                               quanttrio_awq_config, resolve_quant_specs)
     tc = getattr(config, "text_config", config)
     logical = tc.intermediate_size
@@ -191,6 +220,9 @@ def text_mlp_intermediate_size(config, topology):
             # QuantTrio AWQ uses G128 controller stripes; preserve its
             # six-core physical width independently of signed W4 G32.
             alignment = 128 * topology.mlp_tp
+            return ((logical + alignment - 1) // alignment) * alignment
+        if NVFP4 in mlp_methods:
+            alignment = 64 * topology.mlp_tp
             return ((logical + alignment - 1) // alignment) * alignment
         if W4A16_PGRP in mlp_methods:
             alignment = 32 * topology.mlp_tp
@@ -252,7 +284,7 @@ def _validate_dense_text_profile(config, *, uniform_quant=False, mlp_only_quant=
         expected = ["full_attention" if i % 4 == 3 else "linear_attention" for i in range(row[1])]
         valid = list(getattr(tc, "layer_types", ()) or ()) == expected
     if not valid:
-        raise ValueError("model.num_cores=4/6 requires an exact dense Qwen3.5 profile or an admitted W8/W4 text recipe with partial interleaved M-RoPE")
+        raise ValueError("model.num_cores=4/6 requires an exact dense Qwen3.5 profile or an admitted W8/W4/NVFP4 text recipe with partial interleaved M-RoPE")
     if hasattr(config, "text_config"):
         vc = getattr(config, "vision_config", None)
         if (getattr(config, "model_type", None) != "qwen3_5"
@@ -271,7 +303,8 @@ def validate_text_weight_geometry(inner, config, topology):
         _validate_dense_text_weights(inner, config)
         validate_modern_27b_cold_weights(inner, config, cold_cpu=True)
         return
-    if topology.num_cores == 8:
+    if topology.num_cores == 8 or g05_owner(config) is not None:
+        # G05 owners keep their exact private cold checks at every budget.
         return
     _validate_dense_text_weights(inner, config)
     from .quant_scope import validate_legacy_text_profile
@@ -292,14 +325,15 @@ def validate_text_weight_geometry(inner, config, topology):
 def _validate_reduced_quant_weights(inner, config, specs, *, cold_cpu=False):
     """Check raw projection storage; the cold VL owner also requires CPU scales."""
     import torch
-    from .quant_scope import FP16, W8A16, is_full_from_layer_types
+    from .quant_scope import FP16, W8A16, NVFP4, is_full_from_layer_types
     from .text import _iter_text_projections
     tc = getattr(config, "text_config", config)
     is_full = is_full_from_layer_types(tc.layer_types)
     for linear, name in _iter_text_projections(inner, is_full):
         weight = linear.weight
         spec = specs[name]
-        quantized = spec.method != FP16
+        # NVFP4 is quantized during installation from the floating source.
+        quantized = spec.method not in (FP16, NVFP4)
         allowed_float = ((torch.float16, torch.bfloat16, torch.float32)
                          if weight.device.type == "cpu" else (torch.float16,))
         devices = ("cpu",) if cold_cpu else ("cpu", "rpu", "privateuseone")

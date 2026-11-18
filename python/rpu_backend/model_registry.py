@@ -40,6 +40,9 @@ MODELS: Dict[str, str] = {
     "qwen3_5-35b-a3b-rtn-w4a16": "Qwen3.5-35B-A3B-RTN-W4A16-G128",
     # Official routed-only GPTQ G128, with the same explicit-path override.
     "qwen3_5-35b-a3b-gptq-w4a16": "Qwen3.5-35B-A3B-GPTQ-Int4",
+    # Routed-only per-output INT8 written by quant/convert_qwen3_5_moe_int8.py
+    # from the official float checkpoint; same explicit-path override.
+    "qwen3_5-35b-a3b-rtn-w8a16": "Qwen3.5-35B-A3B-RTN-W8A16",
     # Galaxea G0.5 VLA (Qwen3.5-2B VLM + action expert).
     "g05-base": "G05/g05-base",
     # Pi0.5 VLA (LeRobot)

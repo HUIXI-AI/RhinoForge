@@ -179,12 +179,16 @@ def require_g05_action_nvfp4_native():
     return check()
 
 
-def prepare_g05_action_nvfp4(expert):
+def prepare_g05_action_nvfp4(expert, lanes=8):
     """Pack five families directly from original CPU FP16, before W8 staging.
 
     The shared installer retains W8 K/V/attention gate; this private payload
     replaces only finalized Q/O/MLP lists, without changing public Qwen scope.
+    ``lanes`` is the expert's execution width (8, or 4 at a reduced budget);
+    the logical tensor shapes do not depend on it.
     """
+    if lanes not in (4, 8):
+        raise ValueError("G0.5 Action NVFP4 packs for four or eight lanes")
     from rpu_backend.adapters.g05.action import _check_g05_action_profile
     from rpu_backend.adapters.qwen3_5.text import split_q_gate
     from rpu_backend.quant.nvfp4_pack import quantize_nvfp4, swizzle_pack_nvfp4_v2
@@ -219,7 +223,7 @@ def prepare_g05_action_nvfp4(expert):
                 weight, _ = split_q_gate(weight, 8, 256)
             codes, block_scale, tensor_scale = quantize_nvfp4(weight)
             packed, striped = swizzle_pack_nvfp4_v2(
-                codes, block_scale, 0 if index in (1, 4) else 1, 8)
+                codes, block_scale, 0 if index in (1, 4) else 1, lanes)
             weights[index].append(packed)
             scales[index].append(striped)
             tensor_scales[index].append(tensor_scale.reshape(()))

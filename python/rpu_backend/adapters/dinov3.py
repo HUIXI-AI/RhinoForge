@@ -13,6 +13,10 @@ Scope (P4 install + forward):
     install device keepalives (CLS+reg / γ_attn / γ_mlp stacks) → install
     fused C++ vision handle (set_weights / set_rope / KV cache) → set
     hardware attrs → replace forward.
+  - On-install `quantization="w8a16"` / `"w4a16"` (exact ViT-B, cold-only):
+    the 72 encoder projections are quantized after the head padding and
+    before the swizzle (`quant/convert_dinov3.py`); their FP16 scales reach the
+    native owner through `dinov3_vision_set_weight_scales`. ACC16 only.
   - Forward dispatch: `_rpu_dinov3_forward`:
       1. patch_embed via CPU fp16 folded Linear (Conv2d k=16 s=16 → Linear).
       2. CLS + 4 register tokens prepend from device keepalive.
@@ -87,6 +91,8 @@ _NUM_CORES = 8
 # swizzle, SDPA (heads % cores) and KV-insert partitions require.
 _REDUCED_CORE_PROFILE = (768, 12, 12, 16, 224, 4)
 _REDUCED_CORE_INTERMEDIATE = 3072
+# On-install recipes for the exact ViT-B tower (see quant/convert_dinov3.py).
+_ON_INSTALL_QUANTIZATION = ("w8a16", "w4a16")
 _LOG = logging.getLogger(__name__)
 
 
@@ -209,6 +215,15 @@ def _check_execution_cores(config: Any, execution: Any) -> int:
     return cores
 
 
+def _validate_dinov3_quant_source(model: nn.Module, quantization: str) -> None:
+    """Admit the original CPU FP16 projections before an on-install recipe."""
+    from rpu_backend.quant.convert_dinov3 import check_dinov3_quant_source
+    try:
+        check_dinov3_quant_source(_dinov3_layers(model), quantization)
+    except ValueError as exc:
+        raise UnsupportedModelError(str(exc)) from exc
+
+
 def _dinov3_execution_cores(model: nn.Module) -> int:
     """Cold core budget bound to this model's execution session."""
     return _check_execution_cores(
@@ -314,13 +329,18 @@ def _convert_dinov3_weights_for_rpu(model: nn.Module) -> None:
        stashed on `model._rpu_dinov3_patch_embed_w` / `_b`.
     2. Pad attention heads up to a multiple of the cold execution cores
        (no-op for ViT-L, and for ViT-B at four/six cores).
-    3. Swizzle every leaf `nn.Linear` weight in-place (attention q/k/v/o,
-       MLP up_proj/down_proj) for that core count. k_proj has bias=None —
-       preserved because `convert_linear_weights_inplace` only touches
-       `.weight`. The applied count is recorded as `_rpu_vision_num_cores`;
-       the native installer binds the same count.
+    3. With a cold on-install recipe (`_rpu_dinov3_quantization`), quantize
+       the six projections of every layer: W8A16 keeps natural int8 for the
+       byte-width swizzle; G32 W4A16 packs its own per-core layout and is
+       skipped by the generic swizzle (pitfall P1).
+    4. Swizzle every remaining leaf `nn.Linear` weight in-place (attention
+       q/k/v/o, MLP up_proj/down_proj) for that core count. k_proj has
+       bias=None — preserved because `convert_linear_weights_inplace` only
+       touches `.weight`. The applied count is recorded as
+       `_rpu_vision_num_cores`; the native installer binds the same count.
     """
     num_cores = _dinov3_execution_cores(model)
+    quantization = vars(model).get("_rpu_dinov3_quantization")
     with torch.no_grad():
         pe = model.embeddings.patch_embeddings
         pe_w = pe.weight.data  # [hidden, in_channels, k, k]
@@ -340,14 +360,31 @@ def _convert_dinov3_weights_for_rpu(model: nn.Module) -> None:
         )
 
     _pad_attn_heads_to_multiple_of_cores(model, num_cores)
+    skip_names = SKIP_LINEAR_NAMES
+    if quantization is not None:
+        from rpu_backend.quant.convert_dinov3 import (
+            W4_SKIP_LINEAR_NAMES, quantize_dinov3_projections_,
+        )
+        quantize_dinov3_projections_(_dinov3_layers(model), quantization, num_cores=num_cores)
+        if quantization == "w4a16":
+            skip_names = SKIP_LINEAR_NAMES | W4_SKIP_LINEAR_NAMES
     if num_cores == _NUM_CORES:
-        convert_linear_weights_inplace(model, skip_names=SKIP_LINEAR_NAMES)
+        convert_linear_weights_inplace(model, skip_names=skip_names)
     else:
         # One budget for every role; the reduced budget rejects unknown Linears.
         convert_linear_weights_inplace(
-            model, skip_names=SKIP_LINEAR_NAMES, attn_num_cores=num_cores,
+            model, skip_names=skip_names, attn_num_cores=num_cores,
             mlp_num_cores=num_cores, lm_head_num_cores=num_cores,
             execution_core_count=num_cores)
+    if quantization == "w4a16":
+        from rpu_backend.quant.convert_dinov3 import PROJECTIONS
+        # The generic skip marker describes only that swizzle; these
+        # projections already carry the packed per-core layout.
+        for layer in _dinov3_layers(model):
+            for role, partition in PROJECTIONS:
+                projection = layer.get_submodule(role)
+                projection._rpu_linear_partition = partition
+                projection._rpu_linear_num_cores = num_cores
     model._rpu_vision_num_cores = num_cores
 
 
@@ -731,6 +768,31 @@ def _install_dinov3_vision_for_rpu_impl(
         num_heads_padded, head_dim, hidden, intermediate, eps,
     )
 
+    # On-install W8A16 / W4A16: each projection's own FP16 scale buffer, in
+    # set_weights order. Checked here, before the native owner exists.
+    quantization = vars(vision_model).get("_rpu_dinov3_quantization")
+    scale_lists = None
+    if quantization is not None:
+        weight_dtype = {"w8a16": torch.int8, "w4a16": torch.uint8}.get(quantization)
+        projections = [
+            [L.attention.q_proj for L in layers], [L.attention.k_proj for L in layers],
+            [L.attention.v_proj for L in layers], [L.attention.o_proj for L in layers],
+            [L.mlp.up_proj for L in layers], [L.mlp.down_proj for L in layers],
+        ]
+        scale_lists = tuple([getattr(p, "weight_scale", None) for p in role]
+                            for role in projections)
+        for role, scales in zip(projections, scale_lists):
+            for projection, scale in zip(role, scales):
+                weight = projection.weight
+                expected = ((1, weight.size(0)) if quantization == "w8a16" else (2, 32))
+                if (weight_dtype is None or weight.dtype != weight_dtype
+                        or not torch.is_tensor(scale) or scale.dtype != torch.float16
+                        or scale.device != weight.device or not scale.is_contiguous()
+                        or (scale.dim(), scale.size(0)) != expected):
+                    raise ValueError(
+                        f"DINOv3 {quantization} install requires every projection's "
+                        "own FP16 scale beside its quantized weight")
+
     freq_cos, freq_sin = build_dinov3_rope_tables(
         head_dim=head_dim, max_hw=max_hw,
         device="rpu", dtype=torch.float16, theta=theta,
@@ -758,7 +820,9 @@ def _install_dinov3_vision_for_rpu_impl(
     handle = torch.ops.rpu.dinov3_vision_create()
     resource = _InstalledNativeResource(
         vision_model, handle, torch.ops.rpu.dinov3_vision_destroy,
-        graphs=(graph_cache,), keepalive=(weight_args, freq_cos, freq_sin, kv_cache),
+        graphs=(graph_cache,),
+        keepalive=(weight_args, freq_cos, freq_sin, kv_cache)
+        + ((scale_lists,) if scale_lists is not None else ()),
         label="DINOv3", handle_name="_rpu_dinov3_handle")
     handle_finalizer = resource.finalizer
     _install_state["pending_resource"] = resource
@@ -773,6 +837,9 @@ def _install_dinov3_vision_for_rpu_impl(
         if actual != expected:
             raise RuntimeError(
                 f"DINOv3 native topology mismatch: {actual} != {expected}")
+    if scale_lists is not None:
+        # The native owner validates every pair before it publishes any scale.
+        torch.ops.rpu.dinov3_vision_set_weight_scales(handle, *scale_lists)
     torch.ops.rpu.dinov3_vision_set_chunk_envelope(handle, int(kv_cache.max_seq_len), 0)
     torch.ops.rpu.dinov3_vision_set_rope(handle, freq_cos, freq_sin)
     configured_chunk = _configured_vision_chunk(vision_model)
@@ -1220,7 +1287,34 @@ class DINOv3Adapter:
                 f"{logical_tokens} logical tokens, got {requested}"
             )
 
-    def __init__(self, model: nn.Module, *, rpu_execution=None) -> None:
+    @classmethod
+    def preflight_quantization(cls, config: Any, execution_config, quantization) -> int:
+        """Admit an on-install recipe before any weight is read.
+
+        `quantization` is `"w8a16"` (per-channel INT8) or `"w4a16"` (G32 RTN)
+        for the exact FP16 ViT-B/16 source at model.num_cores 4, 6 or 8.
+        Patch embedding, norms, LayerScale and biases stay FP16. Returns the
+        admitted core budget.
+        """
+        _check_profile(config)
+        if quantization not in _ON_INSTALL_QUANTIZATION:
+            raise UnsupportedModelError(
+                f"unknown DINOv3 on-install recipe {quantization!r}; "
+                f"expected one of {_ON_INSTALL_QUANTIZATION}")
+        if getattr(config, "quantization_config", None) is not None:
+            raise UnsupportedModelError(
+                "DINOv3 on-install quantization requires the original FP16 "
+                "checkpoint, not a pre-quantized one")
+        if (_profile(config) != _REDUCED_CORE_PROFILE
+                or int(config.intermediate_size) != _REDUCED_CORE_INTERMEDIATE):
+            raise UnsupportedModelError(
+                "DINOv3 on-install quantization admits only exact ViT-B/16 (MLP 3072)")
+        try:
+            return _check_execution_cores(config, execution_config or {})
+        except ValueError as exc:
+            raise UnsupportedModelError(str(exc)) from exc
+
+    def __init__(self, model: nn.Module, *, rpu_execution=None, quantization=None) -> None:
         from rpu_backend.api._execution import (
             bind_rpu_execution,
             normalize_rpu_execution,
@@ -1235,6 +1329,10 @@ class DINOv3Adapter:
                 supported=supported_execution,
             )
         _check_profile(model.config)
+        if (getattr(model.to, "__rpu_wrapped__", False)
+                and getattr(model.to, "__rpu_quantization__", None) != quantization):
+            raise UnsupportedModelError(
+                "DINOv3 on-install quantization is cold-only; reload the model to change it")
         self._rpu_execution = bind_rpu_execution(
             model,
             normalized_execution if rpu_execution is not None else None,
@@ -1242,8 +1340,13 @@ class DINOv3Adapter:
             supported=supported_execution,
         )
         self.preflight_execution(model.config, self._rpu_execution)
+        if quantization is not None:
+            self.preflight_quantization(model.config, self._rpu_execution, quantization)
         self.model = model
+        self._quantization = quantization
         self._rpu_is_ready: bool = _dinov3_runtime_complete(model)
+        if quantization is not None and not self._rpu_is_ready:
+            _validate_dinov3_quant_source(model, quantization)
         self._execution_reconfigure_journal = None
         callbacks = {}
         if getattr(model, "_execution_session", None) is None:
@@ -1301,6 +1404,7 @@ class DINOv3Adapter:
             return original_to(*args, **kwargs)
 
         rpu_aware_to.__rpu_wrapped__ = True
+        rpu_aware_to.__rpu_quantization__ = quantization
         model.to = rpu_aware_to
 
     def _cold_execution_configuration_only(self) -> bool:
@@ -1440,6 +1544,14 @@ class DINOv3Adapter:
             raise RPUBackendError(
                 f"DINOv3 model.num_cores={num_cores} requires a native "
                 "extension built with the DINOv3 core-count ops; rebuild it")
+        if self._quantization is not None:
+            self.preflight_quantization(
+                self.model.config, self._execution_session.config, self._quantization)
+            if not hasattr(torch.ops.rpu, "dinov3_vision_set_weight_scales"):
+                raise RPUBackendError(
+                    f"DINOv3 {self._quantization} requires a native extension "
+                    "built with dinov3_vision_set_weight_scales; rebuild it")
+            _validate_dinov3_quant_source(self.model, self._quantization)
         if not _SWIZZLE_LOCK.acquire(blocking=False):
             raise RPUBackendError(
                 "DINOv3Adapter.to_rpu(): another swizzle in progress."
@@ -1452,6 +1564,8 @@ class DINOv3Adapter:
             _claim_live_instance(self.model)
             self.model._rpu_swizzle_started = True
             install_started = True
+            if self._quantization is not None:
+                self.model._rpu_dinov3_quantization = self._quantization
 
             # ---------- Step A: pre-move CPU conversion --------------------
             # Linear swizzle + patch_embed Conv2d→Linear CPU fp16 fold.

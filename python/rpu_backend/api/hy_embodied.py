@@ -57,9 +57,11 @@ VALID_ACTION_DIMS = 20
 # `actions` 是 49 行。
 MODEL_ACTION_STEPS = 50
 
-# `[model].dtype` → `RPU_HY_VLA_W8A16`。**与 `specs/hy_vla/executor.py` 的 DTYPES
-# 表同源**，改一处必须改另一处（两边都是交付面）。W8 各档只保留为
-# legacy-bf16 受控评估；当前 immutable-v2 认证仅覆盖 `fp16`。
+# `[model].dtype` → `RPU_HY_VLA_W8A16`。**除 `w4a16`/`w4a16-vision` 外与
+# `specs/hy_vla/executor.py` 的 DTYPES 表同源**，改一处必须改另一处（两边都是
+# 交付面）；交付包不提供 W4。W8 各档只保留为 legacy-bf16 受控评估；当前
+# immutable-v2 认证仅覆盖 `fp16`。`w8a16`、`w4a16` 与 `w4a16-vision` 另有登记
+# 配方（`w8a16` / `w4a16_rtn_g32_vision_w8a16` / `w4a16_rtn_g32`）。
 _PROFILE_ENV: dict[str, str] = {
     "fp16":              "0",                  # 三座全 fp16（W16A16）
     "w8a16":             "all",
@@ -68,6 +70,16 @@ _PROFILE_ENV: dict[str, str] = {
     "w8a16-vlm":         "vlm",
     "w8a16-vit":         "vit",
     "w8a16-no-vlm":      "vit,expert",         # 已被 expert-vlmv 严格支配，勿新用
+    "w4a16":             "vit",                # Vision W8；VLM/Action 见下表
+    "w4a16-vision":      "0",                  # 三座全 W4，见下表
+}
+# `[model].dtype` → `RPU_HY_VLA_W4A16`；未列出的档写 "0"。对称 G32 RTN。
+# `w4a16` 的 Vision 留在 W8；`w4a16-vision` 连 Vision 也是 W4，补零后的
+# o_proj/fc2 按行切到 8 核不满足 int4 行切分，所以 Vision 在任何核数预算下
+# 都跑 4 核。
+_PROFILE_W4_ENV: dict[str, str] = {
+    "w4a16":             "vlm,expert",
+    "w4a16-vision":      "vit,vlm,expert",
 }
 
 
@@ -296,12 +308,16 @@ class HyEmbodiedPolicy:
         量化在装载时做，没有单独的量化 ckpt 要发。
 
         Args:
-            dtype: 见 `_PROFILE_ENV`。当前 immutable-v2 认证档是 `fp16`；
-                W8 各档仅用于 legacy-bf16 受控评估。
-            prefix_len: S，16 行对齐。省略时三相机取 240、两相机取 192，
-                覆盖 64 个语言槽位；显式调小可省时间，且必须 ≥
-                `ceil16(本条 observation 的有效行数)`。
-            n_cameras: 2 或 3，按 camera_names 顺序；两相机省略 hand_right。
+            dtype: 见 `_PROFILE_ENV`，默认 `fp16`。当前 immutable-v2 认证档是
+                `fp16`；`w8a16`（三座 W8）、`w4a16`（Vision W8、VLM/Action
+                G32 W4）与 `w4a16-vision`（三座 G32 W4，Vision 固定 4 核）有
+                登记配方，尚未上板；其余 W8 档仅用于 legacy-bf16 受控评估。
+            prefix_len: S，16 行对齐。省略时三相机取 240、两相机取 192、单相机取
+                128，覆盖 64 个语言槽位；显式调小可省时间，且必须 ≥
+                `ceil16(本条 observation 的有效行数)`，也不能小于 128（动作专家的
+                常驻 Gate/Up 与融合路线只放行 prefix 128–240）。
+            n_cameras: 1、2 或 3，按 camera_names 顺序；两相机省略 hand_right，
+                单相机只留第一路。
             norm_stats_path: `norm_stats.pkl`。**必须显式给，不会自动探测**；
                 不给就拿不到物理动作（`out.actions` 会抛，只能读
                 `.actions_normalized`）。通常就是 `<ckpt_dir>/norm_stats.pkl`。
@@ -319,13 +335,15 @@ class HyEmbodiedPolicy:
         dtype = (dtype or "fp16").strip().lower()
         if dtype not in _PROFILE_ENV:
             raise ValueError(f"dtype 必须是 {sorted(_PROFILE_ENV)} 之一，得到 {dtype!r}")
-        if type(n_cameras) is not int or n_cameras not in (2, 3):
-            raise ValueError(f"Hy-Embodied-0.5-VLA-UMI 支持 2 或 3 相机，得到 {n_cameras}")
+        if type(n_cameras) is not int or n_cameras not in (1, 2, 3):
+            raise ValueError(f"Hy-Embodied-0.5-VLA-UMI 支持 1、2 或 3 相机，得到 {n_cameras}")
         max_prefix = _ceil16(2 + n_cameras * 58 + 64)
         if prefix_len is None:
             prefix_len = max_prefix
-        if type(prefix_len) is not int or prefix_len % 16 or not 16 <= prefix_len <= max_prefix:
-            raise ValueError(f"prefix_len 必须是 16 的倍数且在 [16,{max_prefix}]，得到 {prefix_len}")
+        # 128 is the action expert's admitted floor; two or three cameras never
+        # fit below it, one camera runs at it.
+        if type(prefix_len) is not int or prefix_len % 16 or not 128 <= prefix_len <= max_prefix:
+            raise ValueError(f"prefix_len 必须是 16 的倍数且在 [128,{max_prefix}]，得到 {prefix_len}")
 
         import pathlib
 
@@ -335,8 +353,8 @@ class HyEmbodiedPolicy:
         inst._ckpt = d / "model.safetensors"
         inst._dtype = dtype
         inst._prefix_len = int(prefix_len)
-        # Two-camera execution uses the first two configured views and omits
-        # the absent image segment (checkpoint empty_cameras=0). Packed Vision
+        # Two- or one-camera execution uses the first configured views and omits
+        # the absent image segments (checkpoint empty_cameras=0). Packed Vision
         # and prefix masks use the actual count; this does not certify task quality.
         inst._n_cameras = int(n_cameras)
         # ⚠️ **不自动探测 `norm_stats.pkl`**：物理动作解码必须由调用方**显式**打开。
@@ -498,16 +516,19 @@ class HyEmbodiedPolicy:
                 preflight_hy_vla_checkpoint,
             )
             from rpu_backend.adapters.hy_vla.runtime import (
+                _hy_vla_core_budget,
                 build_hy_vla,
                 prepare_hy_vla_cold_plan,
             )
 
             cold_overrides = {
                 "RPU_HY_VLA_W8A16": _PROFILE_ENV[self._dtype],
-                "RPU_HY_VLA_W4A16": "0",
+                "RPU_HY_VLA_W4A16": _PROFILE_W4_ENV.get(self._dtype, "0"),
             }
             cold_overrides.update(self._runtime_env)
-            cold_plan = prepare_hy_vla_cold_plan(cold_overrides)
+            cold_plan = prepare_hy_vla_cold_plan(
+                cold_overrides,
+                num_cores=_hy_vla_core_budget(self._rpu_execution))
             model_cfg = HyVlaConfig(num_cameras=self._n_cameras)
             preflight_hy_vla_checkpoint(self._ckpt, model_cfg)
             import rpu_backend  # noqa: F401  （注册 PrivateUse1 后端）
@@ -530,7 +551,7 @@ class HyEmbodiedPolicy:
                 _remember_environment(env_snapshot, "RPU_HY_VLA_W8A16")
                 _remember_environment(env_snapshot, "RPU_HY_VLA_W4A16")
                 os.environ["RPU_HY_VLA_W8A16"] = _PROFILE_ENV[self._dtype]
-                os.environ["RPU_HY_VLA_W4A16"] = "0"
+                os.environ["RPU_HY_VLA_W4A16"] = _PROFILE_W4_ENV.get(self._dtype, "0")
                 for key, value in self._runtime_env.items():
                     _remember_environment(env_snapshot, key)
                     os.environ[key] = value

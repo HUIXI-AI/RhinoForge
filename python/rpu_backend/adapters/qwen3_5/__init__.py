@@ -22,10 +22,12 @@ forward is byte-for-byte identical to the pre-restructure single-file version.
 """
 from __future__ import annotations
 
+import copy
 import os
 import threading
 import types
 import weakref
+from collections.abc import Mapping
 
 import torch
 
@@ -55,6 +57,7 @@ from rpu_backend.runtime.weights import transform_linear_weight
 from rpu_backend.adapters.qwen3_5.quant_scope import (
     validate_legacy_text_profile, validate_modern_27b_profile,
     resolve_quant_config, quanttrio_awq_config, is_mlp_only_text_profile,
+    NVFP4, is_nvfp4_text_policy, nvfp4_text_quant_config,
 )
 
 # Text backbone (== HF Qwen3_5TextModel). `layer_types_to_is_full` is re-exported
@@ -83,8 +86,13 @@ from .vision import (
 def _upload_lm_head_weight(output, embedding, num_cores, *, release_source=False):
     """Upload the final head without keeping an unused untied CPU copy alive."""
     weight = output.weight if output is not None else embedding.weight
-    packed = transform_linear_weight(
-        weight.detach().to("cpu").to(torch.float16).contiguous(), 1, num_cores)
+    w_cpu = weight.detach().to("cpu").to(torch.float16).contiguous()
+    if w_cpu.ndim == 2:
+        align = 16 * int(num_cores)
+        rem = int(w_cpu.shape[0]) % align
+        if rem:
+            w_cpu = torch.nn.functional.pad(w_cpu, (0, 0, 0, align - rem))
+    packed = transform_linear_weight(w_cpu, 1, num_cores)
     # The text embedding remains live. Preserve both Parameter tying and
     # storage aliases; only an independent CPU head can retire here.
     if (release_source and output is not None and weight.device.type == "cpu"
@@ -581,6 +589,44 @@ def _check_quant_checkpoint_loaded(model) -> None:
     )
 
 
+def _with_quant_config(config, quant):
+    """Return a shallow config copy carrying ``quant``; ``config`` is unchanged."""
+    if isinstance(config, Mapping):
+        return dict(config, quant_config=quant)
+    stamped = copy.copy(config)
+    stamped.quant_config = quant
+    return stamped
+
+
+def _bind_install_quantization(model, quantization, execution_config) -> None:
+    """Stamp the install-time NVFP4 policy before any config-driven admission.
+
+    Every later check (core profile, MLP width, 27B resource plan, retained
+    prefill lifecycle, installer) then takes its quantized path. The recipe is
+    cold: a model keeps the recipe it was first bound with, and a later adapter
+    that passes ``quantization=None`` reuses it.
+    """
+    installed = getattr(model, "_qwen3_5_install_quantization", None)
+    if installed is not None:
+        if quantization not in (None, installed):
+            raise UnsupportedModelError(
+                "Qwen3.5 on-install quantization is cold-only; reload the model to change it")
+        return
+    if quantization is None:
+        return
+    fusion = getattr(model, "model", model)
+    inner = getattr(fusion, "language_model", fusion)
+    if (getattr(model, "_rpu_swizzled", False) or getattr(model, "_rpu_swizzle_started", False)
+            or getattr(inner, "_rpu_qwen3_5_text_install_started", False)):
+        raise UnsupportedModelError(
+            "Qwen3.5 on-install quantization must be bound before installation; reload the model")
+    Qwen3_5Adapter.preflight_quantization(model.config, execution_config, quantization)
+    policy = nvfp4_text_quant_config()
+    model.config.quant_config = policy
+    model._qwen3_5_quant_config = dict(policy)
+    model._qwen3_5_install_quantization = quantization
+
+
 def _check_quant_policy(config) -> None:
     """Validate the declared quantization scope before loading weights.
 
@@ -636,7 +682,38 @@ class Qwen3_5Adapter:
 
     _EXECUTION_SUPPORTED = _QWEN3_5_EXECUTION_SUPPORTED
 
-    def __init__(self, model, *, rpu_execution=None):
+    @classmethod
+    def preflight_quantization(cls, config, execution_config, quantization):
+        """Admit install-time dense text NVFP4 from an exact FP16 source.
+
+        ``quantization="nvfp4"`` quantizes every text projection except GDN b/a
+        once during installation; GDN b/a, the output head, embedding, norms,
+        conv1d and Vision stay FP16. Pure text only, at 4, 6 or 8 cores.
+        """
+        try:
+            if quantization != NVFP4:
+                raise ValueError(f"unknown on-install recipe {quantization!r}")
+            for owner in (config, _text_config(config)):
+                for name in ("quant_config", "quantization_config"):
+                    value = (owner.get(name) if isinstance(owner, Mapping)
+                             else getattr(owner, name, None))
+                    if value is not None:
+                        raise ValueError("the source already declares quantization metadata")
+            if qwen35_vision_requested(execution_config):
+                raise ValueError("Vision is not admitted")
+            stamped = _with_quant_config(config, nvfp4_text_quant_config())
+            from .cores import _validate_dense_text_profile, validate_core_profile
+            _check_profile(stamped)
+            _validate_layer_types(stamped)
+            _validate_dense_text_profile(stamped)
+            validate_core_profile(stamped, execution_config)
+        except ValueError as exc:
+            raise UnsupportedModelError(
+                "on-install NVFP4 requires exact dense Qwen3.5 0.8B/2B/4B/9B/27B "
+                "FP16 source weights, pure text and model.num_cores 4, 6 or 8; GDN b/a, "
+                "output head, embedding and norms remain FP16: " + str(exc)) from exc
+
+    def __init__(self, model, *, rpu_execution=None, quantization=None):
         from rpu_backend.api._execution import (
             bind_rpu_execution,
             normalize_rpu_execution,
@@ -660,6 +737,10 @@ class Qwen3_5Adapter:
                 )
 
         self.model = model
+        _bind_install_quantization(
+            model, quantization,
+            normalized_execution if rpu_execution is not None
+            else getattr(model, "_rpu_execution", None))
         _check_quant_policy(model.config)
         _check_profile(model.config)
         _validate_layer_types(model.config)
@@ -761,8 +842,11 @@ class Qwen3_5Adapter:
         )
         validate_core_profile(config, execution_config)
         awq = quanttrio_awq_config(config)
-        if (awq is not None or is_mlp_only_text_profile(config)) and qwen35_vision_requested(execution_config):
-            recipe = "QuantTrio AWQ" if awq is not None else "Qwen3.5 MLP-only W4"
+        nvfp4 = is_nvfp4_text_policy(getattr(config, "quant_config", None))
+        if ((awq is not None or nvfp4 or is_mlp_only_text_profile(config))
+                and qwen35_vision_requested(execution_config)):
+            recipe = ("QuantTrio AWQ" if awq is not None else "Qwen3.5 text NVFP4" if nvfp4
+                      else "Qwen3.5 MLP-only W4")
             raise UnsupportedModelError(f"{recipe} supports pure text only; Vision is not admitted")
         from .text import _validate_qwen35_linear_accumulation
         _validate_qwen35_linear_accumulation(config, execution_config)
@@ -1028,7 +1112,8 @@ class Qwen3_5Adapter:
             # Legacy direct allocations may retain physical pages after the
             # source tensor dies. Upload only the installer's finalized large
             # projections instead of creating a second raw device copy.
-            if not (is_legacy_text or modern27 or awq is not None):
+            if not (is_legacy_text or modern27 or awq is not None
+                    or is_nvfp4_text_policy(getattr(model.config, "quant_config", None))):
                 inner.to("rpu")
 
             # ── Step A: text backbone (swizzle + create + set_weights) ──
@@ -1290,7 +1375,12 @@ def _rpu_qwen3_5_forward(self, input_ids=None, inputs_embeds=None,
     logits = torch.ops.rpu.linear_with_accumulation(
         flat, self._lm_head_w_rpu_keepalive, None, 1,
         topology.lm_head_tp if topology is not None else 8, state.linear_acc32)
-    logits = logits.reshape(*head_in.shape[:-1], logits.shape[-1]).to("cpu").to(torch.float32)
+    logits = logits.reshape(*head_in.shape[:-1], logits.shape[-1]).to("cpu")
+    tc = getattr(getattr(self, "config", None), "text_config", getattr(self, "config", None))
+    logical_vocab = getattr(tc, "vocab_size", None)
+    if isinstance(logical_vocab, int) and not isinstance(logical_vocab, bool) and logits.shape[-1] > logical_vocab:
+        logits = logits[..., :logical_vocab]
+    logits = logits.to(torch.float32)
     return Qwen3_5CausalLMOutputWithPast(
         loss=None,
         logits=logits,

@@ -25,10 +25,15 @@ from safetensors.torch import load_file, save_file
 
 try:
     from ._common import quantize_linear_per_channel
+    from .precision_recipes import RECORD, produced, write_record
 except ImportError:  # standalone import (no rpu_backend package)
     from _common import quantize_linear_per_channel
+    from precision_recipes import RECORD, produced, write_record
 
 DEFAULT_SKIP_MODULES = ("embed_tokens",)
+# The registered precision recipe the default skip list produces; Wall-OSS RTC and
+# sorting load the same conversion.
+FAMILY, RECIPE = "wall_oss", "w8a16"
 
 
 def _scale_name(weight_name: str) -> str:
@@ -58,7 +63,7 @@ def _checkpoint_layout(src: Path):
 def _copy_sidecar_files(src: Path, dst: Path, shards) -> None:
     skip = set(shards) | {
         "model.safetensors", "model.safetensors.index.json",
-        "config.json", "rpu_quant_config.json",
+        "config.json", "rpu_quant_config.json", RECORD,
     }
     for path in sorted(src.iterdir()):
         if path.name in skip or not path.is_file():
@@ -82,8 +87,10 @@ def _quant_config(src: Path, skip_modules, quantized_weights) -> dict:
     }
 
 
-def convert_checkpoint(src, dst, *, skip_modules=DEFAULT_SKIP_MODULES):
+def convert_checkpoint(src, dst, *, skip_modules=DEFAULT_SKIP_MODULES, recipe=None):
+    """RECIPE, when given, must be the registered recipe SKIP_MODULES produces."""
     src, dst = Path(src).expanduser().resolve(), Path(dst).expanduser().resolve()
+    recipe = produced(FAMILY, RECIPE if tuple(skip_modules) == DEFAULT_SKIP_MODULES else None, recipe)
     if not src.is_dir():
         raise FileNotFoundError(f"--src not a dir: {src}")
     if dst.exists():
@@ -124,11 +131,12 @@ def convert_checkpoint(src, dst, *, skip_modules=DEFAULT_SKIP_MODULES):
         json.dump(_quant_config(src, skip_modules, quantized),
                   (tmp / "rpu_quant_config.json").open("w"), indent=2)
         _copy_sidecar_files(src, tmp, set(shards))
+        write_record(tmp, FAMILY, recipe)
         tmp.rename(dst)
     except Exception:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
-    return {"n_quantized": len(quantized), "n_copied": n_copied, "n_shards": len(shards)}
+    return {"recipe": recipe, "n_quantized": len(quantized), "n_copied": n_copied, "n_shards": len(shards)}
 
 
 def main(argv=None):

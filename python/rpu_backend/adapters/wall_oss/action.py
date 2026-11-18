@@ -34,7 +34,7 @@ import torch.nn.functional as F
 
 import rpu_backend
 from rpu_backend.runtime import rpu_env_bool
-from rpu_backend.adapters.wall_oss._sorting import sorting_config_from_env
+from rpu_backend.adapters.wall_oss._sorting import WallSortingConfig, sorting_config_from_env
 from rpu_backend.runtime.masks import versioned_cpu_mask
 from rpu_backend.runtime.decoder import plan_bounded_prefill_execution
 from rpu_backend.runtime.execution_planner import (
@@ -46,7 +46,7 @@ from rpu_backend.runtime.weights import (
     tp_row_swizzle_mc_weight,
 )
 from rpu_backend.adapters.wall_oss.llm import (
-    _MLP_CORES, _resolve_ckpt, _eff_attn_tp, _replicate_kv,
+    _MLP_CORES, _REDUCED_ATTN_TP, _resolve_ckpt, _eff_attn_tp, _replicate_kv,
     _SafeTensorStore, _split_qkv, _to_rpu_half, _to_rpu_int8, _pack_int4_rpu, _build_rope_tables,
     _chan_first_scale, _scale_to_rpu,
     _pack_nvfp4_rpu, _nvfp4_tensor_scale_array,
@@ -301,16 +301,22 @@ def _destroy_action_handle(h, fused):
 
 def _configure_action_handle(
     *, fused, set_weights, weight_args, chunk_size_override=0,
-    kv_owner_fanout=False, sorting=None, linear_acc32=False, max_seq_len=2048,
+    kv_owner_fanout=False, sorting=None, linear_acc32=False, max_seq_len=2048, num_cores=8,
 ):
-    """Create/configure an action handle, destroying it on failure."""
+    """Create/configure an action handle, destroying it on failure.
+
+    Below eight cores only the fused owner exists; it runs its execution prefix
+    and the native readback must match the four-lane weight layout.
+    """
     from rpu_backend.api._execution import _require_execution_process_safe
     _require_execution_process_safe()
+    if num_cores != 8 and not fused:
+        raise ValueError("Wall-OSS action below eight cores requires the fused owner")
     create = (
         torch.ops.rpu.wall_oss_action_step_create
         if fused else torch.ops.rpu.causal_decoder_create
     )
-    handle = create()
+    handle = create() if num_cores == 8 else create(num_cores=num_cores)
     try:
         if linear_acc32:
             set_acc32 = (
@@ -325,6 +331,13 @@ def _configure_action_handle(
             )
             set_routes(handle, *sorting.decoder_args())
         set_weights(handle, *weight_args)
+        if num_cores != 8:
+            native = tuple(torch.ops.rpu.wall_oss_action_step_topology(handle))
+            expected = (num_cores, num_cores, num_cores, 4, 8)
+            if native != expected:
+                raise RuntimeError(
+                    "Wall-OSS native action topology differs from its weight layout: "
+                    f"actual={native}, expected={expected}")
         if kv_owner_fanout:
             if not fused:
                 raise ValueError("K/V owner fanout requires fused=True")
@@ -1359,7 +1372,8 @@ def _load_expert1_decoder(st, cfg, num_layers, max_seq_len, *, w8a16: bool = Fal
                           action_chunk_size: int = 0,
                           weight_residency: bool = False,
                           kv_owner_fanout: bool = False,
-                          sorting=None, linear_acc32: bool = False):
+                          sorting=None, linear_acc32: bool = False,
+                          num_cores: int = 8):
     """Load expert-1 (action) decoder weights and install the device decoder handle.
 
     Same split/swizzle@attn_tp=2 + QKV-bias path as P1's `build_wall_oss_llm`, but at the
@@ -1380,8 +1394,10 @@ def _load_expert1_decoder(st, cfg, num_layers, max_seq_len, *, w8a16: bool = Fal
     EPS = cfg["rms_norm_eps"]
     THETA = cfg["rope_theta"]
     MROPE = list(cfg["rope_scaling"]["mrope_section"])
-    ATTN_TP = _eff_attn_tp(NKV)     # 2 (default) or 8 via RPU_WALL_OSS_ATTN_TP8
-    REP = ATTN_TP // NKV            # KV-head replication factor (1 or 4)
+    # 2 (default) or 8 via RPU_WALL_OSS_ATTN_TP8; 4 below eight execution cores.
+    ATTN_TP = _eff_attn_tp(NKV, num_cores)
+    MLP_TP = num_cores
+    REP = ATTN_TP // NKV            # KV-head replication factor (1, 2 or 4)
     NKV_EFF = NKV * REP             # effective KV heads the C++ decoder sees (== ATTN_TP)
     fp16_transfer = _action_fp16_transfer(sorting, w8a16, w4a16, nvfp4a16)
     if weight_residency and not (
@@ -1494,9 +1510,9 @@ def _load_expert1_decoder(st, cfg, num_layers, max_seq_len, *, w8a16: bool = Fal
             up_s = gu_s[INTER:2 * INTER].contiguous()
             down_s = _chan_first_scale(gr(f"{p}.moe.experts.1.down_proj.weight_scale"))
             if w8a16:
-                gate_list.append(_to_rpu_int8(tp_col_swizzle_mc_weight(gate_w, _MLP_CORES, dwidth=1)))
-                up_list.append(_to_rpu_int8(tp_col_swizzle_mc_weight(up_w, _MLP_CORES, dwidth=1)))
-                down_list.append(_to_rpu_int8(tp_row_swizzle_mc_weight(down_w, _MLP_CORES, dwidth=1)))
+                gate_list.append(_to_rpu_int8(tp_col_swizzle_mc_weight(gate_w, MLP_TP, dwidth=1)))
+                up_list.append(_to_rpu_int8(tp_col_swizzle_mc_weight(up_w, MLP_TP, dwidth=1)))
+                down_list.append(_to_rpu_int8(tp_row_swizzle_mc_weight(down_w, MLP_TP, dwidth=1)))
             else:  # w4a16: expert-1 INTER=2048, so down (K=2048) IS int4 (2048 % 512 == 0)
                 gate_list.append(_pack_int4_rpu(gate_w, 1, _MLP_CORES))
                 up_list.append(_pack_int4_rpu(up_w, 1, _MLP_CORES))
@@ -1516,16 +1532,16 @@ def _load_expert1_decoder(st, cfg, num_layers, max_seq_len, *, w8a16: bool = Fal
                     down_s, in_features=INTER, partition=0,
                     num_cores=_MLP_CORES))
         elif nvfp4a16:
-            gate_wq, gate_s, gate_ts = _pack_nvfp4_rpu(gate_w, 1, _MLP_CORES)
-            up_wq, up_s, up_ts = _pack_nvfp4_rpu(up_w, 1, _MLP_CORES)
-            down_wq, down_s, down_ts = _pack_nvfp4_rpu(down_w, 0, _MLP_CORES)
+            gate_wq, gate_s, gate_ts = _pack_nvfp4_rpu(gate_w, 1, MLP_TP)
+            up_wq, up_s, up_ts = _pack_nvfp4_rpu(up_w, 1, MLP_TP)
+            down_wq, down_s, down_ts = _pack_nvfp4_rpu(down_w, 0, MLP_TP)
             gate_list.append(gate_wq); gate_s_list.append(gate_s); gate_ts_list.append(gate_ts)
             up_list.append(up_wq); up_s_list.append(up_s); up_ts_list.append(up_ts)
             down_list.append(down_wq); down_s_list.append(down_s); down_ts_list.append(down_ts)
         else:
-            gate_list.append(_to_rpu_half(tp_col_swizzle_mc_weight(gate_w.half(), _MLP_CORES)))
-            up_list.append(_to_rpu_half(tp_col_swizzle_mc_weight(up_w.half(), _MLP_CORES)))
-            down_list.append(_to_rpu_half(tp_row_swizzle_mc_weight(down_w.half(), _MLP_CORES)))
+            gate_list.append(_to_rpu_half(tp_col_swizzle_mc_weight(gate_w.half(), MLP_TP)))
+            up_list.append(_to_rpu_half(tp_col_swizzle_mc_weight(up_w.half(), MLP_TP)))
+            down_list.append(_to_rpu_half(tp_row_swizzle_mc_weight(down_w.half(), MLP_TP)))
 
         in_norm_list.append(_to_rpu_half(gf(f"{p}.input_layernorms.1.weight")))
         post_norm_list.append(_to_rpu_half(gf(f"{p}.post_attention_layernorms.1.weight")))
@@ -1569,7 +1585,7 @@ def _load_expert1_decoder(st, cfg, num_layers, max_seq_len, *, w8a16: bool = Fal
             weight_args=weight_args,
             max_seq_len=max_seq_len,
             kv_owner_fanout=kv_owner_fanout, sorting=sorting,
-            linear_acc32=linear_acc32,
+            linear_acc32=linear_acc32, num_cores=num_cores,
         )
         if weight_residency:
             resident_bundle_cpu = resident_bundle_rpu = None
@@ -1643,7 +1659,7 @@ def _load_expert1_decoder(st, cfg, num_layers, max_seq_len, *, w8a16: bool = Fal
     return handle, H, INTER
 
 
-def _build_fused_action_weights(g, AH, AD, chunk_size):
+def _build_fused_action_weights(g, AH, AD, chunk_size, num_cores=8):
     """Fold the action preprocessor by linearity (Task 2) into single-core-swizzled
     on-device weights + the CPU fp32 pieces the per-step B_step precompute needs.
 
@@ -1661,7 +1677,7 @@ def _build_fused_action_weights(g, AH, AD, chunk_size):
     proj_back_p = F.pad(proj_back, (0, 0, 0, action_dim_pad - AD))  # [action_dim_pad, AH]
     fused_action = {
         "w_comb":    _to_rpu_half(tp_col_swizzle_mc_weight(w_comb_p.half(), 1)),
-        "w3":        _to_rpu_half(tp_col_swizzle_mc_weight(w3.half(), _MLP_CORES)),
+        "w3":        _to_rpu_half(tp_col_swizzle_mc_weight(w3.half(), 1 if num_cores != 8 else num_cores)),
         "proj_back": _to_rpu_half(tp_col_swizzle_mc_weight(proj_back_p.half(), 1)),
         # w2_t = w2[:,AH:] (time proj) and w2_a = w2[:,:AH] (action proj); single-core
         # col-swizzled. Enable the on-device base = ae_dof·w2_a and ct = te·w2_t (the whole
@@ -1718,12 +1734,19 @@ def build_wall_oss_action(
     from rpu_backend.api._execution import _require_execution_process_safe
     _require_execution_process_safe()
     from rpu_backend.api._execution import normalize_rpu_execution
-    action_execution = normalize_rpu_execution(
+    builder_execution = normalize_rpu_execution(
         {"action": ({} if execution_config is None else
-                    execution_config.get("action", {}))},
+                    execution_config.get("action", {})),
+         **({} if execution_config is None or "model" not in execution_config
+            else {"model": execution_config["model"]})},
         entry_point="build_wall_oss_action",
-        supported={"action": ("chunk_size", "linear_acc32")},
-    ).get("action", {})
+        supported={"action": ("chunk_size", "linear_acc32"), "model": ("num_cores",)},
+    )
+    action_execution = builder_execution.get("action", {})
+    # model.num_cores here is the composite budget: the owned text follows it and
+    # the expert runs its four-lane template in both reduced budgets.
+    budget = builder_execution.get("model", {}).get("num_cores", 8)
+    num_cores = 8 if budget == 8 else _REDUCED_ATTN_TP
     linear_acc32 = action_execution.get("linear_acc32", False)
     if linear_acc32 and not fused:
         raise ValueError("Wall-OSS action.linear_acc32=True requires fused=True")
@@ -1756,6 +1779,23 @@ def build_wall_oss_action(
     kv_owner_fanout = rpu_env_bool(
         "RPU_WALL_OSS_ACTION_KV_OWNER_FANOUT", default=False
     )
+    if budget != 8:
+        selected = [name for name, active in (
+            ("fused=False", not fused), ("w4a16", w4a16),
+            ("linear_acc32", linear_acc32),
+            ("RPU_WALL_OSS_ACTION_WEIGHT_RESIDENCY", weight_residency),
+            ("RPU_WALL_OSS_ACTION_KV_OWNER_FANOUT", kv_owner_fanout),
+            ("Wall sorting routes", sorting != WallSortingConfig()),
+        ) if active]
+        if selected:
+            raise ValueError(
+                f"{budget}-core Wall-OSS action admits only the fused FP16, W8A16 or "
+                f"NVFP4 expert (RTC included) with ordinary routes; refused: "
+                f"{', '.join(selected)}")
+        if graph_runtime_policy is not None and (
+                graph_runtime_policy.execution_core_count != num_cores):
+            raise ValueError(
+                "Wall-OSS action graph_runtime_policy core count must be its four lanes")
     if linear_acc32 and (weight_residency or kv_owner_fanout):
         raise ValueError("Wall-OSS Action ACC32 does not support weight residency or K/V owner fanout")
     fp16_transfer = _action_fp16_transfer(sorting, w8a16, w4a16, nvfp4a16)
@@ -1788,6 +1828,12 @@ def build_wall_oss_action(
         if causal_action_attention_mask:
             raise ValueError(
                 "Wall-OSS RTC requires causal_action_attention_mask=false")
+        if budget != 8 and getattr(llm, "residual_scale", 1) == 1:
+            # The RTC prefix overflows an unscaled FP16 expert-0 residual.
+            raise ValueError(
+                f"{budget}-core Wall-OSS RTC needs the residual-scaled expert 0: "
+                "build through build_wall_oss_vla(rtc=True) or pass llm= built "
+                "with residual_scale=4")
     owns_llm = llm is None
     if owns_llm:
         llm = build_wall_oss_llm(ckpt_dir, expert=0, max_seq_len=max_seq_len,
@@ -1795,9 +1841,18 @@ def build_wall_oss_action(
                                  nvfp4a16=nvfp4a16,
                                  fp16_ckpt_dir=fp16_ckpt_dir,
                                  execution_config=execution_config,
+                                 # A reduced policy names one component's prefix.
                                  **({"graph_runtime_policy": graph_runtime_policy}
-                                    if graph_runtime_policy is not None else {}))
+                                    if graph_runtime_policy is not None and budget == 8
+                                    else {}))
     try:
+        if budget != 8:
+            expected_attention = _eff_attn_tp(cfg["num_key_value_heads"], budget)
+            if int(llm._attn_geometry["num_cores"]) != expected_attention:
+                raise ValueError(
+                    "shared-cache action needs the text attention layout: "
+                    f"text attn_tp={llm._attn_geometry['num_cores']}, "
+                    f"model.num_cores={budget} requires {expected_attention}")
         num_layers = cfg["num_hidden_layers"]
         if llm.num_layers != num_layers:
             raise ValueError(
@@ -1821,10 +1876,13 @@ def build_wall_oss_action(
         w2 = g("action_preprocessor.w2.weight")
         w3 = g("action_preprocessor.w3.weight")
         fused_action, fused_extra = (
-            _build_fused_action_weights(g, AH, AD, action_chunk_size)
+            _build_fused_action_weights(g, AH, AD, action_chunk_size, num_cores)
             if fused else (None, None)
         )
         partial_mrope = _partial_mrope_enabled()
+        if graph_runtime_policy is None and num_cores != 8:
+            graph_runtime_policy = rpu_backend.graph.GraphRuntimePolicy.from_environment(
+                execution_core_count=num_cores)
         graph_cache = rpu_backend.graph.GraphCache(
             **({"runtime_policy": graph_runtime_policy}
                if graph_runtime_policy is not None else {}))
@@ -1848,7 +1906,7 @@ def build_wall_oss_action(
                 action_chunk_size=action_chunk_size,
                 weight_residency=weight_residency,
                 kv_owner_fanout=kv_owner_fanout, sorting=sorting,
-                linear_acc32=linear_acc32,
+                linear_acc32=linear_acc32, num_cores=num_cores,
             )
             model = WallOssAction.__new__(WallOssAction)
             model._handle, model._graph_cache, model._closed = handle, graph_cache, False

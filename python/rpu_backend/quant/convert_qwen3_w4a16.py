@@ -40,7 +40,10 @@ from rpu_backend.quant.int4_pgrp_pack import (
     swizzle_pack_int4_pgrp,
     w4_storage_shape,
 )
-from rpu_backend.runtime.topology import decoder_packed_w4_mlp_intermediate_size
+from rpu_backend.runtime.topology import (
+    decoder_lm_head_vocab_size,
+    decoder_packed_w4_mlp_intermediate_size,
+)
 
 NUM_CORES = 8
 # Group-wise (pgrp / AWQ-style) group size along K. 32 matches the Wall-OSS
@@ -96,9 +99,9 @@ def packed_mlp_padded_size(role: str, linear: nn.Linear, mlp_tp: int) -> int | N
     return physical if physical != logical else None
 
 
-def pack_linear_int4_(linear: nn.Linear, partition: int, name: str = "",
-                      group_size: int | None = None, *, num_cores: int = NUM_CORES,
-                      padded_size: int | None = None) -> None:
+def pack_int4_weight(w: torch.Tensor, partition: int, name: str = "",
+                     group_size: int | None = None, *, num_cores: int = NUM_CORES,
+                     padded_size: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """Pack fp16 [N,K] into N32K32 uint8 with TP-aware N padding and FP16 scale.
 
     group_size None -> logical per-channel, repeated over K/32 groups.
@@ -106,9 +109,7 @@ def pack_linear_int4_(linear: nn.Linear, partition: int, name: str = "",
     Both produce the same controller-striped 2-D physical scale ABI.
     padded_size widens an MLP stripe after logical quantization: col
     partition pads N, row partition pads K, with zero values and unit scales.
-    Linear features become physical; model config stays logical.
     """
-    w = linear.weight.detach()
     n, k = int(w.shape[0]), int(w.shape[1])
     if padded_size is not None:
         if padded_size < (n if partition == 1 else k):
@@ -140,9 +141,23 @@ def pack_linear_int4_(linear: nn.Linear, partition: int, name: str = "",
     packed = swizzle_pack_int4_pgrp(vals, partition, num_cores).reshape(
         w4_storage_shape(pn, pk, partition, num_cores))
     scale = swizzle_int4_pgrp_scale(logical_scale, scale_group, partition, num_cores)
+    return packed.to(torch.uint8).contiguous(), scale.to(torch.float16).contiguous()
 
-    linear.weight = nn.Parameter(
-        packed.to(torch.uint8).contiguous(), requires_grad=False)
+
+def pack_linear_int4_(linear: nn.Linear, partition: int, name: str = "",
+                      group_size: int | None = None, *, num_cores: int = NUM_CORES,
+                      padded_size: int | None = None) -> None:
+    """In-place ``pack_int4_weight`` of one Linear: packed uint8 weight + fp16 scale.
+
+    Linear features become physical; model config stays logical.
+    """
+    n, k = int(linear.weight.shape[0]), int(linear.weight.shape[1])
+    pn, pk = ((padded_size, k) if partition == 1 else (n, padded_size)
+              ) if padded_size is not None else (n, k)
+    packed, scale = pack_int4_weight(
+        linear.weight.detach(), partition, name, group_size,
+        num_cores=num_cores, padded_size=padded_size)
+    linear.weight = nn.Parameter(packed, requires_grad=False)
     linear.out_features, linear.in_features = pn, pk
     # register_buffer, NOT a plain attribute: `model.to('rpu')` only migrates
     # parameters and buffers. A plain attribute leaves the scale on the host,
@@ -152,9 +167,7 @@ def pack_linear_int4_(linear: nn.Linear, partition: int, name: str = "",
     # the same thing for the W8A16 checkpoint scales.
     if hasattr(linear, "weight_scale"):
         del linear.weight_scale
-    linear.register_buffer("weight_scale",
-                           scale.to(torch.float16).contiguous(),
-                           persistent=False)
+    linear.register_buffer("weight_scale", scale, persistent=False)
 
 
 def convert_qwen3_to_w4a16_(model, group_size: int | None = None,
@@ -179,7 +192,9 @@ def convert_qwen3_to_w4a16_(model, group_size: int | None = None,
             raise ValueError("W4 lm_head requires group_size=32")
         if model.lm_head.weight.dtype != torch.float16:
             raise TypeError("W4 lm_head requires original FP16 weights")
-        _check_int4_shape("lm_head", *model.lm_head.weight.shape, 1, head_tp)
+        head_n, head_k = model.lm_head.weight.shape
+        padded_head_n = decoder_lm_head_vocab_size(head_n, head_tp)
+        _check_int4_shape("lm_head", padded_head_n, head_k, 1, head_tp)
     for i, layer in enumerate(model.model.layers):
         for dotted, partition in _PROJECTIONS:
             mod = _get(layer, dotted)
@@ -193,11 +208,18 @@ def convert_qwen3_to_w4a16_(model, group_size: int | None = None,
         head = model.lm_head
         if head.weight.dtype != torch.float16:
             raise TypeError("W4 lm_head requires original FP16 weights")
+        head_w = head.weight.detach()
+        padded_head_n = decoder_lm_head_vocab_size(int(head_w.shape[0]), head_tp)
+        if padded_head_n != int(head_w.shape[0]):
+            padded = head_w.new_zeros((padded_head_n, int(head_w.shape[1])))
+            padded[:head_w.shape[0]].copy_(head_w)
+            head_w = padded
         packed, scale = quantize_pack_int4_pgrp_col_bounded(
-            head.weight, group_size, num_cores=head_tp)
+            head_w, group_size, num_cores=head_tp)
         # Replace only the head Parameter. The 0.6/1.7/4B source ties it to
         # embed_tokens; the embedding must retain the original FP16 storage.
         head.weight = nn.Parameter(packed, requires_grad=False)
+        head.out_features = padded_head_n
         head.register_buffer("weight_scale", scale, persistent=False)
 
 

@@ -182,6 +182,26 @@ def _siglip_w8a16_enabled(default_enabled: bool = False) -> bool:
     return rpu_env_bool("RPU_PI05_SIGLIP_W8A16", default=default_enabled)
 
 
+def _siglip_w4a16_enabled() -> bool:
+    # Cold Pi0.5 Vision W4 selector, default off. It replaces the W8 of all six
+    # encoder projections with symmetric RTN W4/G32, so it needs
+    # RPU_PI05_SIGLIP_W8A16 on with scope all and the four-lane SigLIP.
+    return rpu_env_bool("RPU_PI05_SIGLIP_W4A16", default=False)
+
+
+_SIGLIP_W4_GROUP_SIZE = 32
+_SIGLIP_PROJECTION_NAMES = frozenset({
+    "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+    "self_attn.out_proj", "mlp.fc1", "mlp.fc2",
+})
+# Four lanes only: at eight, the padded o (K1280) and fc2 (K4352) rows split
+# into 160 and 544 per core, which are not the 64-aligned pgrp W4 lanes.
+SIGLIP_W4A16_EIGHT_LANES = (
+    "SigLIP Vision W4 runs on four lanes only: the padded o (K1280) and fc2 "
+    "(K4352) rows split into 160 and 544 per core on eight, not 64-aligned "
+    "pgrp W4 lanes")
+
+
 def _siglip_w8a16_projection_names(default_enabled: bool = False) -> set[str]:
     if not _siglip_w8a16_enabled(default_enabled=default_enabled):
         return set()
@@ -204,6 +224,102 @@ def _siglip_w8a16_projection_names(default_enabled: bool = False) -> set[str]:
         "RPU_PI05_SIGLIP_W8A16_SCOPE must be one of row,out_proj,fc2,all,none; "
         f"got {raw!r}"
     )
+
+
+
+def _validate_siglip_w8a8(
+    vision_model, projector, *, qkv_w8a8=False, mlp_w8a8=False, num_images=1,
+    num_cores=8, linear_acc32=None, w8a16_default=False,
+) -> None:
+    """Validate bounded producer/W8A8 routes before uploads or weight mutation.
+
+    Raw Pi FP16 checkpoints use the existing W8 conversion and padding. An
+    already converted install can reuse its INT8 weights and FP16 scales.
+    Raw INT8 is not admitted: this converter does not consume its scales.
+    """
+    for selector, enabled in (("qkv_w8a8", qkv_w8a8), ("mlp_w8a8", mlp_w8a8)):
+        if type(enabled) is not bool:
+            raise TypeError(f"SigLIP {selector} must be bool")
+    if not (qkv_w8a8 or mlp_w8a8):
+        return
+    route = "/".join(name for name, enabled in
+                     (("qkv_w8a8", qkv_w8a8), ("mlp_w8a8", mlp_w8a8)) if enabled)
+    if linear_acc32 is not None and type(linear_acc32) is not bool:
+        raise TypeError("SigLIP linear_acc32 must be bool or None")
+    if linear_acc32 is True:
+        raise ValueError(f"SigLIP {route} requires ACC16 (linear_acc32=False)")
+    if type(num_cores) is not int or num_cores != 8:
+        raise ValueError(f"SigLIP {route} requires exactly eight cores")
+    if type(num_images) is not int or num_images not in (2, 3):
+        raise ValueError(f"SigLIP {route} requires two or three packed images")
+    if mlp_w8a8:
+        for flag, required in (("RPU_PI05_RING_XOR3", True),
+                               ("RPU_PI05_VISION_OWNER_LN", True),
+                               ("RPU_PI05_VISION_KV_SPM_ONLY", True),
+                               ("RPU_PI05_VISION_FC_WEIGHT_OUTER", False)):
+            if rpu_env_bool(flag, cpp_mirror="src/fused/pi05_kernel_policy.h") != required:
+                raise ValueError(f"SigLIP mlp_w8a8 requires {flag}={int(required)}")
+
+    config = vision_model.config
+    layers = vision_model.encoder.layers
+    leaf = projector.linear if hasattr(projector, "linear") else projector
+    if (len(layers) != 27 or config.hidden_size != 1152
+            or config.num_attention_heads != 16
+            or config.intermediate_size not in (4304, 4352)
+            or leaf.out_features != 2048
+            or float(config.layer_norm_eps) != 1e-6):
+        raise ValueError(
+            f"SigLIP {route} requires 27 layers, H1152, 16 heads, "
+            "padded intermediate4352, projector2048 and eps1e-6")
+    converted = getattr(vision_model, "_rpu_siglip_weights_converted", False)
+    if converted and getattr(vision_model, "_rpu_vision_num_cores", 8) != 8:
+        raise ValueError(f"SigLIP {route} requires the existing TP8 weight layout")
+    required_names = set()
+    if qkv_w8a8 or mlp_w8a8:
+        required_names.update(("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"))
+    if mlp_w8a8:
+        # The owner-LN/XOR3 profile requires one dtype across all six projections.
+        required_names.update(("self_attn.out_proj", "mlp.fc1", "mlp.fc2"))
+    if not converted and not required_names.issubset(
+        _siglip_w8a16_projection_names(default_enabled=w8a16_default)
+    ):
+        projections = "every Q/K/V projection" if not mlp_w8a8 else "every Q/K/V/O and FC1/FC2 projection"
+        raise ValueError(f"SigLIP {route} requires W8A16 conversion for {projections}")
+
+    def require_tensor(tensor, shape, dtype, label):
+        if (tensor is None or tensor.dtype != dtype
+                or tuple(tensor.shape) != shape):
+            raise ValueError(f"SigLIP {route} requires {label} {dtype} {shape}")
+
+    dtype = torch.int8 if converted else torch.float16
+    qkv_rows = 1280 if converted else 1152
+    intermediate = 4352 if converted else config.intermediate_size
+    for index, layer in enumerate(layers):
+        projections = []
+        if qkv_w8a8 or mlp_w8a8:
+            projections.extend((getattr(layer.self_attn, name), name, qkv_rows, 1152)
+                               for name in ("q_proj", "k_proj", "v_proj"))
+        if mlp_w8a8:
+            projections.extend(((layer.self_attn.out_proj, "out_proj", 1152, qkv_rows),
+                                (layer.mlp.fc1, "fc1", intermediate, 1152),
+                                (layer.mlp.fc2, "fc2", 1152, intermediate)))
+        for projection, name, rows, cols in projections:
+            prefix = f"layer{index}.{name}"
+            require_tensor(projection.weight, (rows, cols), dtype, prefix + ".weight")
+            require_tensor(projection.bias, (rows,), torch.float16, prefix + ".bias")
+            if converted:
+                require_tensor(getattr(projection, "weight_scale", None),
+                               (rows,), torch.float16, prefix + ".weight_scale")
+            elif projection.weight.device.type != "cpu":
+                raise ValueError(f"SigLIP {route} conversion requires original CPU FP16 {name}")
+        for norm_name in ("layer_norm1", "layer_norm2"):
+            norm = getattr(layer, norm_name)
+            for name in ("weight", "bias"):
+                require_tensor(getattr(norm, name, None), (1152,), torch.float16,
+                               f"layer{index}.{norm_name}.{name}")
+    require_tensor(leaf.weight, (2048, 1152), torch.float16, "projector.weight")
+    if leaf.bias is not None:
+        require_tensor(leaf.bias, (2048,), torch.float16, "projector.bias")
 
 
 def _set_siglip_weight_scale(module: nn.Module, scale: torch.Tensor) -> None:
@@ -240,8 +356,18 @@ def _install_siglip_linear_weight(
     partition: int,
     w8a16: bool,
     num_cores: int = NUM_CORES,
+    w4a16: bool = False,
 ) -> None:
-    if w8a16:
+    if w4a16:
+        # pgrp packing replaces the TP swizzle; quantized after padding, so the
+        # G32 groups follow the physical K and the padding decodes to zero.
+        from rpu_backend.quant.convert_qwen3_w4a16 import pack_int4_weight
+        weight, scale = pack_int4_weight(
+            weight.contiguous().to(torch.float16), partition,
+            group_size=_SIGLIP_W4_GROUP_SIZE, num_cores=num_cores)
+        module.weight = nn.Parameter(weight, requires_grad=False)
+        _set_siglip_weight_scale(module, scale)
+    elif w8a16:
         weight, scale = _quantize_and_swizzle_siglip_weight(
             weight, partition=partition, num_cores=num_cores)
         module.weight = nn.Parameter(weight, requires_grad=False)
@@ -250,6 +376,24 @@ def _install_siglip_linear_weight(
         weight = transform_linear_weight(
             weight.contiguous(), partition=partition, num_cores=num_cores)
         module.weight = nn.Parameter(weight.contiguous(), requires_grad=False)
+
+
+def _fold_siglip_ln_beta(weight: torch.Tensor, bias: torch.Tensor,
+                         beta: torch.Tensor) -> torch.Tensor:
+    """Return ``bias + W4(weight) @ beta`` for a Linear fed by a LayerNorm.
+
+    W(g*xhat + beta) + bias == W(g*xhat) + (bias + W beta), so the RPU can run
+    the LayerNorm with a zero beta. ``W`` is the dequantized W4/G32 weight the
+    kernel computes with (the same quantizer ``pack_int4_weight`` runs), summed
+    in FP32 and rounded once to the bias dtype.
+    """
+    from rpu_backend.quant.int4_pgrp_pack import (
+        dequantize_int4_group_wise, quantize_int4_group_wise)
+    values, scale, _ = quantize_int4_group_wise(
+        weight.contiguous().to(torch.float16), _SIGLIP_W4_GROUP_SIZE)
+    weight_q = dequantize_int4_group_wise(values, scale).to(torch.float32)
+    folded = bias.to(torch.float32) + weight_q @ beta.to(torch.float32)
+    return folded.to(bias.dtype).contiguous()
 
 
 def _iter_siglip_encoder_projections(encoder):
@@ -306,8 +450,25 @@ def _detect_and_validate_siglip_encoder_w8a16(encoder) -> bool:
     return True
 
 
+def _detect_siglip_encoder_w4a16(encoder) -> bool:
+    """True when every encoder projection is packed W4 with its G32 scale."""
+    projections = list(_iter_siglip_encoder_projections(encoder))
+    packed = [module.weight.dtype == torch.uint8 for _, _, module in projections]
+    if not any(packed):
+        return False
+    for layer_idx, name, module in projections:
+        scale = getattr(module, "weight_scale", None)
+        if (module.weight.dtype != torch.uint8 or scale is None
+                or scale.dtype != torch.float16 or scale.dim() != 2
+                or scale.size(0) != _SIGLIP_W4_GROUP_SIZE):
+            raise RuntimeError(
+                "SigLIP W4A16 validation failed: packed W4 must cover all six "
+                f"projections with their G32 scale, not encoder.layers[{layer_idx}].{name}")
+    return True
+
+
 def _siglip_weight_to_rpu(module: nn.Linear) -> torch.Tensor:
-    if module.weight.dtype == torch.int8:
+    if module.weight.dtype in (torch.int8, torch.uint8):
         return module.weight.to(device="rpu").contiguous()
     return module.weight.to(dtype=torch.float16, device="rpu").contiguous()
 
@@ -338,8 +499,16 @@ def _siglip_destroy_handle(h):
 # `patch_siglip_model_for_rpu_all_layers_once` (line 108 below).
 
 
-def _convert_siglip_weights_for_rpu(vision_tower, *, w8a16_default: bool = False, num_cores: int = 8):
-    """Convert SigLIP encoder weights: pad head_dim/intermediate, swizzle for device.
+def _convert_siglip_weights_for_rpu(vision_tower, *, w8a16_default: bool = False, num_cores: int = 8,
+                                    w4a16: bool = False):
+    """Convert SigLIP encoder weights: pad head_dim/intermediate, swizzle for RPU.
+
+    W4A16 (default False) packs all six projections symmetric RTN W4/G32 after
+    padding instead of W8; it needs W8 on with scope all, four lanes and the
+    exact Pi0.5 SigLIP27 tower. It also folds each LayerNorm beta into the
+    Q/K/V and fc1 biases and zeroes it (``_siglip_ln_beta_folded``), which
+    keeps the four-lane tower's per-layer SPM within the Pi0.5 TP8 prefill
+    budget.
 
     Modifications:
       - Q/K/V weights: pad head_dim 72->80, col swizzle
@@ -348,7 +517,8 @@ def _convert_siglip_weights_for_rpu(vision_tower, *, w8a16_default: bool = False
       - fc1 weight: pad intermediate 4304->4352, col swizzle
       - fc1 bias: pad intermediate 4304->4352
       - fc2 weight: pad intermediate 4304->4352, row swizzle
-      - LayerNorm weight/bias: no change (replicated on all cores by C++)
+      - LayerNorm weight/bias: no change (replicated on all cores by C++);
+        W4A16 folds the bias into the Q/K/V and fc1 biases and zeroes it
 
     Idempotent: guards on the normalized vit object to prevent double-swizzle
     regardless of whether caller passes wrapper or inner vit.
@@ -357,13 +527,21 @@ def _convert_siglip_weights_for_rpu(vision_tower, *, w8a16_default: bool = False
     vit = vision_tower.vision_model if hasattr(vision_tower, 'vision_model') else vision_tower
     if type(num_cores) is not int or num_cores not in (4, 8):
         raise ValueError("SigLIP execution core count must be 4 or 8")
+    if type(w4a16) is not bool:
+        raise TypeError("SigLIP w4a16 must be bool")
     siglip_w8a16_names = _siglip_w8a16_projection_names(default_enabled=w8a16_default)
     siglip_w8a16 = bool(siglip_w8a16_names)
+    if w4a16 and num_cores != 4:
+        raise ValueError(SIGLIP_W4A16_EIGHT_LANES)
+    if w4a16 and siglip_w8a16_names != _SIGLIP_PROJECTION_NAMES:
+        raise ValueError("SigLIP Vision W4 requires RPU_PI05_SIGLIP_W8A16=1 with scope all")
 
     # Idempotence guard on the NORMALIZED vit object
     if getattr(vit, '_rpu_siglip_weights_converted', False):
         if getattr(vit, '_rpu_vision_num_cores', 8) != num_cores:
             raise ValueError('SigLIP core count is cold-only; reload before changing its weight layout')
+        if getattr(vit, '_siglip_w4a16', False) != w4a16:
+            raise ValueError('SigLIP Vision W4 is cold-only; reload before changing its weight layout')
         if siglip_w8a16 and not getattr(vit, '_siglip_w8a16', False):
             _LOG.warning(
                 "SigLIP W8A16 requested after encoder was already converted as fp16; "
@@ -391,7 +569,13 @@ def _convert_siglip_weights_for_rpu(vision_tower, *, w8a16_default: bool = False
               num_layers, hidden_size, num_heads)
     _LOG.info("  head_dim: %d -> %d, intermediate: %d -> %d",
               orig_head_dim, padded_head_dim, orig_intermediate, padded_intermediate)
-    if siglip_w8a16:
+    if w4a16:
+        if any(module.weight.dtype not in (torch.float16, torch.float32, torch.bfloat16)
+               for _, _, module in _iter_siglip_encoder_projections(encoder)):
+            raise ValueError("SigLIP Vision W4 quantizes floating-point encoder weights at install")
+        _LOG.info("  SigLIP encoder Linear weights: W4A16 G%d for all six projections",
+                  _SIGLIP_W4_GROUP_SIZE)
+    elif siglip_w8a16:
         _LOG.info("  SigLIP encoder Linear weights: W8A16 enabled for %s",
                   ",".join(sorted(siglip_w8a16_names)))
 
@@ -412,7 +596,8 @@ def _convert_siglip_weights_for_rpu(vision_tower, *, w8a16_default: bool = False
                 w = w.reshape(padded_qkv_out, hidden_size).contiguous()
                 _install_siglip_linear_weight(
                     proj, w, partition=1,
-                    w8a16=(f"self_attn.{proj_name}" in siglip_w8a16_names), num_cores=num_cores)
+                    w8a16=(f"self_attn.{proj_name}" in siglip_w8a16_names), num_cores=num_cores,
+                    w4a16=w4a16)
                 proj.out_features = padded_qkv_out
 
                 # Bias: [num_heads*orig_hd] -> pad -> [num_heads*padded_hd]
@@ -421,7 +606,10 @@ def _convert_siglip_weights_for_rpu(vision_tower, *, w8a16_default: bool = False
                     bpad = torch.zeros(num_heads, padded_head_dim - orig_head_dim,
                                        dtype=b.dtype, device=b.device)
                     b = torch.cat([b, bpad], dim=1)
-                proj.bias = nn.Parameter(b.reshape(-1).contiguous(), requires_grad=False)
+                b = b.reshape(-1)
+                if w4a16:
+                    b = _fold_siglip_ln_beta(w, b, layer.layer_norm1.bias.data)
+                proj.bias = nn.Parameter(b.contiguous(), requires_grad=False)
 
             # === O_proj (out_proj): [hidden, orig_in] -> pad -> [hidden, padded_in] -> row swizzle ===
             w = attn.out_proj.weight.data  # [hidden_size, num_heads*orig_hd]
@@ -433,7 +621,8 @@ def _convert_siglip_weights_for_rpu(vision_tower, *, w8a16_default: bool = False
             w = w.reshape(hidden_size, padded_qkv_out).contiguous()
             _install_siglip_linear_weight(
                 attn.out_proj, w, partition=0,
-                w8a16=("self_attn.out_proj" in siglip_w8a16_names), num_cores=num_cores)
+                w8a16=("self_attn.out_proj" in siglip_w8a16_names), num_cores=num_cores,
+                w4a16=w4a16)
             attn.out_proj.in_features = padded_qkv_out
             # O_proj bias: [hidden_size] -- no padding needed
 
@@ -445,7 +634,8 @@ def _convert_siglip_weights_for_rpu(vision_tower, *, w8a16_default: bool = False
                 w = torch.cat([w, pad], dim=0)
             _install_siglip_linear_weight(
                 mlp.fc1, w.contiguous(), partition=1,
-                w8a16=("mlp.fc1" in siglip_w8a16_names), num_cores=num_cores)
+                w8a16=("mlp.fc1" in siglip_w8a16_names), num_cores=num_cores,
+                w4a16=w4a16)
             mlp.fc1.out_features = padded_intermediate
 
             # fc1 bias: [orig_inter] -> pad -> [padded_inter]
@@ -454,6 +644,8 @@ def _convert_siglip_weights_for_rpu(vision_tower, *, w8a16_default: bool = False
                 bpad = torch.zeros(padded_intermediate - orig_intermediate,
                                    dtype=b.dtype, device=b.device)
                 b = torch.cat([b, bpad], dim=0)
+            if w4a16:
+                b = _fold_siglip_ln_beta(w, b, layer.layer_norm2.bias.data)
             mlp.fc1.bias = nn.Parameter(b.contiguous(), requires_grad=False)
 
             # === fc2: [hidden, orig_inter] -> pad -> [hidden, padded_inter] -> row swizzle ===
@@ -464,9 +656,15 @@ def _convert_siglip_weights_for_rpu(vision_tower, *, w8a16_default: bool = False
                 w = torch.cat([w, pad], dim=1)
             _install_siglip_linear_weight(
                 mlp.fc2, w.contiguous(), partition=0,
-                w8a16=("mlp.fc2" in siglip_w8a16_names), num_cores=num_cores)
+                w8a16=("mlp.fc2" in siglip_w8a16_names), num_cores=num_cores,
+                w4a16=w4a16)
             mlp.fc2.in_features = padded_intermediate
             # fc2 bias: [hidden_size] -- no padding needed
+
+            if w4a16:
+                # Both betas now live in the Q/K/V and fc1 biases.
+                for norm in (layer.layer_norm1, layer.layer_norm2):
+                    norm.bias = nn.Parameter(torch.zeros_like(norm.bias), requires_grad=False)
 
         # Store metadata for fused forward
         layer._rpu_layer_idx = layer_idx
@@ -477,8 +675,10 @@ def _convert_siglip_weights_for_rpu(vision_tower, *, w8a16_default: bool = False
 
     vit._rpu_vision_num_cores = num_cores
     vit._rpu_siglip_weights_converted = True
-    vit._siglip_w8a16 = siglip_w8a16
-    suffix = " (W8A16)" if siglip_w8a16 else ""
+    vit._siglip_w8a16 = siglip_w8a16 and not w4a16
+    vit._siglip_w4a16 = w4a16
+    vit._siglip_ln_beta_folded = w4a16
+    suffix = " (W4A16 G32)" if w4a16 else " (W8A16)" if siglip_w8a16 else ""
     _LOG.info("Converted %d SigLIP encoder layers%s", num_layers, suffix)
 
 
@@ -569,6 +769,8 @@ def patch_siglip_embeddings_for_rpu(embeddings_module, num_cores=8):
 _SIGLIP_RUNTIME_INSTALL_ATTRS = (
     "_test_siglip_weight_args_tuple",
     "_siglip_w8a16",
+    "_siglip_qkv_w8a8",
+    "_siglip_mlp_w8a8",
     "_rpu_cache",
     "_rpu_siglip_graph_cache",
     "_rpu_lazy_init_checked",
@@ -585,7 +787,10 @@ def patch_siglip_model_for_rpu_all_layers_once(vision_model, projector,
                                                num_images: int = 1,
                                                w8a16_default: bool = False,
                                                num_cores: int = 8,
-                                               *, runtime_policy=None, linear_acc32=None) -> int:
+                                               *, runtime_policy=None, linear_acc32=None,
+                                               w4a16: bool = False,
+                                               qkv_w8a8: bool = False,
+                                               mlp_w8a8: bool = False) -> int:
     """
     Patch a Pi0.5 SigLIP vision model instance to use all-layers-once
     C++ execution via SigLIPModel (FusedModelBase).
@@ -623,12 +828,31 @@ def patch_siglip_model_for_rpu_all_layers_once(vision_model, projector,
     if linear_acc32 is not None and type(linear_acc32) is not bool:
         raise TypeError("SigLIP linear_acc32 must be bool or None")
 
+    if w4a16 and (qkv_w8a8 or mlp_w8a8):
+        raise ValueError("SigLIP W8A8 requires W8A16 weights; it cannot use w4a16")
+
+    _validate_siglip_w8a8(
+        vision_model, projector, qkv_w8a8=qkv_w8a8, mlp_w8a8=mlp_w8a8,
+        num_images=num_images, num_cores=num_cores,
+        linear_acc32=linear_acc32, w8a16_default=w8a16_default)
+
     from rpu_backend.api._execution import _require_execution_process_safe
     from rpu_backend.runtime._native_retirement import _InstalledNativeResource
 
     _require_execution_process_safe()
-    if type(num_cores) is not int or num_cores not in (4, 8) or (num_cores == 4 and num_images != 1):
-        raise ValueError("SigLIP4 requires the fixed serial one-image profile")
+    allowed_four_lane_images = (1,) if w4a16 else (1, 2, 3)
+    if (
+        type(num_cores) is not int
+        or num_cores not in (4, 8)
+        or (
+            num_cores == 4
+            and (type(num_images) is not int or num_images not in allowed_four_lane_images)
+        )
+    ):
+        raise ValueError(
+            "SigLIP4 requires the fixed serial one-image profile "
+            "(or admitted packed 2/3-image FP16/W8 profile)"
+        )
     if runtime_policy is not None:
         if runtime_policy.execution_core_count < num_cores:
             raise ValueError("SigLIP Graph policy cannot run fewer cores than its weights")
@@ -678,11 +902,17 @@ def patch_siglip_model_for_rpu_all_layers_once(vision_model, projector,
     # ------------------------------------------------------------------ #
     # v5-05 D-02: helpers are now module-private (defined above).
     # Encoder conversion
-    _convert_siglip_weights_for_rpu(vision_model, w8a16_default=w8a16_default, num_cores=num_cores)
+    _convert_siglip_weights_for_rpu(vision_model, w8a16_default=w8a16_default, num_cores=num_cores,
+                                    w4a16=w4a16)
 
     # Projector conversion
     _convert_siglip_projector_for_rpu(projector, num_cores=num_cores)
     siglip_w8a16 = _detect_and_validate_siglip_encoder_w8a16(encoder)
+    siglip_w4a16 = _detect_siglip_encoder_w4a16(encoder)
+    if siglip_w4a16 != w4a16:
+        raise ValueError("SigLIP encoder weights do not match the requested Vision W4 install")
+    if siglip_w4a16 and getattr(vision_model, "_siglip_ln_beta_folded", False) is not True:
+        raise ValueError("SigLIP Vision W4 needs its LayerNorm beta folded at conversion")
 
     # ------------------------------------------------------------------ #
     # Step 3: gather per-layer weights
@@ -706,23 +936,17 @@ def patch_siglip_model_for_rpu_all_layers_once(vision_model, projector,
 
         fc1_w_list.append(_siglip_weight_to_rpu(mlp.fc1))
         fc2_w_list.append(_siglip_weight_to_rpu(mlp.fc2))
-        if sa.q_proj.weight.dtype == torch.int8:
-            q_ws_list.append(_siglip_scale_to_rpu(sa.q_proj))
-        if sa.k_proj.weight.dtype == torch.int8:
-            k_ws_list.append(_siglip_scale_to_rpu(sa.k_proj))
-        if sa.v_proj.weight.dtype == torch.int8:
-            v_ws_list.append(_siglip_scale_to_rpu(sa.v_proj))
-        if sa.out_proj.weight.dtype == torch.int8:
-            o_ws_list.append(_siglip_scale_to_rpu(sa.out_proj))
-        if mlp.fc1.weight.dtype == torch.int8:
-            fc1_ws_list.append(_siglip_scale_to_rpu(mlp.fc1))
-        if mlp.fc2.weight.dtype == torch.int8:
-            fc2_ws_list.append(_siglip_scale_to_rpu(mlp.fc2))
+        for module, scales in ((sa.q_proj, q_ws_list), (sa.k_proj, k_ws_list),
+                               (sa.v_proj, v_ws_list), (sa.out_proj, o_ws_list),
+                               (mlp.fc1, fc1_ws_list), (mlp.fc2, fc2_ws_list)):
+            if module.weight.dtype in (torch.int8, torch.uint8):
+                scales.append(_siglip_scale_to_rpu(module))
 
         ln1_w_list.append(layer.layer_norm1.weight.to(dtype=torch.float16, device="rpu"))
-        ln1_b_list.append(layer.layer_norm1.bias.to(dtype=torch.float16, device="rpu"))
         ln2_w_list.append(layer.layer_norm2.weight.to(dtype=torch.float16, device="rpu"))
-        ln2_b_list.append(layer.layer_norm2.bias.to(dtype=torch.float16, device="rpu"))
+        if not siglip_w4a16:  # W4 folded both betas into the Q/K/V and fc1 biases
+            ln1_b_list.append(layer.layer_norm1.bias.to(dtype=torch.float16, device="rpu"))
+            ln2_b_list.append(layer.layer_norm2.bias.to(dtype=torch.float16, device="rpu"))
 
         q_b_list.append(sa.q_proj.bias.to(dtype=torch.float16, device="rpu"))
         k_b_list.append(sa.k_proj.bias.to(dtype=torch.float16, device="rpu"))
@@ -789,10 +1013,14 @@ def patch_siglip_model_for_rpu_all_layers_once(vision_model, projector,
     _num_heads = num_heads
     _padded_head_dim = padded_head_dim
     _attn_tp = min(num_cores, num_heads)
-    _siglip_sig_w8a16 = int(siglip_w8a16)
+    # Weight-format code in the Graph signature: 0 FP16, 1 W8, 2 packed W4.
+    _siglip_sig_w8a16 = 2 if siglip_w4a16 else int(siglip_w8a16)
+    _siglip_sig_qkv_w8a8 = int(qkv_w8a8)
+    _siglip_sig_mlp_w8a8 = int(mlp_w8a8)
     _split_siglip_graph = _siglip_graph_enabled()
     _private_serial_cpu_profile = num_cores == 4 and all(
-        weight.dtype == (torch.int8 if siglip_w8a16 else torch.float16)
+        weight.dtype == (torch.uint8 if siglip_w4a16 else
+                         torch.int8 if siglip_w8a16 else torch.float16)
         for group in (q_w_list, k_w_list, v_w_list, o_w_list, fc1_w_list, fc2_w_list)
         for weight in group
     )
@@ -812,6 +1040,10 @@ def patch_siglip_model_for_rpu_all_layers_once(vision_model, projector,
             raise ValueError("pixel_values is required for SigLIP forward")
 
         input_tensor = pixel_values
+        if (qkv_w8a8 or mlp_w8a8) and (input_tensor.dim() != 4
+                or input_tensor.shape[0] not in (2, 3)
+                or tuple(input_tensor.shape[1:]) != (3, 224, 224)):
+            raise ValueError("SigLIP Vision W8A8 requires two or three packed 224px images")
 
         # Only intact private Pi serial slab views use native CPU ingress.
         # Native admission independently checks the installed Vision4 profile.
@@ -915,6 +1147,7 @@ def patch_siglip_model_for_rpu_all_layers_once(vision_model, projector,
             shapes=[_this_total_seq, _num_layers, _padded_head_dim],
             dyn_dims=[
                 _num_heads, _attn_tp, _n_packed, _siglip_sig_w8a16,
+                _siglip_sig_qkv_w8a8, _siglip_sig_mlp_w8a8,
                 *_component_plan_words,
             ],
             dtypes=[torch.float16],
@@ -998,10 +1231,23 @@ def patch_siglip_model_for_rpu_all_layers_once(vision_model, projector,
     handle_finalizer = resource.finalizer
     committed = False
     try:
-        resource.handle = handle = torch.ops.rpu.siglip_create(linear_acc32)
+        if mlp_w8a8:
+            handle = torch.ops.rpu.siglip_create(linear_acc32, qkv_w8a8, True)
+        elif qkv_w8a8:
+            handle = torch.ops.rpu.siglip_create(linear_acc32, True)
+        else:
+            handle = torch.ops.rpu.siglip_create(linear_acc32)
+        resource.handle = handle
         if num_cores != 8:
             torch.ops.rpu.siglip_set_execution_core_count(handle, num_cores)
-        if siglip_w8a16:
+        if siglip_w4a16:
+            torch.ops.rpu.siglip_set_weights_w4a16(
+                handle,
+                *weight_args_tuple,
+                q_ws_list, k_ws_list, v_ws_list, o_ws_list,
+                fc1_ws_list, fc2_ws_list,
+            )
+        elif siglip_w8a16:
             torch.ops.rpu.siglip_set_weights_w8a16(
                 handle,
                 *weight_args_tuple,
@@ -1025,6 +1271,8 @@ def patch_siglip_model_for_rpu_all_layers_once(vision_model, projector,
         # drop the `_rpu_` prefix (A9 audits only `_rpu_*` attrs).
         vision_model._test_siglip_weight_args_tuple = weight_args_tuple
         vision_model._siglip_w8a16 = _siglip_sig_w8a16
+        vision_model._siglip_qkv_w8a8 = qkv_w8a8
+        vision_model._siglip_mlp_w8a8 = mlp_w8a8
         vision_model._siglip_graph_enabled = _split_siglip_graph
         vision_model._rpu_cache = rpu_cache
         vision_model._rpu_siglip_graph_cache = siglip_graph_cache
@@ -1066,8 +1314,8 @@ def patch_siglip_model_for_rpu_all_layers_once(vision_model, projector,
         old_finalizer.detach()
 
     _LOG.info("Patched SigLIPModel (instance) with all-layers-once fused forward, "
-              "handle=%d, num_layers=%d, w8a16=%s",
-              handle, num_layers, siglip_w8a16)
+              "handle=%d, num_layers=%d, w8a16=%s, w4a16=%s",
+              handle, num_layers, siglip_w8a16, siglip_w4a16)
 
     return handle
 
@@ -1099,13 +1347,23 @@ def _prepare_siglip_images(images_list, vision_model=None):
     """Prepare intact CPU camera slabs for the private native packed copy."""
     shared_slab = _shared_siglip_image_slab(images_list)
     if shared_slab is not None:
+        from rpu_backend.runtime import rpu_env_bool
+
         model_state = {} if vision_model is None else vars(vision_model)
         cache = model_state.get("_rpu_cache")
+        vision_cores = model_state.get("_rpu_vision_num_cores")
         cpu_packed = (
-            model_state.get("_rpu_vision_num_cores") == 8
+            vision_cores in (4, 8)
             and cache is not None
             and (cache.num_layers, cache.num_kv_heads, cache.head_dim, cache.attn_tp)
-            == (27, 16, 80, 8)
+            == (27, 16, 80, vision_cores)
+            and (
+                vision_cores == 8
+                or (
+                    rpu_env_bool("RPU_PI05_VISION_KV_SPM_ONLY", default=False)
+                    and rpu_env_bool("RPU_PI05_VISION_Q_RESIDENT", default=False)
+                )
+            )
             and shared_slab.device.type == "cpu"
             and len(images_list) in (2, 3)
             and tuple(shared_slab.shape[1:]) == (3, 224, 224)
@@ -1154,6 +1412,9 @@ def _siglip_forward_images(vision_model, images_list):
     # constant as the single-image rpu_siglip_forward.
     _seq_len = 256
     _n_packed = len(images_list)
+    if (getattr(vision_model, "_siglip_qkv_w8a8", False)
+            or getattr(vision_model, "_siglip_mlp_w8a8", False)) and _n_packed not in (2, 3):
+        raise ValueError("SigLIP Vision W8A8 requires two or three packed images")
     _this_total_seq = _n_packed * _seq_len
     if _this_total_seq > cache.max_seq_len:
         raise ValueError(
@@ -1171,6 +1432,8 @@ def _siglip_forward_images(vision_model, images_list):
     _padded_head_dim = cache.head_dim
     _attn_tp = cache.attn_tp
     _siglip_sig_w8a16 = int(getattr(vision_model, "_siglip_w8a16", 0))
+    _siglip_sig_qkv_w8a8 = int(getattr(vision_model, "_siglip_qkv_w8a8", False))
+    _siglip_sig_mlp_w8a8 = int(getattr(vision_model, "_siglip_mlp_w8a8", False))
 
     component_plan = _siglip_component_execution_plan(
         vision_model, h, _this_total_seq, _n_packed,
@@ -1202,6 +1465,7 @@ def _siglip_forward_images(vision_model, images_list):
         shapes=[_this_total_seq, _num_layers, _padded_head_dim],
         dyn_dims=[
             _num_heads, _attn_tp, _n_packed, _siglip_sig_w8a16,
+            _siglip_sig_qkv_w8a8, _siglip_sig_mlp_w8a8,
             *component_plan_words,
         ],
         dtypes=[torch.float16],

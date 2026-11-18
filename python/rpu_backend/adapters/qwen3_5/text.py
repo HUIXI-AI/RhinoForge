@@ -46,6 +46,7 @@ from rpu_backend.adapters.qwen3_5.quant_scope import (
     W4A16_PGRP,
     W4A16_AWQ,
     W8A16,
+    NVFP4,
     normalize_quant_config,
     validate_legacy_text_profile,
     validate_modern_27b_profile,
@@ -632,6 +633,8 @@ def _validate_projection_specs(inner, is_full, quant_config):
         else:
             actual_method = W8A16 if scale.dim() == 1 else W4A16_PGRP
         spec = specs[name]
+        if spec.method == NVFP4 and actual_method == FP16:
+            continue  # Quantized from the original FP16 weight during install.
         if actual_method != spec.method:
             raise RPUBackendError(
                 f"Qwen3.5 projection {name} declares method={spec.method} but "
@@ -1136,6 +1139,7 @@ def _install_qwen3_5_text_for_rpu_impl(
     projection_specs = _validate_projection_specs(
         inner, is_full, quant_config or None)
     has_awq = any(spec.method == W4A16_AWQ for spec in projection_specs.values())
+    has_nvfp4 = any(spec.method == NVFP4 for spec in projection_specs.values())
     if cpu_stage_weights and quant_config and not g05_w8a16:
         raise UnsupportedModelError(
             "Qwen3.5 quantized CPU-staged installation is not enabled; "
@@ -1158,7 +1162,7 @@ def _install_qwen3_5_text_for_rpu_impl(
     legacy_text = validate_legacy_text_profile(config)
     from .cores import validate_official_27b_runtime_profile
     modern_27b = validate_official_27b_runtime_profile(config)
-    finalized_only = legacy_text or modern_27b or has_awq
+    finalized_only = legacy_text or modern_27b or has_awq or has_nvfp4
     if finalized_only and any(parameter.device.type != "cpu" for parameter in inner.parameters()):
         raise UnsupportedModelError(
             "large Qwen3.5 installation requires original CPU source weights")
@@ -1214,9 +1218,28 @@ def _install_qwen3_5_text_for_rpu_impl(
     # in_proj_qkv = [all-q(nkh) | all-k(nkh) | all-v(nvh)].
     _gksz = _gnkh * _gdk                   # q proj size = k proj size (2048, no rep)
 
-    def _prep_weight(w, partition, spec, *, num_cores=NUM_CORES):
-        """Swizzle FP16/W8, or swizzle+nibble-pack W4, for one ``[N,K]``."""
+    # Install-time NVFP4: one tensor scale per final native owner (the q/gate
+    # split and the GDN q/k/v slices each get their own), indexed by layer.
+    nvfp4_families = ("q", "k", "v", "o", "attn_gate", "gdn_q", "gdn_k", "gdn_v",
+                      "gdn_z", "gdn_out", "gate", "up", "down")
+    nvfp4_block_scales = {}
+    nvfp4_layer_scales = {family: {} for family in nvfp4_families}
+
+    def _prep_weight(w, partition, spec, *, num_cores=NUM_CORES, owner=None):
+        """Swizzle FP16/W8, swizzle+nibble-pack W4, or quantize+pack NVFP4."""
         wc = w.detach().to("cpu").contiguous()
+        if spec.method == NVFP4:
+            from rpu_backend.quant.nvfp4_pack import (
+                quantize_nvfp4, swizzle_nvfp4_scales, swizzle_pack_nvfp4)
+            family, layer = owner
+            n, k = wc.shape
+            codes, block_scale, tensor_scale = quantize_nvfp4(wc)
+            out = swizzle_pack_nvfp4(codes, partition, num_cores).reshape(n, k // 2)
+            nvfp4_block_scales[owner] = swizzle_nvfp4_scales(
+                block_scale, partition, num_cores).contiguous().to("rpu")
+            nvfp4_layer_scales[family][layer] = float(tensor_scale)
+            del codes, block_scale
+            return out.contiguous().to("rpu")
         if spec.method == W4A16_AWQ:
             from rpu_backend.quant.awq_gemm import swizzle_pack_uint4_pgrp
             from rpu_backend.quant.int4_pgrp_pack import w4_storage_shape
@@ -1237,7 +1260,7 @@ def _install_qwen3_5_text_for_rpu_impl(
         weight = linear.weight.data
         if ".mlp." in name and mlp_physical_size != tc.intermediate_size:
             pad = pad_decoder_mlp_projection
-            if projection_specs[name].method in (W8A16, W4A16_PGRP, W4A16_AWQ):
+            if projection_specs[name].method in (W8A16, W4A16_PGRP, W4A16_AWQ, NVFP4):
                 from .weights import pad_quant_mlp_projection
                 pad = pad_quant_mlp_projection
             elif legacy_text:
@@ -1252,12 +1275,14 @@ def _install_qwen3_5_text_for_rpu_impl(
                 weight.detach().to("cpu").contiguous(),
                 projection_name=name.rsplit(".", 1)[-1],
                 logical_size=tc.intermediate_size, physical_size=mlp_physical_size)
+        layer, role = name.split(".")[1], name.rsplit(".", 1)[-1]
         return _prep_weight(
             weight, partition, projection_specs[name],
-            num_cores=mlp_cores if ".mlp." in name else NUM_CORES)
+            num_cores=mlp_cores if ".mlp." in name else NUM_CORES,
+            owner=(role.removesuffix("_proj"), int(layer)))
 
-    def _sw_col(w, spec):
-        return _prep_weight(w, 1, spec)
+    def _sw_col(w, spec, owner=None):
+        return _prep_weight(w, 1, spec, owner=owner)
 
     # Keep an aligned scalar row/core. Legacy GDN4 needs16 slots for12 heads;
     # all existing GDN8 and small dense GDN4 layouts retain8 slots/core.
@@ -1266,15 +1291,15 @@ def _install_qwen3_5_text_for_rpu_impl(
 
         return pad_gdn_scalar(w, num_heads=_gnvh, num_cores=NUM_CORES).to("rpu")
 
-    def _sw_row(w, spec):
-        return _prep_weight(w, 0, spec)
+    def _sw_row(w, spec, owner=None):
+        return _prep_weight(w, 0, spec, owner=owner)
 
     # ===== GDN per-path weights — SEPARATE q/k/v proj + per-path conv + N_bg b/a =====
     # Shared by decode (build_gdn recurrent) and prefill (chunk); matches rhino's
     # decomposed prep. in_proj_qkv = [all-q(_gksz) | all-k(_gksz) | all-v(nvh·dv)].
     _gvsz = _gnvh * _gdv                       # v proj width (4096)
-    def _qkv_path(w, lo, hi, spec):
-        return _prep_weight(w.detach().to("cpu")[lo:hi].contiguous(), 1, spec)
+    def _qkv_path(w, lo, hi, spec, owner=None):
+        return _prep_weight(w.detach().to("cpu")[lo:hi].contiguous(), 1, spec, owner=owner)
     def _conv_path(la, lo, hi):  # per-path conv slice -> [nc, Kc, (hi-lo)/nc]
         cw = la.conv1d.weight.detach().to("cpu").squeeze(1)[lo:hi]   # [hi-lo, Kc]
         Kc = cw.shape[1]
@@ -1397,8 +1422,8 @@ def _install_qwen3_5_text_for_rpu_impl(
             out_name = f"layers.{i}.linear_attn.out_proj"
             z_spec = projection_specs[z_name]
             out_spec = projection_specs[out_name]
-            g_z.append(_sw_col(la.in_proj_z.weight, z_spec))
-            g_out.append(_sw_row(la.out_proj.weight, out_spec))
+            g_z.append(_sw_col(la.in_proj_z.weight, z_spec, ("gdn_z", i)))
+            g_out.append(_sw_row(la.out_proj.weight, out_spec, ("gdn_out", i)))
             g_z_s.append(_scale_rpu(la.in_proj_z, z_name, 1))
             g_out_s.append(_scale_rpu(la.out_proj, out_name, 0))
             g_alog.append(_pad_scalar(la.A_log.data))
@@ -1409,10 +1434,10 @@ def _install_qwen3_5_text_for_rpu_impl(
             qkv_name = f"layers.{i}.linear_attn.in_proj_qkv"
             qkv_spec = projection_specs[qkv_name]
             _qkvs = _projection_scale(la.in_proj_qkv, qkv_name)
-            g_q.append(_qkv_path(_qkvw, 0, _gksz, qkv_spec))
-            g_k.append(_qkv_path(_qkvw, _gksz, 2 * _gksz, qkv_spec))
+            g_q.append(_qkv_path(_qkvw, 0, _gksz, qkv_spec, ("gdn_q", i)))
+            g_k.append(_qkv_path(_qkvw, _gksz, 2 * _gksz, qkv_spec, ("gdn_k", i)))
             g_v.append(_qkv_path(
-                _qkvw, 2 * _gksz, 2 * _gksz + _gvsz, qkv_spec))
+                _qkvw, 2 * _gksz, 2 * _gksz + _gvsz, qkv_spec, ("gdn_v", i)))
             g_q_s.append(_qkv_scale_path(_qkvs, 0, _gksz, qkv_spec))
             g_k_s.append(_qkv_scale_path(
                 _qkvs, _gksz, 2 * _gksz, qkv_spec))
@@ -1451,8 +1476,8 @@ def _install_qwen3_5_text_for_rpu_impl(
         query_raw, gate_raw = split_q_gate(a.q_proj.weight.data, nq, head_dim)
         q_name = f"layers.{i}.self_attn.q_proj"
         q_spec = projection_specs[q_name]
-        q.append(_prep_weight(query_raw, 1, q_spec))
-        ag.append(_prep_weight(gate_raw, 1, q_spec))
+        q.append(_prep_weight(query_raw, 1, q_spec, owner=("q", i)))
+        ag.append(_prep_weight(gate_raw, 1, q_spec, owner=("attn_gate", i)))
         qg_scale = _projection_scale(a.q_proj, q_name)
         if qg_scale.numel() == 0:
             q_s.append(empty)
@@ -1474,10 +1499,10 @@ def _install_qwen3_5_text_for_rpu_impl(
         v_spec = projection_specs[v_name]
         k.append(_prep_weight(
             _replicate_kv_heads(a.k_proj.weight.data, nkv, head_dim, kv_rep),
-            1, k_spec))
+            1, k_spec, owner=("k", i)))
         v.append(_prep_weight(
             _replicate_kv_heads(a.v_proj.weight.data, nkv, head_dim, kv_rep),
-            1, v_spec))
+            1, v_spec, owner=("v", i)))
         k_scale = _projection_scale(a.k_proj, k_name)
         v_scale = _projection_scale(a.v_proj, v_name)
         k_s.append(empty if k_scale.numel() == 0 else _scale_to_rpu(
@@ -1535,6 +1560,22 @@ def _install_qwen3_5_text_for_rpu_impl(
         head_dim, rotary_dim, rope_theta, max_seq=max_seq_len)
 
     nvfp4_tensor_scales = []
+    if has_nvfp4:
+        scale_lists = (q_s, k_s, v_s, o_s, ag_s, g_q_s, g_k_s, g_v_s,
+                       g_z_s, g_out_s, g_s, u_s, d_s)
+        table_size = (len(is_full) + 7) // 8 * 8
+        for family, target in zip(nvfp4_families, scale_lists):
+            for layer in range(len(is_full)):
+                block_scale = nvfp4_block_scales.pop((family, layer), None)
+                if block_scale is not None:
+                    target[layer] = block_scale
+            # Layers without this family and the padding to eight hold 1.0.
+            table = torch.ones(table_size, dtype=torch.float32)
+            for layer, value in nvfp4_layer_scales[family].items():
+                table[layer] = value
+            nvfp4_tensor_scales.append(table.to("rpu").contiguous())
+        if nvfp4_block_scales:
+            raise RPUBackendError("Qwen3.5 text NVFP4 produced an owner outside its families")
     if g05_action_nvfp4 is not None:
         # These bytes were packed from original FP16 sources before W8 staging.
         for target, source in zip((q, o, g, u, d), g05_action_nvfp4["weights"]):
@@ -1611,7 +1652,7 @@ def _install_qwen3_5_text_for_rpu_impl(
         if g05_math_precision == "high":
             torch.ops.rpu.qwen3_5_set_high_precision(handle, True)
         nvfp4_kwargs = ({"nvfp4_tensor_scales": nvfp4_tensor_scales}
-                         if g05_action_nvfp4 is not None else {})
+                         if g05_action_nvfp4 is not None or has_nvfp4 else {})
         if has_awq:
             nvfp4_kwargs.update(gate_negative_zero=g_zero, up_negative_zero=u_zero,
                                 down_negative_zero=d_zero)

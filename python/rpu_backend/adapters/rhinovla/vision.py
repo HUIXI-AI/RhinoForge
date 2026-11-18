@@ -362,7 +362,8 @@ _VISION_CONVERSION_IN_PROGRESS = "rhinovla-vision-conversion-in-progress"
 
 
 def _convert_vision_block_weights_for_rpu(
-    block, num_heads: int, hidden_size: int, *, w8a16: bool = False
+    block, num_heads: int, hidden_size: int, *, w8a16: bool = False,
+    num_cores: int = 8,
 ) -> None:
     """In-place swizzle of a single Qwen3VLVisionBlock's weights.
 
@@ -385,12 +386,15 @@ def _convert_vision_block_weights_for_rpu(
             "RhinoVLA vision precision cannot change after weight conversion; "
             "reload the model before retrying."
         )
-    if w8a16:
+    if w8a16 or num_cores != 8:
+        # The shared converter owns W8 and the four-core layout; it refuses a
+        # block already converted for another precision or core count.
         from rpu_backend.adapters.qwen3_vl.vision import (
-            _convert_vision_block_weights_for_rpu as convert_w8_block,
+            _convert_vision_block_weights_for_rpu as convert_shared_block,
         )
-        convert_w8_block(block, num_heads, hidden_size, w8a16=True)
-        block._rpu_rhinovla_vision_w8a16 = True
+        convert_shared_block(block, num_heads, hidden_size, w8a16=w8a16,
+                             **({} if num_cores == 8 else {"num_cores": num_cores}))
+        block._rpu_rhinovla_vision_w8a16 = w8a16
         return
     if conversion_state is True:
         return
@@ -572,6 +576,7 @@ def _prepare_vision_patch_merger_for_rpu(
     resident: bool = True,
     resident_norm: bool = False,
     w8a16: bool = False,
+    num_cores: int = 8,
 ) -> None:
     """Stash device-ready weights for `Qwen3VLVisionPatchMerger`.
 
@@ -587,8 +592,9 @@ def _prepare_vision_patch_merger_for_rpu(
     if type(w8a16) is not bool:
         raise TypeError("RhinoVLA merger w8a16 must be a bool")
     if getattr(merger, "_rpu_qwen3vl_merger_converted", False):
-        if bool(getattr(merger, "_rpu_merger_w8a16", False)) != w8a16:
-            raise RuntimeError("RhinoVLA merger precision cannot change after preparation")
+        if (bool(getattr(merger, "_rpu_merger_w8a16", False)) != w8a16
+                or getattr(merger, "_rpu_merger_num_cores", 8) != num_cores):
+            raise RuntimeError("RhinoVLA merger precision cannot change after preparation, nor its core layout")
         if resident:
             _materialize_vision_patch_merger_resident(
                 merger, include_norm=resident_norm
@@ -632,10 +638,10 @@ def _prepare_vision_patch_merger_for_rpu(
             # Eager fc2 uses col partition; the fused residual path uses row.
             merger._rpu_merger_fc2_quantized_cpu = fc2_w
         merger._rpu_merger_fc1_w_cpu = transform_linear_weight(
-            fc1_w, partition=1, num_cores=8
+            fc1_w, partition=1, num_cores=num_cores
         ).contiguous()
         merger._rpu_merger_fc2_w_cpu = transform_linear_weight(
-            fc2_w, partition=1, num_cores=8
+            fc2_w, partition=1, num_cores=num_cores
         ).contiguous()
         merger._rpu_merger_fc1_b_cpu = (
             merger.linear_fc1.bias.detach().to(dtype=torch.float16, device="cpu").contiguous()
@@ -646,6 +652,7 @@ def _prepare_vision_patch_merger_for_rpu(
 
     merger._rpu_qwen3vl_merger_converted = True
     merger._rpu_merger_w8a16 = w8a16
+    merger._rpu_merger_num_cores = num_cores
     merger._rpu_merger_resident = False
     if resident:
         _materialize_vision_patch_merger_resident(
@@ -675,13 +682,18 @@ def _run_vision_patch_merger_on_rpu(
     eps = float(merger._rpu_merger_norm_eps)
     resident = bool(getattr(merger, "_rpu_merger_resident", False))
     w8a16 = bool(getattr(merger, "_rpu_merger_w8a16", False))
+    cores = getattr(merger, "_rpu_merger_num_cores", 8)
 
     def project(value, weight, bias, name):
-        if not w8a16:
+        if not w8a16 and cores == 8:
             return torch.nn.functional.linear(value, weight, bias)
-        scale = getattr(merger, f"_rpu_merger_{name}_scale_rpu") if resident else (
+        scale = None if not w8a16 else getattr(merger, f"_rpu_merger_{name}_scale_rpu") if resident else (
             getattr(merger, f"_rpu_merger_{name}_scale_cpu").to(device="rpu").contiguous()
         )
+        if cores != 8:
+            # Same arithmetic on the reduced owner's lanes: FP16 ACC32, W8 ACC16.
+            return torch.ops.rpu.linear_with_accumulation(
+                value, weight, bias, 1, cores, not w8a16, scale)
         return torch.ops.rpu.linear_w8a16(value, weight, scale, bias)
 
     if norm_on_rpu:
@@ -871,12 +883,16 @@ def install_qwen3_vl_vision_for_rpu(
     rpu_mergers_streaming: bool = False,
     execution_chunk_size: str | int = "auto",
     w8a16: bool = False,
+    num_cores: int = 8,
 ) -> int:
     """Install or replace the RhinoVLA vision runtime transactionally.
 
     A replacement is published only after its Python state and native handle
     are fully configured. Failure retires the pending handle and restores the
     old install; uncertain retirement is retained and forbids native retries.
+    ``num_cores`` 4 selects the native four-core owner: per-image encoding,
+    eager patch and merger projections on four lanes. Each merger runs once over
+    every image and keeps its output on RPU, with no raw DeepStack copies.
     """
     flags = {
         "rpu_patch_embed": rpu_patch_embed,
@@ -899,6 +915,13 @@ def install_qwen3_vl_vision_for_rpu(
         vision_model._rpu_vision_w8a16 != w8a16
     ):
         raise RuntimeError("RhinoVLA vision precision cannot change after installation")
+    if type(num_cores) is not int or num_cores not in (4, 8):
+        raise ValueError("RhinoVLA vision num_cores must be 4 or 8")
+    if (hasattr(vision_model, "_rpu_vision_handle")
+            and getattr(vision_model, "_rpu_vision_num_cores", 8) != num_cores):
+        raise RuntimeError("RhinoVLA vision core count cannot change after installation")
+    if num_cores != 8 and rpu_env_bool("RPU_RHINOVLA_VISION_RPU_MERGER_NORM"):
+        raise ValueError("RhinoVLA four-core vision keeps the merger norm on CPU")
     if execution_chunk_size != "auto" and (
         isinstance(execution_chunk_size, bool)
         or not isinstance(execution_chunk_size, int)
@@ -915,8 +938,10 @@ def install_qwen3_vl_vision_for_rpu(
             "install_qwen3_vl_vision_for_rpu: hidden_act must be "
             f"'gelu_pytorch_tanh', got {getattr(cfg, 'hidden_act', None)!r}."
         )
-    batch_views = rpu_env_bool("RPU_RHINOVLA_VISION_BATCH_VIEWS")
-    input_cache_enabled = rpu_env_bool("RPU_RHINOVLA_VISION_INPUT_CACHE")
+    # Four- and eight-core Vision owners both support batched equal-size views
+    # and cached RPU input slots.
+    batch_views = num_cores in (4, 8) and rpu_env_bool("RPU_RHINOVLA_VISION_BATCH_VIEWS")
+    input_cache_enabled = num_cores in (4, 8) and rpu_env_bool("RPU_RHINOVLA_VISION_INPUT_CACHE")
     model_vars = vars(vision_model)
     snapshot = {
         name: value
@@ -947,6 +972,7 @@ def install_qwen3_vl_vision_for_rpu(
             rpu_mergers_streaming=rpu_mergers_streaming,
             execution_chunk_size=execution_chunk_size,
             w8a16=w8a16,
+            num_cores=num_cores,
             batch_views=batch_views,
             input_cache_enabled=input_cache_enabled,
             _install_state=install_state,
@@ -974,6 +1000,8 @@ def _make_dummy_vision_kv_caches(
     max_seq_len: int,
     num_heads: int,
     head_dim: int,
+    *,
+    num_cores: int = 8,
 ) -> RPUCache:
     """Create an RPUCache sized for bidirectional vision SDPA.
 
@@ -988,12 +1016,12 @@ def _make_dummy_vision_kv_caches(
         max_seq_len=max_seq_len,
         num_kv_heads=num_heads,
         head_dim=head_dim,
-        attn_tp=min(8, num_heads),
+        attn_tp=min(num_cores, num_heads),
     )
 
 
 def register_qwen3vl_vision_fused_merger(
-    vision_model, cores: int = 8, *, w8a16: bool = False,
+    vision_model, cores: int | None = None, *, w8a16: bool = False,
 ) -> None:
     """Register the patch-merger weights for the in-graph fused merger (ROUND-3 opt #1).
 
@@ -1007,8 +1035,10 @@ def register_qwen3vl_vision_fused_merger(
     """
     if type(w8a16) is not bool:
         raise TypeError("RhinoVLA fused merger w8a16 must be a bool")
-    if cores != 8:
-        raise ValueError("RhinoVLA vision merger requires eight cores")
+    if cores is None:
+        cores = getattr(vision_model, "_rpu_vision_num_cores", 8)
+    if cores not in (4, 8) or getattr(vision_model, "_rpu_vision_num_cores", 8) != cores:
+        raise ValueError("RhinoVLA vision merger requires the installed four- or eight-core layout")
     if bool(getattr(vision_model, "_rpu_vision_w8a16", False)) != w8a16:
         raise ValueError("RhinoVLA fused merger precision must match the vision install")
     if getattr(vision_model, "_rpu_vision_fused_merger", False):
@@ -1016,7 +1046,7 @@ def register_qwen3vl_vision_fused_merger(
 
     def _merger_rpu_weights(mg):
         if w8a16:
-            _prepare_vision_patch_merger_for_rpu(mg, w8a16=True)
+            _prepare_vision_patch_merger_for_rpu(mg, w8a16=True, num_cores=cores)
             mg._rpu_merger_fc2_fused_w_rpu = tp_row_swizzle_mc_weight(
                 mg._rpu_merger_fc2_quantized_cpu, cores, dwidth=1
             ).to(device="rpu").contiguous()
@@ -1072,6 +1102,7 @@ def _install_qwen3_vl_vision_for_rpu_impl(
     rpu_mergers_streaming: bool = False,
     execution_chunk_size: str | int = "auto",
     w8a16: bool = False,
+    num_cores: int = 8,
     batch_views: bool,
     input_cache_enabled: bool = False,
     _install_state: dict[str, Any],
@@ -1119,7 +1150,8 @@ def _install_qwen3_vl_vision_for_rpu_impl(
     # ------------------------------------------------------------------ #
     for block in vision_model.blocks:
         _convert_vision_block_weights_for_rpu(
-            block, num_heads, hidden_size, **({"w8a16": True} if w8a16 else {})
+            block, num_heads, hidden_size, **({"w8a16": True} if w8a16 else {}),
+            **({} if num_cores == 8 else {"num_cores": num_cores}),
         )
 
     # ------------------------------------------------------------------ #
@@ -1224,7 +1256,7 @@ def _install_qwen3_vl_vision_for_rpu_impl(
             pe_projection, pe_scale = _quantize_vision_w8_weight(pe_w_raw)
             patch_embed_scale_rpu = pe_scale.to(device="rpu").contiguous()
         patch_embed_w_rpu = transform_linear_weight(
-            pe_projection, partition=1, num_cores=8
+            pe_projection, partition=1, num_cores=num_cores
         ).to(device="rpu").contiguous()
         patch_embed_b_rpu = (
             pe_b_raw.to(dtype=torch.float16, device="rpu").contiguous()
@@ -1251,19 +1283,27 @@ def _install_qwen3_vl_vision_for_rpu_impl(
         "RPU_RHINOVLA_VISION_CPU_MERGER_NORM_FP16")
     collect_raw_snapshots = not rpu_env_bool(
         "RPU_RHINOVLA_VISION_SKIP_RAW_SNAPSHOTS")
+    if mergers_on_rpu and num_cores != 8:
+        # The four-lane owner has no in-graph merger. Run each merger once over
+        # every image and keep its output on RPU for the on-device prefix
+        # assembly, without raw DeepStack copies, as the eight-core fused merger
+        # does. The merger arithmetic (CPU FP32 norm, GELU, projections) is unchanged.
+        batch_mergers = merger_output_rpu = True
+        collect_raw_snapshots = False
     if rpu_mergers:
+        merger_cores = {} if num_cores == 8 else {"num_cores": num_cores}
         _prepare_vision_patch_merger_for_rpu(
             vision_model.merger,
             resident=mergers_resident,
             resident_norm=merger_norm_on_rpu,
-            **({"w8a16": True} if w8a16 else {}),
+            **({"w8a16": True} if w8a16 else {}), **merger_cores,
         )
         for ds_merger in vision_model.deepstack_merger_list:
             _prepare_vision_patch_merger_for_rpu(
                 ds_merger,
                 resident=mergers_resident,
                 resident_norm=merger_norm_on_rpu,
-                **({"w8a16": True} if w8a16 else {}),
+                **({"w8a16": True} if w8a16 else {}), **merger_cores,
             )
     else:
         vision_model.merger.to(device="cpu", dtype=torch.float32)
@@ -1274,9 +1314,12 @@ def _install_qwen3_vl_vision_for_rpu_impl(
     # Step 7: prepare dummy KV caches + GraphCache before creating a handle.
     # ------------------------------------------------------------------ #
     vision_kv_cache = _make_dummy_vision_kv_caches(
-        num_layers, max_seq_len, num_heads, head_dim
+        num_layers, max_seq_len, num_heads, head_dim,
+        **({} if num_cores == 8 else {"num_cores": num_cores}),
     )
-    vision_graph_cache = rpu_backend.graph.GraphCache()
+    vision_graph_cache = rpu_backend.graph.GraphCache(**({} if num_cores == 8 else {
+        "runtime_policy": rpu_backend.graph.GraphRuntimePolicy.from_environment(
+            execution_core_count=num_cores)}))
     patch_input_cache = {}
     batched_pos_idx_cache = {}
 
@@ -1320,7 +1363,8 @@ def _install_qwen3_vl_vision_for_rpu_impl(
     # Step 8: configure a pending handle, publish all Python state, then
     # retire the old handle. The public wrapper owns rollback until commit.
     # ------------------------------------------------------------------ #
-    handle = torch.ops.rpu.qwen3vl_vision_create()
+    handle = (torch.ops.rpu.qwen3vl_vision_create() if num_cores == 8
+              else torch.ops.rpu.qwen3vl_vision_create(num_cores))
     _install_state["pending_handle"] = handle
     from rpu_backend.runtime._native_retirement import _InstalledNativeResource
     resource = _InstalledNativeResource(
@@ -1337,6 +1381,8 @@ def _install_qwen3_vl_vision_for_rpu_impl(
         torch.ops.rpu.qwen3vl_vision_set_weights_w8a16(handle, *vision_args, *scale_lists)
     else:
         torch.ops.rpu.qwen3vl_vision_set_weights(handle, *vision_args)
+    if num_cores != 8 and tuple(torch.ops.rpu.qwen3vl_vision_topology(handle)) != (4, 4, 4, 8):
+        raise RuntimeError("RhinoVLA vision native topology does not match the four-core owner")
     torch.ops.rpu.qwen3vl_vision_set_chunk_envelope(handle, int(vision_kv_cache.max_seq_len), 0)
     torch.ops.rpu.qwen3vl_vision_set_rope_route(
         handle, freq_cos, freq_sin,
@@ -1357,6 +1403,7 @@ def _install_qwen3_vl_vision_for_rpu_impl(
     vision_model._rpu_vision_patch_embed_b = pe_b_raw
     vision_model._rpu_vision_patch_embed_on_rpu = patch_embed_on_rpu
     vision_model._rpu_vision_w8a16 = w8a16
+    vision_model._rpu_vision_num_cores = num_cores
     vision_model._rpu_vision_input_cache_enabled = input_cache_enabled
     vision_model._rpu_vision_patch_input_cache = patch_input_cache
     vision_model._rpu_vision_batched_pos_idx_cache = batched_pos_idx_cache
@@ -1519,9 +1566,17 @@ def _rpu_vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tenso
         else:
             hidden_states_rpu = hidden_states if hidden_states.is_contiguous() else hidden_states.contiguous()
 
-        pe_w = self._rpu_vision_patch_embed_w_rpu  # device fp16, col-swizzled
-        pe_b = self._rpu_vision_patch_embed_b_rpu  # device fp16
-        if prep_cache_enabled:
+        pe_w = self._rpu_vision_patch_embed_w_rpu  # RPU fp16, col-swizzled
+        pe_b = self._rpu_vision_patch_embed_b_rpu  # RPU fp16
+        cores = getattr(self, "_rpu_vision_num_cores", 8)
+        if cores != 8:
+            # The cached output slot uses eight-core kernels; the four-core
+            # owner keeps the same arithmetic (FP16 ACC32, W8 ACC16).
+            w8a16 = getattr(self, "_rpu_vision_w8a16", False)
+            embed_packed = torch.ops.rpu.linear_with_accumulation(
+                hidden_states_rpu, pe_w, pe_b, 1, cores, not w8a16,
+                self._rpu_vision_patch_embed_scale if w8a16 else None)
+        elif prep_cache_enabled:
             # Keep the eager projection's original arithmetic: FP16 uses
             # ACC32, W8 uses ACC16. This slot is private to input preparation.
             embed_packed = _cached_vision_patch_projection(self, hidden_states_rpu)

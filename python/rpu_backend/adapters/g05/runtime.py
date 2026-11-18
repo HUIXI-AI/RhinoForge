@@ -59,6 +59,29 @@ _G05_EXECUTION_COMPONENTS = {
     },
     _G05_ACTION_COMPONENT: {"action": ("chunk_size",)},
 }
+_G05_MODEL_SCOPE = {"model": ("num_cores",)}
+# The public core budget belongs to the composite and is cold-only. At 4/6 cores
+# the text backbone uses the Qwen3.5 template (attention 4 / MLP = budget);
+# Vision and the action expert have four-lane owners only (the expert's I4096
+# does not split over six), so they run on four cores in both.
+_G05_EXECUTION_SUPPORTED = {
+    **_G05_MODEL_SCOPE,
+    **{stage: fields
+       for stages in _G05_EXECUTION_COMPONENTS.values()
+       for stage, fields in stages.items()},
+}
+_G05_REDUCED_LANES = 4
+
+
+def g05_core_budget(execution) -> int:
+    # normalize_rpu_execution already admitted 4, 6 or 8.
+    return (execution or {}).get("model", {}).get("num_cores", 8)
+
+
+def _g05_component_cores(budget: int, component: str) -> int:
+    if budget == 8:
+        return 8
+    return budget if component == _G05_TEXT_COMPONENT else _G05_REDUCED_LANES
 
 
 def _resolve_g05_execution(value, *, max_seq_len: int, entry_point: str):
@@ -71,6 +94,7 @@ def _resolve_g05_execution(value, *, max_seq_len: int, entry_point: str):
     root = normalize_rpu_execution(
         value,
         entry_point=entry_point,
+        supported=_G05_EXECUTION_SUPPORTED,
         supported_components=_G05_EXECUTION_COMPONENTS,
     )
     profile_auto = {
@@ -85,11 +109,23 @@ def _resolve_g05_execution(value, *, max_seq_len: int, entry_point: str):
             root,
             component,
             entry_point=entry_point,
+            supported=_G05_EXECUTION_SUPPORTED,
             supported_components=_G05_EXECUTION_COMPONENTS,
             profile_auto=profile_auto[component],
         )
         for component in _G05_EXECUTION_COMPONENTS
     }
+    budget = g05_core_budget(root)
+    if budget != 8:
+        # Each child carries its own physical width; installers read it there.
+        components = {
+            component: normalize_rpu_execution(
+                {**config, "model": {"num_cores": _g05_component_cores(budget, component)}},
+                entry_point=entry_point,
+                supported={**_G05_EXECUTION_COMPONENTS[component], **_G05_MODEL_SCOPE},
+            )
+            for component, config in components.items()
+        }
     text_chunk = components[_G05_TEXT_COMPONENT]["prefill"]["chunk_size"]
     if isinstance(text_chunk, int) and text_chunk % 64:
         raise ValueError(
@@ -1471,6 +1507,7 @@ def _rpu_g05_forward_embed(
         self.vision_tower,
         compact=(
             getattr(self.vision_tower, "_rpu_vision_step0", False)
+            and getattr(self.vision_tower, "_rpu_vision_num_cores", 8) == 8
             and _g05_packed_vision_capacity_enabled()
         ),
     )
@@ -1546,7 +1583,10 @@ def _ensure_g05_text_cache(vlm):
 
     cache = getattr(vlm, "_rpu_g05_cache", None)
     if cache is None:
-        cache = Qwen3_5Cache.from_config(vlm.config, max_seq_len=vlm._rpu_g05_max_seq_len)
+        # The text child carries the composite budget; its KV replication follows it.
+        cache = Qwen3_5Cache.from_config(
+            vlm.config, max_seq_len=vlm._rpu_g05_max_seq_len,
+            num_cores=g05_core_budget(getattr(vlm, "_rpu_execution", None)))
         vlm._rpu_g05_cache = cache
     return cache
 
@@ -1816,6 +1856,8 @@ def patch_g05_vlm_for_rpu(
         exact_k1=_allow_certified_g05_k1)
     math_precision = validate_math_precision(math_precision, exact_k1=_allow_certified_g05_k1)
     if math_precision == "high":
+        if g05_core_budget(_execution_config) != 8:
+            raise ValueError("G0.5 HIGH math is eight-core only")
         require_g05_high_math_native()
     install_execution = linear_execution_config(
         _execution_config, linear_accumulation, stage="prefill")
@@ -1933,7 +1975,9 @@ def patch_g05_vlm_for_rpu(
         torch.ops.rpu.qwen3_5_enable_execution_reconfigure(handle)
         import rpu_backend as _rb
 
-        vlm._rpu_qwen3_5.prefill_graph_cache = _rb.graph.GraphCache(max_entries=1)
+        # Share the installer's policy: its core count matches the text budget.
+        vlm._rpu_qwen3_5.prefill_graph_cache = _rb.graph.GraphCache(
+            max_entries=1, runtime_policy=vlm._rpu_qwen3_5.graph_cache.runtime_policy)
         vlm._rpu_qwen3_5.prefill_graph_sig = None
         # Debug prefill is lazy and uses a separate cache because its graph has
         # diagnostic-only fixed-address SPM→DDR taps. Never replay it as the
@@ -2940,11 +2984,16 @@ def _publish_g05_execution_views(
 
 def _validate_g05_execution_reconfigure(policy, execution_config) -> None:
     """Validate every child and required native transaction API."""
-    _resolve_g05_execution(
+    root, _components = _resolve_g05_execution(
         execution_config,
         max_seq_len=policy.model.vlm._rpu_g05_max_seq_len,
         entry_point="G0.5 policy reconfigure",
     )
+    installed = g05_core_budget(getattr(policy, "_rpu_execution", None))
+    if g05_core_budget(root) != installed:
+        raise ValueError(
+            "G0.5 model.num_cores is cold-only; the installed policy runs on "
+            f"{installed} cores (reload the checkpoint to change it)")
     required = (
         "execution_reconfigure_begin",
         "execution_reconfigure_commit",
@@ -3260,6 +3309,7 @@ def _install_g05_execution_session(policy, resolved) -> None:
         policy,
         resolved[0],
         entry_point="G0.5 policy",
+        supported=_G05_EXECUTION_SUPPORTED,
         supported_components=_G05_EXECUTION_COMPONENTS,
         validate=lambda config: _validate_g05_execution_reconfigure(
             policy, config
@@ -3549,6 +3599,17 @@ def patch_g05_policy_for_rpu(
         if not rtc_release_fm_only:
             raise ValueError("G0.5 Action NVFP4 requires exact K1 W8A16")
         require_g05_action_nvfp4_native()
+    budget = g05_core_budget(resolved_execution[0])
+    if budget != 8:
+        # The reduced owners run one still image per Vision forward and the
+        # generic decomposed routes; HIGH math and the temporal/packed
+        # profiles have eight-core kernels only.
+        if not rtc_release_fm_only:
+            raise ValueError(
+                f"G0.5 at model.num_cores={budget} requires the exact vla_rtc K1 policy")
+        if math_precision == "high":
+            raise ValueError(
+                f"G0.5 math_precision='high' is eight-core only; got model.num_cores={budget}")
     exact_policy_forward = None
     ensure_sample_list = None
     if rtc_release_fm_only:
@@ -3821,6 +3882,8 @@ def configure_g05_vision_camera_batch(policy, batch):
     policy._execution_session.require_cold()
     if not getattr(policy, "_rpu_g05_fm_only_customer_release", False):
         raise ValueError("K1 camera grouping requires the exact G05 RTC/FM release")
+    if getattr(vision, "_rpu_vision_num_cores", 8) != 8:
+        raise ValueError("K1 camera grouping is eight-core only; reduced Vision runs one camera per forward")
     names = getattr(policy, "_rpu_g05_camera_names", _G05_RELEASE_CAMERA_NAMES)
     if batch != len(names):
         raise ValueError("K1 camera group must match the selected source camera count")

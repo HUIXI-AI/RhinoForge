@@ -108,8 +108,11 @@ def full_w8_inventory(runtime):
                            for layer in text.layers),
            (scale for group in text_scales for scale in group))
     visual = runtime.vision_model
+    # Eight cores always fuse the mergers; reduced budgets may fuse or run them outside.
+    reduced = getattr(visual, "_rpu_vision_num_cores", 8) != 8
+    fused_merger = getattr(visual, "_rpu_vision_fused_merger_w8a16", False) is True
     if (getattr(visual, "_rpu_vision_w8a16", False) is not True
-            or getattr(visual, "_rpu_vision_fused_merger_w8a16", False) is not True):
+            or (not reduced and not fused_merger)):
         raise ValueError("RhinoVLA full W8 requires quantized vision blocks and fused mergers")
     vweights, vscales = visual._rpu_vision_projection_weights, visual._rpu_vision_projection_scales
     if (len(vweights) != 6 or len(vscales) != 6
@@ -121,7 +124,8 @@ def full_w8_inventory(runtime):
            [visual._rpu_vision_patch_embed_scale])
     mergers = [visual.merger, *visual.deepstack_merger_list]
     record("vision_mergers", (w for merger in mergers for w in (
-        merger._rpu_merger_fc1_w_rpu, merger._rpu_merger_fc2_fused_w_rpu)),
+        merger._rpu_merger_fc1_w_rpu,
+        merger._rpu_merger_fc2_fused_w_rpu if fused_merger else merger._rpu_merger_fc2_w_rpu)),
         (s for merger in mergers for s in (
             merger._rpu_merger_fc1_scale_rpu, merger._rpu_merger_fc2_scale_rpu)))
     loop = runtime._denoise_loop_meta

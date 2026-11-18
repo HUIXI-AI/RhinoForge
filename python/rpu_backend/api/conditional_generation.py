@@ -76,8 +76,21 @@ class RPUModelForConditionalGeneration:
         rpu_execution=None,
         max_seq_len: int | None = None,
         image_grid_thw=None,
+        quantization=None,
         **hf_kwargs,
     ):
+        """`quantization` is optional and defaults to None (weights install as loaded).
+
+        `'nvfp4'` converts the seven text projections of an official FP16
+        Qwen3-VL-2B/4B/8B source once at install; the head, embedding, norms and
+        Vision stay FP16. `'vision_nvfp4'` does the same for the 2B/4B source and
+        also converts the 24 Vision blocks' q/k/v/o/fc1/fc2 to NVFP4; patch
+        embedding and mergers stay FP16. `'vision_w4a16'` takes a runtime W4A16
+        checkpoint and packs the Vision blocks' q/k/v/o/fc1/fc2 to symmetric RTN
+        W4/G32 at install at model.num_cores 4, 6 or 8: 2B/4B (24 blocks, Vision
+        on 8 cores at 8), or 8B/32B (27 padded blocks, Vision on 4 cores at every
+        budget). Patch
+        embedding and mergers stay W8, text and head keep the checkpoint's W4."""
         if max_seq_len is not None:
             from numbers import Integral
             if isinstance(max_seq_len, bool) or not isinstance(max_seq_len, Integral) or max_seq_len <= 0:
@@ -175,6 +188,12 @@ class RPUModelForConditionalGeneration:
             adapter_cls.preflight(config)
         if hasattr(adapter_cls, "preflight_execution"):
             adapter_cls.preflight_execution(config, execution_config)
+        if quantization is not None:
+            if not hasattr(adapter_cls, "preflight_quantization"):
+                raise UnsupportedModelError(
+                    f"RPUModelForConditionalGeneration: on-install quantization is not "
+                    f"available for {arch}.")
+            adapter_cls.preflight_quantization(config, execution_config, quantization)
         vision_capacity = None
         if image_grid_thw is not None:
             # Cold install sizing from the caller's actual image grids; reject
@@ -275,7 +294,8 @@ class RPUModelForConditionalGeneration:
         if max_seq_len is not None:
             model._rpu_requested_max_seq_len = max_seq_len
 
-        adapter = adapter_cls(model)
+        adapter = (adapter_cls(model) if quantization is None
+                   else adapter_cls(model, quantization=quantization))
         adapter._rpu_execution = execution_config
         if vision_capacity is not None:
             adapter._rpu_vision_capacity = vision_capacity

@@ -27,6 +27,7 @@ from transformers import Qwen3_5MoeConfig
 
 if __package__:
     from .fp8 import quantize_fp8_e4m3_per_output
+    from . import precision_recipes as _recipes
     from rpu_backend.adapters.qwen3_5_moe import quant_scope as _scope
 else:
     # Load only CPU leaves; importing rpu_backend would initialize its native SO.
@@ -44,7 +45,15 @@ else:
     _scope = importlib.util.module_from_spec(_scope_spec)
     sys.modules[_scope_spec.name] = _scope
     _scope_spec.loader.exec_module(_scope)
+    _recipes_spec = importlib.util.spec_from_file_location(
+        "_offline_moe_fp8_recipes", Path(__file__).resolve().with_name("precision_recipes.py")
+    )
+    _recipes = importlib.util.module_from_spec(_recipes_spec)
+    sys.modules[_recipes_spec.name] = _recipes
+    _recipes_spec.loader.exec_module(_recipes)
 
+# The one registered precision recipe this converter produces.
+FAMILY, RECIPE = "qwen3_5", "fp8_e4m3_experts_attn_gdn"
 FP8_FORMAT, FP8_METHOD = _scope.FP8_FORMAT, _scope.FP8_METHOD
 FP8_PROFILE, FP8_SCOPE = _scope.FP8_PROFILE, _scope.FP8_SCOPE
 FP16_PRESERVE = _scope.FP16_PRESERVE
@@ -158,7 +167,7 @@ def _mixer_shapes(config: dict) -> dict[str, tuple[int, int]]:
 
 def _copy_sidecars(src: Path, dst: Path, shards: set[str]) -> None:
     skip = set(shards) | {
-        "model.safetensors", "model.safetensors.index.json", "config.json"
+        "model.safetensors", "model.safetensors.index.json", "config.json", _recipes.RECORD
     }
     for path in sorted(src.iterdir()):
         if (path.is_file() and path.name not in skip
@@ -316,6 +325,7 @@ def convert_checkpoint(
         with (temp / "config.json").open("w") as handle:
             json.dump(config, handle, indent=2)
         _copy_sidecars(src, temp, set(shards))
+        _recipes.write_record(temp, FAMILY, RECIPE)
         temp.rename(dst)
     except BaseException:
         # Also retire a partial multi-GB checkpoint on Ctrl-C/KeyboardInterrupt.

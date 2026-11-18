@@ -46,6 +46,10 @@ RTN_PROFILE_ID = "qwen3_5_moe_35b_a3b_tp8_routed_rtn_w4a16_g128"
 RTN_METHOD = "qwen3_5_moe_routed_rtn_uint4"
 GPTQ_PROFILE_ID = "qwen3_5_moe_35b_a3b_tp8_routed_gptq_w4a16_g128"
 GPTQ_METHOD = "qwen3_5_moe_routed_gptq_uint4"
+INT8_PROFILE_ID = "qwen3_5_moe_35b_a3b_tp8_routed_rtn_w8a16"
+INT8_METHOD = "qwen3_5_moe_routed_int8"
+INT8_FORMAT = "int8_per_output"
+INT8_SCOPE = "routed_experts"
 
 
 @dataclass(frozen=True)
@@ -60,6 +64,9 @@ class RuntimeCapabilities:
 # INT4 sources use the existing exact TP8 Vision/text bridge and owner policy.
 _ROUTED_INT4_RUNTIME = RuntimeCapabilities(6, "float16", (4, 6, 8), False)
 _MIXED_FP8_RUNTIME = RuntimeCapabilities(5, "fp8_e4m3", (4, 6, 8), False)
+# Signed INT8 routed experts use the grouped kernel's mode 1 at the routed
+# width E4M3 uses (TP6 pads I512 to 576); mixers stay FP16 as for INT4.
+_ROUTED_INT8_RUNTIME = RuntimeCapabilities(1, "float16", (4, 6, 8), False)
 
 
 def runtime_capabilities(profile_id: str) -> RuntimeCapabilities:
@@ -68,6 +75,8 @@ def runtime_capabilities(profile_id: str) -> RuntimeCapabilities:
         return _ROUTED_INT4_RUNTIME
     if profile_id == EXACT_PROFILE_ID:
         return _MIXED_FP8_RUNTIME
+    if profile_id == INT8_PROFILE_ID:
+        return _ROUTED_INT8_RUNTIME
     raise ValueError(f"Unknown Qwen3.5-MoE profile: {profile_id!r}")
 
 
@@ -89,6 +98,8 @@ FP16_PRESERVE = (
     "router/shared_expert/shared_expert_gate",
     "vision",
 )
+# Routed INT8 quantizes only the experts; the text mixers join the FP16 copy.
+INT8_FP16_PRESERVE = ("self_attn/linear_attn projections",) + FP16_PRESERVE
 
 _EXACT_TEXT_FIELDS = {
     "model_type": "qwen3_5_moe_text",
@@ -229,9 +240,12 @@ def validate_exact_profile(config, *, require_quant: bool = True) -> dict:
                 "quant_config": validate_gptq_config(config)}
     if require_quant and quant is None:
         raise ValueError(
-            "Qwen3.5-35B-A3B requires a supported mixed-E4M3, RTN or official GPTQ checkpoint; "
+            "Qwen3.5-35B-A3B requires a supported mixed-E4M3, RTN, routed INT8 or official GPTQ checkpoint; "
             "BF16/FP16 and official block-FP8 checkpoints are not admitted"
         )
+    if isinstance(quant, Mapping) and quant.get("method") == INT8_METHOD:
+        return {"profile": INT8_PROFILE_ID,
+                "quant_config": validate_int8_config(quant, layer_types)}
     if quant is not None:
         quant = validate_quant_config(quant, layer_types)
     return {"profile": EXACT_PROFILE_ID, "quant_config": quant}
@@ -360,6 +374,51 @@ def scale_name(weight_name: str) -> str:
     return weight_name + "_scale"
 
 
+def expected_int8_weight_names(layer_types) -> tuple[str, ...]:
+    """The routed-only INT8 scope: both fused expert tensors of every layer."""
+    layer_types = validate_layer_types(layer_types)
+    return tuple(f"{TEXT_PREFIX}{layer}.{role}"
+                 for layer in range(len(layer_types)) for role in ROUTED_EXPERT_ROLES)
+
+
+def validate_int8_config(quant_config, layer_types) -> dict:
+    """Validate the routed-only INT8 declaration emitted by the converter."""
+    required = {
+        "method": INT8_METHOD,
+        "format": INT8_FORMAT,
+        "weight_mode": 1,
+        "qaxis": -1,
+        "scale_dtype": "float16",
+        "scope": INT8_SCOPE,
+        "profile": INT8_PROFILE_ID,
+        "symmetric": True,
+        "calibration": False,
+    }
+    mismatched = {
+        key: (quant_config.get(key), expected)
+        for key, expected in required.items()
+        if quant_config.get(key) != expected
+        or type(quant_config.get(key)) is not type(expected)
+    }
+    if mismatched:
+        raise ValueError(
+            f"unsupported Qwen3.5-MoE routed INT8 declaration: {mismatched}")
+    expected_names = list(expected_int8_weight_names(layer_types))
+    if (quant_config.get("quantized_tensors") != sorted(expected_names)
+            or quant_config.get("quantized_tensor_count") != len(expected_names)):
+        raise ValueError(
+            "Qwen3.5-MoE routed INT8 must quantize exactly the "
+            f"{len(expected_names)} fused routed-expert tensors")
+    if quant_config.get("fp16_preserve") != list(INT8_FP16_PRESERVE):
+        raise ValueError(
+            "Qwen3.5-MoE routed INT8 fp16_preserve does not match the controlled profile")
+    unknown = set(quant_config) - set(required) - {
+        "quantized_tensors", "quantized_tensor_count", "fp16_preserve"}
+    if unknown:
+        raise ValueError(f"Unsupported routed INT8 fields: {sorted(unknown)}")
+    return dict(quant_config)
+
+
 def validate_quant_config(quant_config, layer_types) -> dict:
     """Validate the exact checkpoint declaration emitted by the converter."""
     if not isinstance(quant_config, Mapping):
@@ -420,6 +479,8 @@ __all__ = [
     "EXACT_PROFILE_ID",
     "RTN_PROFILE_ID", "RTN_METHOD", "RTN_RECIPE", "validate_rtn_config",
     "GPTQ_PROFILE_ID", "GPTQ_METHOD", "validate_gptq_config", "runtime_capabilities",
+    "INT8_FORMAT", "INT8_FP16_PRESERVE", "INT8_METHOD", "INT8_PROFILE_ID", "INT8_SCOPE",
+    "expected_int8_weight_names", "validate_int8_config",
     "FP8_FORMAT",
     "FP8_METHOD",
     "FP8_PROFILE",

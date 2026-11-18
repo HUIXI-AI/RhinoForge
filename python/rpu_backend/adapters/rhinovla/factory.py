@@ -138,18 +138,74 @@ def v3_runtime_factory(config, *, rpu_execution=None):
     training-only OAT/LoRA tensors are ignored. Configuration and prepared CPU
     inputs follow ``official_runtime_factory``. ``rtc=True`` selects the
     ten-step RTC path with request delays 0 through 6 for the selected FP16
-    or W8 precision and execution configuration. The v1 asset contract
+    or W8 precision and execution configuration. Instead of ``qin``,
+    ``raw_inputs`` = {images, instruction, view_roles} has the loaded source
+    model's own processor build ``qin`` at 256x256. The v1 asset contract
     is separate."""
     return _runtime_factory(config, rpu_execution=rpu_execution, v3=True)
+
+
+V3_IMAGE_SIZE = (256, 256)
+
+
+def _check_raw_inputs(raw):
+    """Cheap shape checks before the source loads; the source checks the role vocabulary."""
+    from PIL import Image
+
+    if not isinstance(raw, Mapping) or set(raw) != {"images", "instruction", "view_roles"}:
+        raise ValueError("RhinoVLA raw_inputs must contain exactly images, instruction and view_roles")
+    images, roles = raw["images"], raw["view_roles"]
+    if not isinstance(images, (list, tuple)) or len(images) not in (1, 2, 3):
+        raise ValueError("RhinoVLA raw_inputs.images must hold one to three images")
+    if any(not isinstance(image, Image.Image) or image.mode != "RGB" or image.size != V3_IMAGE_SIZE
+           for image in images):
+        raise ValueError("RhinoVLA raw_inputs.images must be RGB PIL images resized to 256x256")
+    if not isinstance(raw["instruction"], str) or not raw["instruction"].strip():
+        raise ValueError("RhinoVLA raw_inputs.instruction must be nonempty text")
+    if (not isinstance(roles, (list, tuple)) or len(roles) != len(images)
+            or any(not isinstance(role, str) for role in roles)):
+        raise ValueError("RhinoVLA raw_inputs.view_roles must name one role per image")
+
+
+def _source_qin(model, raw):
+    """validate_v3.py's recipe: the source processor, chat template and RGB modality."""
+    qin = model.qwen.build_qwenvl_inputs(
+        images=[list(raw["images"])], instructions=[raw["instruction"]],
+        view_roles=[list(raw["view_roles"])], view_modalities=[["rgb"] * len(raw["images"])],
+    )
+    return dict(qin)
+
+
+def _check_qin_tensors(qin):
+    import torch
+
+    if not isinstance(qin, Mapping):
+        raise TypeError("RhinoVLA qin must contain preprocessed CPU tensors")
+    required = {"input_ids", "attention_mask", "pixel_values", "image_grid_thw"}
+    if not required.issubset(qin):
+        raise ValueError(f"RhinoVLA qin is missing {sorted(required - set(qin))}")
+    extra = set(qin) - required - {"mm_token_type_ids"}
+    if extra:
+        raise ValueError(f"unsupported RhinoVLA qin fields: {sorted(extra)}")
+    if any(not isinstance(value, torch.Tensor) or value.device.type != "cpu"
+           for value in qin.values()):
+        raise TypeError("RhinoVLA qin values must be CPU tensors")
+    ids = qin["input_ids"]
+    if ids.dtype != torch.long or ids.ndim != 2 or ids.shape[0] != 1 or ids.shape[1] < 1:
+        raise ValueError("RhinoVLA official qin requires batch=1 and nonempty input_ids")
+    if qin["attention_mask"].shape != ids.shape:
+        raise ValueError("RhinoVLA input_ids/attention_mask shapes disagree")
 
 
 def _runtime_factory(config, *, rpu_execution=None, v3=False):
     if not isinstance(config, Mapping):
         raise TypeError("RhinoVLA official factory config must be a mapping")
     allowed = {"model_root", "checkpoint", "qin", "steps", "trust_model_code",
-               "expert_w8a16", "full_w8a16", "rtc"}
+               "expert_w8a16", "full_w8a16", "rtc"} | ({"raw_inputs"} if v3 else set())
     if set(config) - allowed:
         raise ValueError(f"unsupported RhinoVLA official factory keys: {sorted(set(config) - allowed)}")
+    if ("qin" in config) == ("raw_inputs" in config):
+        raise ValueError("RhinoVLA factory takes exactly one of qin or raw_inputs")
     if config.get("trust_model_code") is not True:
         raise PermissionError("official model code requires explicit trust_model_code=True")
     rtc = config.get("rtc", False)
@@ -175,33 +231,24 @@ def _runtime_factory(config, *, rpu_execution=None, v3=False):
         from .runtime import RhinoVLAPipelineColdConfig
         from .fused import _RhinoVLANativeColdConfig
         from rpu_backend.runtime import rpu_env_bool
+        from rpu_backend.runtime.topology import execution_core_count
 
         if rpu_env_bool("RPU_GRAPH_FORCE_ONESHOT_ON_REPLAY"):
             raise ValueError("RhinoVLA RTC requires ordinary Graph replay, not forced oneshot")
+        cores = execution_core_count(rpu_execution)
         pipeline_cold, _ = RhinoVLAPipelineColdConfig.resolve(rpu_execution)
         validate_rtc_install(
             rtc=rtc, steps=steps, flow_direction="official_descending",
             expert_w8a16=expert_w8a16, full_expert_w8a16=full_expert_w8a16,
-            native_cold=_RhinoVLANativeColdConfig.from_env(),
+            native_cold=_RhinoVLANativeColdConfig.from_env(num_cores=cores),
             action_cold=pipeline_cold.stages["action"])
         require_rtc_native()
-    qin = config["qin"]
-    if not isinstance(qin, Mapping):
-        raise TypeError("RhinoVLA qin must contain preprocessed CPU tensors")
-    required = {"input_ids", "attention_mask", "pixel_values", "image_grid_thw"}
-    if not required.issubset(qin):
-        raise ValueError(f"RhinoVLA qin is missing {sorted(required - set(qin))}")
-    extra = set(qin) - required - {"mm_token_type_ids"}
-    if extra:
-        raise ValueError(f"unsupported RhinoVLA qin fields: {sorted(extra)}")
-    if any(not isinstance(value, torch.Tensor) or value.device.type != "cpu"
-           for value in qin.values()):
-        raise TypeError("RhinoVLA qin values must be CPU tensors")
-    ids = qin["input_ids"]
-    if ids.dtype != torch.long or ids.ndim != 2 or ids.shape[0] != 1 or ids.shape[1] < 1:
-        raise ValueError("RhinoVLA official qin requires batch=1 and nonempty input_ids")
-    if qin["attention_mask"].shape != ids.shape:
-        raise ValueError("RhinoVLA input_ids/attention_mask shapes disagree")
+    raw = config.get("raw_inputs")
+    if raw is None:
+        qin = config["qin"]
+        _check_qin_tensors(qin)
+    else:
+        _check_raw_inputs(raw)
     if v3:
         _validate_official_assets(
             root, checkpoint, source_sha=V3_SOURCE_SHA,
@@ -210,9 +257,16 @@ def _runtime_factory(config, *, rpu_execution=None, v3=False):
     else:
         _validate_official_assets(root, checkpoint)
     model_config = json.loads((root / "rhinovla/assets/qwen3_vl_processor/config.json").read_text())
-    _validate_qin_profile(qin, model_config)
+    if raw is None:
+        _validate_qin_profile(qin, model_config)
     model = (_load_official_model(root, checkpoint, rtc=True) if rtc
              else _load_official_model(root, checkpoint))
+    if raw is not None:
+        # Built by the loaded source, then held to the same checks before any RPU install.
+        qin = _source_qin(model, raw)
+        _check_qin_tensors(qin)
+        _validate_qin_profile(qin, model_config)
+    ids = qin["input_ids"]
     full_expert = model.action_expert
     expert = full_expert.transformer
     # Upstream shares this small module with Qwen; Qwen's later .half() must

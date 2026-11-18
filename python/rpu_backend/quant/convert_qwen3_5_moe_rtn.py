@@ -24,6 +24,7 @@ from transformers import Qwen3_5MoeConfig
 
 if __package__:
     from . import qwen3_5_moe_rtn as recipe_module
+    from . import precision_recipes
     from rpu_backend.adapters.qwen3_5_moe.quant_scope import (
         RTN_RECIPE, TEXT_PREFIX, validate_exact_profile,
     )
@@ -37,6 +38,7 @@ else:
     sys.modules[spec.name] = package
     spec.loader.exec_module(package)
     from _offline_moe_quant import qwen3_5_moe_rtn as recipe_module
+    from _offline_moe_quant import precision_recipes
     spec = importlib.util.spec_from_file_location(
         "_offline_moe_scope", root.parent / "adapters/qwen3_5_moe/quant_scope.py")
     scope = importlib.util.module_from_spec(spec)
@@ -44,6 +46,10 @@ else:
     spec.loader.exec_module(scope)
     RTN_RECIPE, TEXT_PREFIX = scope.RTN_RECIPE, scope.TEXT_PREFIX
     validate_exact_profile = scope.validate_exact_profile
+
+
+# The one registered precision recipe this converter produces.
+FAMILY, RECIPE = "qwen3_5", "w4a16_experts_rtn_g128"
 
 
 def _sha(path: Path) -> str:
@@ -178,7 +184,8 @@ def convert_checkpoint(src: str | Path, dst: str | Path) -> dict:
         validate_exact_profile(Qwen3_5MoeConfig.from_dict(config))
         _json(tmp / "config.json", config)
         _json(tmp / "model.safetensors.index.json", {"metadata": {"total_size": total_size}, "weight_map": output_map})
-        skip = set(shards) | {"config.json", "model.safetensors.index.json", "derivation_manifest.json"}
+        skip = set(shards) | {"config.json", "model.safetensors.index.json", "derivation_manifest.json",
+                              precision_recipes.RECORD}
         for path in sorted(src.iterdir()):
             if path.is_file() and path.name not in skip and not path.name.endswith((".safetensors", ".bin")):
                 record_source(path)
@@ -186,6 +193,7 @@ def convert_checkpoint(src: str | Path, dst: str | Path) -> dict:
         for filename, before in source_stats.items():
             if signature(src / filename) != before:
                 raise ValueError(f"source changed during conversion: {filename}")
+        precision_recipes.write_record(tmp, FAMILY, RECIPE)
         for path in sorted(tmp.iterdir()):
             manifest["output_files"][path.name] = {"bytes": path.stat().st_size, "sha256": _sha(path)}
         manifest["completed"] = True

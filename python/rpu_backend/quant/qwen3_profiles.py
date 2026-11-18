@@ -63,7 +63,7 @@ def qwen3_dense_quant_profile(config):
 
 
 def qwen3_w4_topology(config, num_cores):
-    """Resolve the packed G32 topology; it uses the same template as FP16/W8.
+    """Resolve the packed G32 or NVFP4 topology; it uses the same template as FP16/W8.
 
     Packed row projections need K/TP divisible by 32. A six-lane MLP whose
     source width is not 192-aligned is zero-padded once at installation

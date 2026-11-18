@@ -173,6 +173,7 @@ def load_qwen3_vl_runtime_imagetext(
         return topology.lm_head_tp if name == "lm_head" else (
             topology.mlp_tp if ".mlp." in name else topology.attn_tp)
     mlp_tp = topology.mlp_tp if topology is not None else 8
+    lm_head_tp = topology.lm_head_tp if topology is not None else 8
     if _mmap_w8_weights and not (
         config.text_config.hidden_size == 5120 and config.quant_config["method"] == "w8a16"
     ):
@@ -197,7 +198,7 @@ def load_qwen3_vl_runtime_imagetext(
     for name, module, partition in projections:
         n, k = module.out_features, module.in_features
         cores = projection_cores(name)
-        pn, pk = packed_projection_geometry(name, n, k, partition, mlp_tp)
+        pn, pk = packed_projection_geometry(name, n, k, partition, mlp_tp, lm_head_tp)
         if bits == 4 and ((partition == 1 and (pn % (16 * cores) or pk % 32))
                          or (partition == 0 and (pn % 16 or pk % (32 * cores)))):
             raise ValueError(f"runtime W4 projection is outside its selected pgrp geometry: {name}")
@@ -229,7 +230,7 @@ def load_qwen3_vl_runtime_imagetext(
             weight, scale = tensor(name + ".weight"), tensor(name + ".weight_scale")
             if bits == 4:
                 n, k = module.out_features, module.in_features
-                pn, pk = packed_projection_geometry(name, n, k, partition, mlp_tp)
+                pn, pk = packed_projection_geometry(name, n, k, partition, mlp_tp, lm_head_tp)
                 weight, scale = _pack_w4_projection(weight, scale,
                     n=n, k=k, partition=partition, num_cores=projection_cores(name),
                     padded_size=None if (pn, pk) == (n, k) else (pn if partition == 1 else pk))

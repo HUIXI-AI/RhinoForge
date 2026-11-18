@@ -23,6 +23,10 @@ from rpu_backend.adapters.qwen3_5.quant_scope import (
     is_full_from_layer_types, quanttrio_awq_config,
 )
 from .awq_gemm import pack_awq_words
+from .precision_recipes import RECORD, write_record
+
+# The one registered precision recipe this converter produces.
+FAMILY, RECIPE = 'qwen3_5', 'w4a16_mlp_activation_awq_g128'
 
 
 def _digest(path):
@@ -356,14 +360,15 @@ def convert(src, dst, calibration, *, shard_mb=512, grid=9, row_block=256):
         }
         (tmp / 'config.json').write_text(json.dumps(config, indent=2) + '\n')
         for path in src.iterdir():
-            if path.is_file() and path.name not in {'config.json', 'model.safetensors.index.json', 'SHA256SUMS'} \
+            if path.is_file() and path.name not in {'config.json', 'model.safetensors.index.json', 'SHA256SUMS', RECORD} \
                     and not path.name.endswith(('.safetensors', '.bin', '.pt', '.pth')):
                 shutil.copy2(path, tmp / path.name)
+        write_record(tmp, FAMILY, RECIPE)
         tmp.rename(dst)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
-    return {'profile': ACTIVATION_AWQ_PROFILE, 'layers': layers - 1,
+    return {'profile': ACTIVATION_AWQ_PROFILE, 'recipe': RECIPE, 'layers': layers - 1,
             'shards': writer.index}
 
 

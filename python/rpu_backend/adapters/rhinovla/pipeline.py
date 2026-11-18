@@ -236,8 +236,10 @@ def _preflight_rhinovla_cold_install(
     vision_cold = pipeline_cold_config.stages["vision"]
     action_cold = pipeline_cold_config.stages["action"]
     from .fused import _RhinoVLANativeColdConfig
+    from .runtime import rhinovla_core_count
 
-    native_cold = _RhinoVLANativeColdConfig.from_env()
+    cores = rhinovla_core_count(resolved[0])
+    native_cold = _RhinoVLANativeColdConfig.from_env(num_cores=cores)
     from .runtime import resolve_rhinovla_quantization
     expert_w8a16, full_expert_w8a16, full_w8a16 = resolve_rhinovla_quantization(
         expert_w8a16=expert_w8a16, full_expert_w8a16=full_expert_w8a16)
@@ -268,19 +270,29 @@ def _preflight_rhinovla_cold_install(
     vector_k_norm = rpu_env_bool("RPU_RHINOVLA_VECTOR_K_NORM")
     vector_q_norm = rpu_env_bool("RPU_RHINOVLA_VECTOR_Q_NORM")
     partial_rope = rpu_env_bool("RPU_RHINOVLA_PARTIAL_ROPE")
+    text_topology = None
+    if cores != 8:
+        text_topology = _preflight_reduced_owners(
+            cores, text_cfg=text_cfg, vision_cfg=vision_cfg, expert_cfg=expert_cfg,
+            expert_depth=expert_depth, expert_mlp_dim=expert_mlp_dim,
+            suffix_len=suffix_len, steps=steps, action_io=action_io,
+            native_cold=native_cold, vision_cold=vision_cold, action_cold=action_cold)
     if partial_rope and not high_precision:
         raise ValueError("RhinoVLA PARTIAL_ROPE requires HIGH_PRECISION")
     if vector_q_norm and not high_precision:
         raise ValueError("RhinoVLA VECTOR_Q_NORM requires HIGH_PRECISION")
-    if vector_k_norm and not (high_precision and native_cold.aligned_kv):
+    # Eight cores keep the K pad row in aligned KV storage and the AdaRMS
+    # tables resident; 4/6 cores pad the vector-norm K buffer itself and read
+    # the precomputed tables from DDR per layer.
+    if vector_k_norm and not (high_precision and (native_cold.aligned_kv or cores != 8)):
         raise ValueError("RhinoVLA VECTOR_K_NORM requires HIGH_PRECISION and ALIGNED_KV")
     if high_precision_fusions and not high_precision:
         raise ValueError("RhinoVLA HIGH_PRECISION_FUSIONS requires HIGH_PRECISION")
-    if high_precision and not (full_w8a16 and native_cold.precompute_adarms
-                               and native_cold.adarms_resident):
+    tables_ready = full_w8a16 and native_cold.precompute_adarms and (
+        native_cold.adarms_resident or cores != 8)
+    if high_precision and not tables_ready:
         raise ValueError("RhinoVLA HIGH_PRECISION requires full W8 and resident AdaRMS tables")
-    if precompute_gate_tanh and not (full_w8a16 and native_cold.precompute_adarms
-                                    and native_cold.adarms_resident):
+    if precompute_gate_tanh and not tables_ready:
         raise ValueError("RhinoVLA PRECOMPUTE_GATE_TANH requires full W8 and resident AdaRMS tables")
     if expert_w8a16 and native_cold.packed_qkv:
         raise ValueError("RhinoVLA EXPERT_W8A16 is incompatible with PACKED_QKV")
@@ -305,7 +317,8 @@ def _preflight_rhinovla_cold_install(
     if full_w8a16:
         if not (native_cold.precompute_adarms and not native_cold.skip_adarms_gemv
                 and vision_cold["rpu_patch_embed"] and vision_cold["rpu_mergers"]
-                and vision_cold["fused_merger"] and not vision_cold["rpu_mergers_streaming"]):
+                and (vision_cold["fused_merger"] or cores != 8)
+                and not vision_cold["rpu_mergers_streaming"]):
             raise ValueError("RhinoVLA FULL_W8A16 requires precomputed AdaRMS and device patch/fused resident mergers")
         if tuple(getattr(text_cfg, name, None) for name in (
             "num_hidden_layers", "hidden_size", "intermediate_size",
@@ -354,6 +367,10 @@ def _preflight_rhinovla_cold_install(
             "RPU_RHINOVLA_EXPERT_MLP_DIM_LIMIT must be in "
             f"[1, {expert_mlp_dim}], got {mlp_limit}"
         )
+    if cores != 8 and (depth_limit is not None or mlp_limit is not None):
+        raise ValueError(
+            f"RhinoVLA {cores}-core expert has no depth/MLP-limited owner; "
+            "unset RPU_RHINOVLA_EXPERT_DEPTH_LIMIT and RPU_RHINOVLA_EXPERT_MLP_DIM_LIMIT")
     prefix_layer_offset = int(
         getattr(model, "prefix_layer_offset", depth_total - effective_depth)
     )
@@ -417,7 +434,54 @@ def _preflight_rhinovla_cold_install(
         "prefix_layer_offset": prefix_layer_offset,
         "suffix_len": suffix_len,
         "exp_max_seq": exp_max_seq,
+        "cores": cores,
+        "text_topology": text_topology,
     }
+
+
+def _preflight_reduced_owners(
+    cores, *, text_cfg, vision_cfg, expert_cfg, expert_depth, expert_mlp_dim,
+    suffix_len, steps, action_io, native_cold, vision_cold, action_cold,
+):
+    """Admit the 4/6-core composite before any weight is touched.
+
+    Only the v3 geometry has reduced owners: the expert on attention 4 / MLP
+    ``cores``, the 2B text tower on its Qwen3-VL reduced topology and vision on
+    four cores. Eight-core-only selectors were already turned off by the
+    execution resolver. The HIGH family runs on these owners: its merger GELU
+    is the exact ERF of the separate merger path.
+    """
+    from rpu_backend.api._execution import qwen3_vl_text_topology
+    from .convert import _direct_action_input
+
+    if not (action_cold["denoise_unroll"] and action_cold["shared_cache"]
+            and action_cold["prefix_alias"]):
+        raise ValueError(
+            f"RhinoVLA {cores}-core expert requires action.denoise_unroll, "
+            "shared_cache and prefix_alias")
+    if not native_cold.precompute_adarms or native_cold.skip_adarms_gemv:
+        raise ValueError(
+            f"RhinoVLA {cores}-core expert requires PRECOMPUTE_ADARMS without SKIP_ADARMS_GEMV")
+    if vision_cold["rpu_mergers_streaming"]:
+        raise ValueError(f"RhinoVLA {cores}-core vision has no streaming-merger owner")
+    if not (_direct_action_input(action_io) and steps == 10 and suffix_len == 31 and (
+        expert_depth, getattr(expert_cfg, "width", None), expert_mlp_dim,
+        getattr(expert_cfg, "num_attention_heads", None),
+        getattr(expert_cfg, "num_key_value_heads", None),
+        getattr(expert_cfg, "head_dim", None),
+    ) == (18, 1024, 3072, 16, 8, 128)):
+        raise ValueError(
+            f"RhinoVLA {cores}-core expert requires the v3 18-layer H1024/I3072/"
+            "Q16/KV8/D128, 31-token, ten-step direct-input loop")
+    if tuple(getattr(vision_cfg, name, None) for name in (
+        "depth", "hidden_size", "intermediate_size", "num_heads",
+    )) != (24, 1024, 4096, 16):
+        raise ValueError(f"RhinoVLA {cores}-core vision requires the v3 24-layer tower")
+    try:
+        return qwen3_vl_text_topology(text_cfg, cores)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"RhinoVLA {cores}-core text requires the exact Qwen3-VL-2B tower") from exc
 
 
 class RhinoVLAOnRPU:
@@ -540,6 +604,7 @@ class RhinoVLAOnRPU:
         from rpu_backend.adapters.rhinovla.runtime import (
             own_rhinovla_child,
             RHINOVLA_TEXT_COMPONENT, RHINOVLA_VISION_COMPONENT, RHINOVLA_ACTION_COMPONENT,
+            RHINOVLA_REDUCED_VISION_CORES,
         )
         from rpu_backend.runtime.decoder import install_mrope_text_decoder_for_rpu
         self.steps = cold["steps"]
@@ -588,6 +653,7 @@ class RhinoVLAOnRPU:
                 "vision", {}
             ).get("chunk_size", "auto"),
             w8a16=cold["full_w8a16"],
+            **({} if cold["cores"] == 8 else {"num_cores": RHINOVLA_REDUCED_VISION_CORES}),
         )
         own_rhinovla_child(self, self.vision_model, RHINOVLA_VISION_COMPONENT)
         if rpu_patch_embed:
@@ -617,7 +683,11 @@ class RhinoVLAOnRPU:
         # Opt-in via RPU_QWEN3VL_VISION_FUSED_MERGER; registers weights + sets the
         # _rpu_vision_fused_merger flag consumed by the forward.
         if vision_cold["fused_merger"]:
-            register_qwen3vl_vision_fused_merger(self.vision_model, w8a16=cold["full_w8a16"])
+            register_qwen3vl_vision_fused_merger(
+                self.vision_model,
+                cores=getattr(self.vision_model, "_rpu_vision_num_cores", 8),
+                w8a16=cold["full_w8a16"],
+            )
             _trace("vision fused merger registered")
         if cold["high_precision"]:
             torch.ops.rpu.qwen3vl_vision_set_rhinovla_high_precision(
@@ -636,7 +706,14 @@ class RhinoVLAOnRPU:
         if cold["full_w8a16"]:
             from .precision import quantize_text_prefix
             quantize_text_prefix(self.text_model)
-        convert_linear_weights_inplace(self.text_model, skip_names=set())
+        text_topology = cold["text_topology"]
+        convert_linear_weights_inplace(
+            self.text_model, skip_names=set(), **({} if text_topology is None else {
+                "attn_num_cores": text_topology.attn_tp,
+                "mlp_num_cores": text_topology.mlp_tp,
+                "lm_head_num_cores": text_topology.lm_head_tp,
+                "execution_core_count": text_topology.num_cores,
+            }))
         self.text_model.to("rpu")
         prefix_scales = None
         if cold["full_w8a16"]:
@@ -647,7 +724,9 @@ class RhinoVLAOnRPU:
             arch="qwen3_vl_text", chunk_envelope_for=_TEXT_ENVELOPE,
             vision_config=self.vis_cfg, deepstack_lang_layers=list(range(3)),
             scale_lists=prefix_scales,
-            execution_config={"prefill": {
+            **({} if text_topology is None else {"topology": text_topology}),
+            execution_config={**({} if text_topology is None else {
+                "model": {"num_cores": text_topology.num_cores}}), "prefill": {
                 key: value for key, value in self._text_execution.get("prefill", {}).items()
                 if key in ("chunk_size", "padding_rows", "padding_budget", "linear_acc32")
             }})
@@ -681,7 +760,9 @@ class RhinoVLAOnRPU:
         self._text_cache = self._RPUCache(
             num_layers=self.depth_total, batch_size=1, max_seq_len=self.max_seq,
             num_kv_heads=int(self.text_cfg.num_key_value_heads),
-            head_dim=int(self.text_cfg.head_dim))
+            head_dim=int(self.text_cfg.head_dim),
+            # The expert aliases these prefix layers, so both share one KV layout.
+            **({} if text_topology is None else {"attn_tp": text_topology.attn_tp}))
         # The fused decoder takes inputs_embeds (input_ids=None) and never uses
         # embed_tokens, but prepare_prefix_inputs_from_vision_outputs looks the
         # token embeddings up per call with CPU input_ids. Keep embed_tokens on
@@ -737,7 +818,11 @@ class RhinoVLAOnRPU:
             max_seq_len=self.exp_max_seq,
             w8a16=cold["expert_w8a16"],
             full_w8a16=cold["full_expert_w8a16"],
+            num_cores=cold["cores"],
         )
+        if cold["cores"] != 8:
+            _trace(f"reduced {cold['cores']}-core owners: expert/text "
+                   f"{self.er._rpu_execution_topology}, vision {RHINOVLA_REDUCED_VISION_CORES}")
         if cold["high_precision"]:
             torch.ops.rpu.rhino_vla_set_high_precision(self.er._rpu_handle, True)
         if cold["high_precision_fusions"]:
@@ -768,7 +853,8 @@ class RhinoVLAOnRPU:
             )
 
             loop_w = _prepare_denoise_loop_weights(
-                self.expert, self.action_io, self.mask_proj, full_w8a16=cold["full_w8a16"])
+                self.expert, self.action_io, self.mask_proj, full_w8a16=cold["full_w8a16"],
+                num_cores=cold["cores"])
             loop_setter = (torch.ops.rpu.rhino_vla_set_denoise_loop_weights_w8a16
                            if cold["full_w8a16"] else torch.ops.rpu.rhino_vla_set_denoise_loop_weights)
             loop_setter(

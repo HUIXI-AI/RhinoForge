@@ -371,6 +371,8 @@ def _pi05_graph_runtime_profile(self, num_steps: int) -> dict:
         "vlm_chunk_size": int(getattr(vlm, "_rpu_chunk_size", 0)),
         "siglip_batch_n": int(getattr(self, "_rpu_siglip_batch_n", 1)),
         "siglip_graph": bool(vision._siglip_graph_enabled),
+        "siglip_qkv_w8a8": bool(getattr(vision, "_siglip_qkv_w8a8", False)),
+        "siglip_mlp_w8a8": bool(getattr(vision, "_siglip_mlp_w8a8", False)),
         "gemma_graph": bool(vlm._gemma_graph_enabled),
         "adarms_graph": bool(expert._adarms_graph_capture_enabled),
         "fused_denoise": getattr(
@@ -651,8 +653,16 @@ def _sample_noise(self, bsize, noise):
     return x_t
 
 
+def _installed_vision_lanes(self):
+    """Lanes of the installed SigLIP; Vision W4 keeps four under budget 8."""
+    pawe = getattr(self, "paligemma_with_expert", None)
+    tower = getattr(getattr(getattr(pawe, "paligemma", None), "model", None), "vision_tower", None)
+    vision = getattr(tower, "vision_model", tower)
+    return None if vision is None else vars(vision).get("_rpu_vision_num_cores")
+
+
 def _eligible_serial_siglip_slab(self, images):
-    """Return only the existing exact private CPU slab admitted for TP4/6."""
+    """Return only the existing exact private CPU slab admitted for four-lane SigLIP."""
     if not images or not all(type(image) is torch.Tensor for image in images):
         return None
     from rpu_backend.adapters.siglip import _shared_siglip_image_slab
@@ -670,7 +680,9 @@ def _eligible_serial_siglip_slab(self, images):
     serial_slab = (
         not shared_batch
         and vars(self).get("_rpu_siglip_batch_n") == 1
-        and type(model_cores) is int and model_cores in (4, 6)
+        and type(model_cores) is int
+        and (model_cores in (4, 6)
+             or (model_cores == 8 and _installed_vision_lanes(self) == 4))
         and vars(self).get("training") is False
         and type(shared_slab) is torch.Tensor
         and shared_slab.device.type == "cpu"
@@ -700,7 +712,7 @@ def _prepare_prefill_siglip_inputs(
 
     The batch-preprocessing path returns CPU dim-0 views of one camera slab.
     Keep those views intact until `_siglip_forward_images`, which performs one
-    packed copy. Exact TP4/6 serial inputs retain CPU views for three private
+    packed copy. Exact four-lane serial inputs retain CPU views for three private
     native copies. Dynamic/reference inputs keep the per-image upload.
     Masks stay on CPU: they only feed prefix-mask construction, and the
     fused Gemma path normalizes its attention mask on CPU.
@@ -881,10 +893,29 @@ def _prefill_prefix_embs(self, images, img_masks, tokens, masks, rpu_device):
         vision_inner = getattr(vision_tower, "vision_model", vision_tower)
         native_handle = getattr(vision_inner, "_rpu_vision_handle", None)
         # Installed SigLIP retains CPU embeddings. Extend the legacy device
-        # probe only for the already admitted private serial camera slab.
+        # probe for the admitted private serial camera slab or packed 2/3-cam profile.
+        from rpu_backend.runtime import rpu_env_bool
+
+        _batch_n = getattr(self, "_rpu_siglip_batch_n", 1)
+        _vision_cores = vars(vision_inner).get("_rpu_vision_num_cores")
+        _packed_admitted = (
+            vars(self).get("training") is False
+            and _batch_n in (2, 3)
+            and images is not None
+            and len(images) == _batch_n
+            and all(type(im) is torch.Tensor for im in images)
+            and (
+                _vision_cores == 8
+                or (
+                    _vision_cores == 4
+                    and rpu_env_bool("RPU_PI05_VISION_KV_SPM_ONLY", default=False)
+                    and rpu_env_bool("RPU_PI05_VISION_Q_RESIDENT", default=False)
+                )
+            )
+        )
         _siglip_on_rpu = (
             type(native_handle) is int and native_handle > 0
-            and _eligible_serial_siglip_slab(self, images) is not None
+            and (_eligible_serial_siglip_slab(self, images) is not None or _packed_admitted)
         )
     if _siglip_on_rpu and images is not None:
         images, img_masks = _prepare_prefill_siglip_inputs(

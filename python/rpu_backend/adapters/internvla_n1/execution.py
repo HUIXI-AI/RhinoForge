@@ -46,6 +46,50 @@ INTERNVLA_EXECUTION_COMPONENTS = {
     NAVDP_COMPONENT: {"action": ("chunk_size",)},
     NEXTDIT_COMPONENT: {"action": ("chunk_size",)},
 }
+_MODEL_SCOPE = {"model": ("num_cores",)}
+
+
+def _stage_union(components):
+    union = {}
+    for stages in components.values():
+        for stage, fields in stages.items():
+            known = union.setdefault(stage, [])
+            known.extend(field for field in fields if field not in known)
+    return {stage: tuple(fields) for stage, fields in union.items()}
+
+
+# The public core budget belongs to the composite; child views carry the
+# derived count only when it is not the eight-core default.
+_INTERNVLA_EXECUTION_SUPPORTED = {
+    **_MODEL_SCOPE, **_stage_union(INTERNVLA_EXECUTION_COMPONENTS)}
+# Children whose reduced owners have a four-lane layout only. They run inside
+# the six-core budget too; the backbone and the DINO towers use the budget.
+INTERNVLA_REDUCED_FOUR_CORE = (VISION_COMPONENT, FORMER_COMPONENT, NAVDP_COMPONENT)
+
+
+def internvla_core_count(execution) -> int:
+    # normalize_rpu_execution already admitted 4, 6 or 8.
+    return (execution or {}).get("model", {}).get("num_cores", 8)
+
+
+def internvla_component_cores(budget: int, component: str) -> int:
+    if budget == 8:
+        return 8
+    if component == NEXTDIT_COMPONENT:
+        raise ValueError(
+            "InternVLA NextDiT has only its eight-core owner; "
+            "model.num_cores 4/6 is not supported")
+    return 4 if component in INTERNVLA_REDUCED_FOUR_CORE else budget
+
+
+def _with_cores(config, cores: int, capabilities, *, entry_point: str):
+    if cores == 8:
+        return config
+    return normalize_rpu_execution(
+        {**config, "model": {"num_cores": cores}},
+        entry_point=entry_point,
+        supported={**capabilities, **_MODEL_SCOPE},
+    )
 
 
 def resolve_internvla_execution(value, *, entry_point: str):
@@ -53,8 +97,10 @@ def resolve_internvla_execution(value, *, entry_point: str):
     root = normalize_rpu_execution(
         value,
         entry_point=entry_point,
+        supported=_INTERNVLA_EXECUTION_SUPPORTED,
         supported_components=INTERNVLA_EXECUTION_COMPONENTS,
     )
+    budget = internvla_core_count(root)
     resolved = {}
     for component, capabilities in INTERNVLA_EXECUTION_COMPONENTS.items():
         stage = next(iter(capabilities))
@@ -62,36 +108,51 @@ def resolve_internvla_execution(value, *, entry_point: str):
             {stage: {"chunk_size": "auto"}}
             if "chunk_size" in capabilities[stage] else {}
         )
-        resolved[component] = resolve_component_rpu_execution(
+        child = resolve_component_rpu_execution(
             root,
             component,
             entry_point=entry_point,
+            supported=_INTERNVLA_EXECUTION_SUPPORTED,
             supported_components=INTERNVLA_EXECUTION_COMPONENTS,
             profile_auto=profile,
         )
+        if budget != 8 and component == NEXTDIT_COMPONENT:
+            resolved[component] = child  # Refused by its builder, not by the parser.
+            continue
+        resolved[component] = _with_cores(
+            child, internvla_component_cores(budget, component), capabilities,
+            entry_point=entry_point)
     return root, resolved
 
 
 def component_execution(value, component: str, *, entry_point: str):
     """Resolve a component-local config without accepting sibling fields."""
     capabilities = INTERNVLA_EXECUTION_COMPONENTS[component]
+    supported = {**capabilities, **_MODEL_SCOPE}
     stage = next(iter(capabilities))
     local = normalize_rpu_execution(
         value,
         entry_point=entry_point,
-        supported=capabilities,
+        supported=supported,
     )
+    cores = internvla_core_count(local)
+    if cores != 8 and (
+            component == NEXTDIT_COMPONENT
+            or (component in INTERNVLA_REDUCED_FOUR_CORE and cores != 4)):
+        raise ValueError(f"InternVLA {component} has no {cores}-core owner")
     profile = (
         {stage: {"chunk_size": "auto"}}
         if "chunk_size" in capabilities[stage] else {}
     )
-    return resolve_component_rpu_execution(
+    resolved = resolve_component_rpu_execution(
         local,
         component,
         entry_point=entry_point,
+        supported=supported,
         supported_components={component: capabilities},
         profile_auto=profile,
     )
+    return _with_cores(resolved, cores, capabilities, entry_point=entry_point)
 
 
 def plan_navdp_component(
@@ -447,6 +508,7 @@ class InternVLAExecutionController:
             owner,
             rpu_execution,
             entry_point="bind_internvla_execution_runtime",
+            supported=_INTERNVLA_EXECUTION_SUPPORTED,
             supported_components=INTERNVLA_EXECUTION_COMPONENTS,
         )
         resolved = resolve_internvla_execution(
@@ -458,6 +520,7 @@ class InternVLAExecutionController:
             owner,
             root,
             entry_point="InternVLAExecutionController",
+            supported=_INTERNVLA_EXECUTION_SUPPORTED,
             supported_components=INTERNVLA_EXECUTION_COMPONENTS,
             validate=self.validate,
             apply=self.apply,
@@ -494,7 +557,7 @@ class InternVLAExecutionController:
                 f"{sorted(absent)}"
             )
         for stage, fields in root.items():
-            if stage == "components":
+            if stage in ("components", "model"):
                 continue
             unused = [
                 field for field in fields
@@ -536,6 +599,11 @@ class InternVLAExecutionController:
             value, entry_point="InternVLAExecutionController.reconfigure"
         )
         self._reject_absent_overrides(root)
+        if internvla_core_count(root) != internvla_core_count(
+                vars(self.owner).get("_rpu_execution")):
+            raise ValueError(
+                "InternVLA model.num_cores is cold-only: build a fresh runtime "
+                "to change topology")
 
     def apply(self, old, new, next_generation, *, force_rebuild=False) -> None:
         self._journal = None
@@ -638,9 +706,12 @@ __all__ = [
     "NAVDP_COMPONENT",
     "NEXTDIT_COMPONENT",
     "INTERNVLA_EXECUTION_COMPONENTS",
+    "INTERNVLA_REDUCED_FOUR_CORE",
     "InternVLAExecutionController",
     "bind_internvla_execution_runtime",
     "component_execution",
+    "internvla_component_cores",
+    "internvla_core_count",
     "plan_navdp_component",
     "publish_execution_receipt",
     "resolve_internvla_execution",

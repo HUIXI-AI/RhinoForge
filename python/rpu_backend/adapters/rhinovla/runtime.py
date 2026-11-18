@@ -59,6 +59,31 @@ RHINOVLA_EXECUTION_COMPONENTS = {
                                                     *_PIPELINE_COLD_DEFAULTS["vision"])},
     RHINOVLA_ACTION_COMPONENT: {"action": ("chunk_size", *_PIPELINE_COLD_ENV["action"])},
 }
+_RHINOVLA_EXECUTION_SUPPORTED = {
+    "model": ("num_cores",),
+    **{stage: fields for component in RHINOVLA_EXECUTION_COMPONENTS.values()
+       for stage, fields in component.items()},
+}
+# Pipeline selectors whose owners exist for eight cores only. One TOML per
+# precision serves every budget: a reduced budget turns these off here.
+RHINOVLA_REDUCED_OFF = {
+    "prefill": (),
+    "vision": (),
+}
+# Vision keeps its four-core owner at both reduced budgets.
+RHINOVLA_REDUCED_VISION_CORES = 4
+
+
+def rhinovla_core_count(root):
+    # normalize_rpu_execution already admitted 4, 6 or 8.
+    return root.get("model", {}).get("num_cores", 8)
+
+
+def _drop_reduced_selectors(scope):
+    return {stage: ({field: item for field, item in fields.items()
+                     if field not in RHINOVLA_REDUCED_OFF.get(stage, ())}
+                    if stage in _PIPELINE_COLD_ENV else fields)
+            for stage, fields in scope.items()}
 
 
 def resolve_rhinovla_execution(value, *, entry_point):
@@ -67,12 +92,26 @@ def resolve_rhinovla_execution(value, *, entry_point):
     root = normalize_rpu_execution(
         value,
         entry_point=entry_point,
+        supported=_RHINOVLA_EXECUTION_SUPPORTED,
         supported_components=RHINOVLA_EXECUTION_COMPONENTS,
     )
+    cores = rhinovla_core_count(root)
+    if cores != 8:
+        components = {name: _drop_reduced_selectors(stages)
+                      for name, stages in root.get("components", {}).items()}
+        root = normalize_rpu_execution(
+            {**_drop_reduced_selectors(
+                {key: item for key, item in root.items() if key != "components"}),
+             **({"components": components} if components else {})},
+            entry_point=entry_point,
+            supported=_RHINOVLA_EXECUTION_SUPPORTED,
+            supported_components=RHINOVLA_EXECUTION_COMPONENTS,
+        )
     text = resolve_component_rpu_execution(
         root,
         RHINOVLA_TEXT_COMPONENT,
         entry_point=entry_point,
+        supported=_RHINOVLA_EXECUTION_SUPPORTED,
         supported_components=RHINOVLA_EXECUTION_COMPONENTS,
         profile_auto={"prefill": {"chunk_size": "auto"}},
     )
@@ -80,6 +119,7 @@ def resolve_rhinovla_execution(value, *, entry_point):
         root,
         RHINOVLA_VISION_COMPONENT,
         entry_point=entry_point,
+        supported=_RHINOVLA_EXECUTION_SUPPORTED,
         supported_components=RHINOVLA_EXECUTION_COMPONENTS,
         profile_auto={"vision": {"chunk_size": "auto"}},
     )
@@ -87,9 +127,20 @@ def resolve_rhinovla_execution(value, *, entry_point):
         root,
         RHINOVLA_ACTION_COMPONENT,
         entry_point=entry_point,
+        supported=_RHINOVLA_EXECUTION_SUPPORTED,
         supported_components=RHINOVLA_EXECUTION_COMPONENTS,
         profile_auto={"action": {"chunk_size": "auto"}},
     )
+    if cores != 8:
+        # The public budget belongs to the composite. Its finite child layouts
+        # are derived here; component overrides cannot choose different cores.
+        text, vision, action = (
+            normalize_rpu_execution(
+                {**child, "model": {"num_cores": child_cores}},
+                entry_point=entry_point, supported=_RHINOVLA_EXECUTION_SUPPORTED)
+            for child, child_cores in ((text, cores),
+                                       (vision, RHINOVLA_REDUCED_VISION_CORES),
+                                       (action, cores)))
     return root, text, vision, action
 
 
@@ -104,6 +155,7 @@ class RhinoVLAPipelineColdConfig:
         from rpu_backend.runtime import rpu_env_bool
 
         root, *children = resolve_rhinovla_execution(value, entry_point="RhinoVLAOnRPU")
+        reduced = rhinovla_core_count(root) != 8
         stages = {}
         for (stage, fields), child in zip(_PIPELINE_COLD_ENV.items(), children):
             explicit = child.get(stage, {})
@@ -115,6 +167,8 @@ class RhinoVLAPipelineColdConfig:
                 field: explicit.get(field, default)
                 for field, default in _PIPELINE_COLD_DEFAULTS[stage].items()
             })
+            if reduced:
+                stages[stage].update(dict.fromkeys(RHINOVLA_REDUCED_OFF.get(stage, ()), False))
         snapshot = cls(_freeze_rpu_execution(stages))
         snapshot._validate_dependencies()
         return snapshot, snapshot.bind_defaults(root)
@@ -423,6 +477,7 @@ class _RhinoVLAExecutionController:
             runtime,
             value,
             entry_point="bind_rhinovla_execution_runtime",
+            supported=_RHINOVLA_EXECUTION_SUPPORTED,
             supported_components=RHINOVLA_EXECUTION_COMPONENTS,
         )
         existing_session = _preflight_rhinovla_execution_session(runtime, root)
@@ -498,6 +553,7 @@ class _RhinoVLAExecutionController:
             runtime,
             root,
             entry_point="RhinoVLAPolicy",
+            supported=_RHINOVLA_EXECUTION_SUPPORTED,
             supported_components=RHINOVLA_EXECUTION_COMPONENTS,
             validate=self.validate,
             apply=self.apply,
@@ -561,7 +617,11 @@ class _RhinoVLAExecutionController:
     def validate(self, value):
         import torch
 
-        resolve_rhinovla_execution(value, entry_point="RhinoVLAPolicy.reconfigure")
+        root = resolve_rhinovla_execution(value, entry_point="RhinoVLAPolicy.reconfigure")[0]
+        topology = getattr(self.action_expert, "_rpu_execution_topology", None)
+        if topology is not None and rhinovla_core_count(root) != topology[0]:
+            raise ValueError(
+                "RhinoVLA model.num_cores is cold-bound; rebuild the runtime to change it")
         _validate_pipeline_cold(self.runtime, value)
         required = (
             "execution_reconfigure_begin",
@@ -835,6 +895,7 @@ def build_rpu_expert(
     max_seq_len: int,
     w8a16: bool = False,
     full_w8a16: bool = False,
+    num_cores: int = 8,
 ) -> Any:
     """Build one expert whose runtime prefix may vary within ``max_seq_len``.
 
@@ -845,6 +906,8 @@ def build_rpu_expert(
     its seven main projections are quantized before swizzling.
     ``full_w8a16`` additionally quantizes the expert's AdaRMS conditions;
     it does not select the precision of the pipeline's vision, text or IO.
+    ``num_cores`` 4 or 6 selects the reduced v3 owner: attention on four lanes,
+    the MLP on the whole budget.
     """
     import torch
 
@@ -857,7 +920,7 @@ def build_rpu_expert(
     # enable process-wide flushes at subsequent device-only handoffs.
     converted = copy.deepcopy(expert)
     cpu_rotary = copy.deepcopy(converted.qwen_rotary_emb).cpu()
-    converted = convert_expert_for_rpu(converted, w8a16=w8a16 or full_w8a16)
+    converted = convert_expert_for_rpu(converted, w8a16=w8a16 or full_w8a16, num_cores=num_cores)
     patch_rhino_vla_for_rpu(
         converted,
         prefix_len=int(prefix_len),
@@ -865,6 +928,7 @@ def build_rpu_expert(
         max_seq_len=int(max_seq_len),
         cpu_rotary_emb=cpu_rotary,
         **({"full_w8a16": True} if full_w8a16 else {}),
+        num_cores=num_cores,
     )
     return converted
 

@@ -15,6 +15,7 @@ and lazy-initialization checks keep the installed forward path Dynamo-safe.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import types
 from typing import Any
@@ -105,6 +106,28 @@ def _validate_vision_core_count(num_cores: int) -> None:
         raise ValueError("Qwen3-VL Vision num_cores must be 4 or 8")
 
 
+# Packed W4 Vision blocks: G32 RTN in the pgrp layout of the Vision lanes.
+_VISION_W4_GROUP_SIZE = 32
+
+
+def _is_qwen3_vl_w4_vision_tower(config, num_layers: int) -> bool:
+    """The one tower packed W4 admits: exact 2B/4B L24/H1024/I4096/16x64, taps 5/11/17.
+
+    Its projections split into pgrp lanes at 4 and 8 cores without padding;
+    the padded 8B/32B tower (K1280/K4352 rows) does not at 8 cores.
+    """
+    fields = ("hidden_size", "intermediate_size", "depth", "num_heads",
+              "patch_size", "temporal_patch_size", "spatial_merge_size",
+              "in_channels", "num_position_embeddings")
+    geometry = tuple(getattr(config, field, None) for field in fields)
+    return (num_layers == 24 and all(type(value) is int for value in geometry)
+            and geometry == (1024, 4096, 24, 16, 16, 2, 2, 3, 2304)
+            and getattr(config, "out_hidden_size", None) in (2048, 2560)
+            and canonical_vision_type(config, "qwen3_vl") == "qwen3_vl"
+            and getattr(config, "hidden_act", None) == "gelu_pytorch_tanh"
+            and tuple(getattr(config, "deepstack_visual_indexes", ())) == (5, 11, 17))
+
+
 def validate_qwen3_vl_vision_core_profile(
     vision_model, *, num_cores: int = 8, vision_config=None,
 ) -> None:
@@ -116,8 +139,6 @@ def validate_qwen3_vl_vision_core_profile(
     _validate_vision_core_count(num_cores)
     if num_cores == 8:
         return
-    if rpu_env_bool("RPU_QWEN3VL_VISION_BATCH"):
-        raise ValueError("four-core Vision requires per-image execution; packed image batches require 8 cores")
     cfg = vision_config or vision_model.config
     fields = ("hidden_size", "intermediate_size", "depth", "num_heads",
               "patch_size", "temporal_patch_size", "spatial_merge_size",
@@ -218,7 +239,7 @@ def validate_qwen3_vl_vision_core_profile(
         if merger.use_postshuffle_norm is not postshuffle or merger.hidden_size != hidden * 4:
             raise ValueError(f"four-core Vision {name} has invalid merger semantics")
         if type(merger.act_fn) is not nn.GELU or merger.act_fn.approximate != "none":
-            raise ValueError(f"four-core Vision {name} requires exact CPU GELU")
+            raise ValueError(f"four-core Vision {name} requires exact-erf GELU")
         norm(name + ".norm", merger.norm, hidden * (4 if postshuffle else 1))
         linear(name + ".linear_fc1", merger.linear_fc1, hidden * 4, hidden * 4)
         linear(name + ".linear_fc2", merger.linear_fc2, hidden * 4, out_hidden)
@@ -530,7 +551,7 @@ def _validate_vision_w8_block_source(block) -> None:
     for layer in (block.attn.qkv, block.attn.proj,
                   block.mlp.linear_fc1, block.mlp.linear_fc2):
         if not bool(torch.isfinite(layer.weight.detach().half()).all()):
-            raise ValueError("Qwen3-VL Vision W8 source must be finite in FP16")
+            raise ValueError("Qwen3-VL Vision W8/W4 source must be finite in FP16")
 
 
 def _convert_vision_block_weights_for_rpu(
@@ -539,6 +560,8 @@ def _convert_vision_block_weights_for_rpu(
     hidden_size: int,
     w8a16: bool = False,
     *,
+    w4a16: bool = False,
+    nvfp4: bool = False,
     num_cores: int = 8,
     physical_head_dim: int | None = None,
     physical_intermediate_size: int | None = None,
@@ -554,7 +577,22 @@ def _convert_vision_block_weights_for_rpu(
     symmetric int8 + fp16 scale, int8 swizzle (dwidth=1). The fp16 scales are stashed as
     `_rpu_*_ws`. Default off → fp16 (byte-identical for the qwen3_vl E2E path).
 
-    Idempotent via `_rpu_qwen3vl_vision_weights_converted` marker.
+    W4A16 (exact 2B/4B tower; padded 8B/32B tower at 4 lanes only): symmetric
+    RTN signed INT4 with one fp16 scale per 32 input channels, packed by
+    `pack_int4_weight` in the pgrp layout of `num_cores` lanes (q/k/v/fc1
+    column, o/fc2 row) instead of the TP swizzle. `_rpu_*_ws` then hold the
+    controller-striped 2D scale payload. The padded tower is quantized after
+    padding, so its groups run over the physical K (head 80, MLP 4352): a
+    group that reaches into the zero padding covers fewer logical inputs.
+
+    NVFP4 (exact 2B/4B tower only): E2M1 weight with one E4M3 scale per 16
+    input channels and one FP32 tensor scale per projection, from
+    `quantize_nvfp4`. The weight is the uint8 `[N, K/2]` NVFP4 swizzle at
+    `num_cores` lanes, `_rpu_*_ws` the striped uint8 `[K/16, N]` block scale,
+    and `_rpu_*_ts` the CPU FP32 scalar tensor scale.
+
+    Idempotent via `_rpu_qwen3vl_vision_weights_converted` marker, which
+    records the mode: False (fp16), True (w8a16), "w4a16" or "nvfp4".
     """
     _validate_vision_core_count(num_cores)
     if not isinstance(w8a16, bool):
@@ -562,6 +600,19 @@ def _convert_vision_block_weights_for_rpu(
             "qwen3_vl vision w8a16 must be a bool, "
             f"got {type(w8a16).__name__}."
         )
+    if not isinstance(w4a16, bool):
+        raise TypeError(
+            "qwen3_vl vision w4a16 must be a bool, "
+            f"got {type(w4a16).__name__}."
+        )
+    if not isinstance(nvfp4, bool):
+        raise TypeError(
+            "qwen3_vl vision nvfp4 must be a bool, "
+            f"got {type(nvfp4).__name__}."
+        )
+    if w8a16 + w4a16 + nvfp4 > 1:
+        raise ValueError("qwen3_vl vision block takes one of w8a16, w4a16 and nvfp4")
+    mode = "w4a16" if w4a16 else "nvfp4" if nvfp4 else bool(w8a16)
 
     # Validate fused QKV first so malformed public inputs fail with the
     # established diagnostic before we inspect any sibling submodule.
@@ -627,17 +678,24 @@ def _convert_vision_block_weights_for_rpu(
             "qwen3_vl vision physical padding is private to the exact 8B/32B "
             "vision tower (head 72->80, MLP 4304->4352)."
         )
+    if padded_vision and nvfp4:
+        raise ValueError("qwen3_vl NVFP4 Vision does not admit the padded 8B/32B tower")
+    if padded_vision and w4a16 and num_cores != 4:
+        raise ValueError(
+            "qwen3_vl packed W4 Vision runs the padded 8B/32B tower on 4 cores only: "
+            "its o (K1280) and fc2 (K4352) rows do not split into eight 64-aligned "
+            "pgrp lanes")
 
     # The marker records the quant MODE: re-installing the same block in the same mode is a
-    # no-op, but switching mode (fp16 <-> w8a16) after the weights are already swizzled would
-    # double-swizzle / mismatch dtype — fail loud rather than silently corrupt.
+    # no-op, but switching mode (fp16 / w8a16 / w4a16 / nvfp4) after the weights are already swizzled
+    # would double-swizzle / mismatch dtype — fail loud rather than silently corrupt.
     if _prev is not None:
         if getattr(block, "_rpu_qwen3vl_vision_num_cores", 8) != num_cores:
             raise RuntimeError("Vision core count cannot change after weight conversion")
-        if _prev != bool(w8a16):
+        if _prev != mode:
             raise RuntimeError(
-                f"qwen3_vl vision block already converted with w8a16={_prev}; cannot re-install "
-                f"with w8a16={bool(w8a16)} (weights already swizzled). Rebuild from a fresh model.")
+                f"qwen3_vl vision block already converted with mode={_prev!r}; cannot re-install "
+                f"with mode={mode!r} (weights already swizzled). Rebuild from a fresh model.")
         previous_geometry = getattr(
             block,
             "_rpu_qwen3vl_vision_physical_geometry",
@@ -651,7 +709,24 @@ def _convert_vision_block_weights_for_rpu(
             )
         return
 
+    tensor_scales = []
+
     def _swz(w_unswz, swz_fn):       # -> (weight [int8 dwidth=1 if w8a16 else fp16], fp16 scale or None)
+        if nvfp4:
+            from rpu_backend.quant.nvfp4_pack import (
+                quantize_nvfp4, swizzle_nvfp4_scales, swizzle_pack_nvfp4)
+            partition = 1 if swz_fn is tp_col_swizzle_mc_weight else 0
+            n, k = w_unswz.shape
+            codes, scale, tensor_scale = quantize_nvfp4(w_unswz.half())
+            tensor_scales.append(tensor_scale)
+            return (swizzle_pack_nvfp4(codes, partition, num_cores).reshape(n, k // 2),
+                    swizzle_nvfp4_scales(scale, partition, num_cores))
+        if w4a16:
+            # pgrp packing replaces the TP swizzle; the partition follows the swizzler.
+            from rpu_backend.quant.convert_qwen3_w4a16 import pack_int4_weight
+            return pack_int4_weight(
+                w_unswz.half(), 1 if swz_fn is tp_col_swizzle_mc_weight else 0,
+                group_size=_VISION_W4_GROUP_SIZE, num_cores=num_cores)
         if w8a16:
             wq, ws = _quantize_vision_w8_weight(w_unswz.half())
             return swz_fn(wq, num_cores, dwidth=1).contiguous(), ws.to(torch.float16)
@@ -688,8 +763,23 @@ def _convert_vision_block_weights_for_rpu(
                     f"Qwen3-VL vision {name} must have shape {expected}, got {actual}"
                 )
 
-        if w8a16:
+        if w8a16 or w4a16 or nvfp4:
             _validate_vision_w8_block_source(block)
+        # The packed formats see the physical (padded) projection shapes.
+        attention_width = num_heads * physical_head_dim
+        packed_shapes = (
+            ("qkv", attention_width, hidden_size, 1),
+            ("o", hidden_size, attention_width, 0),
+            ("fc1", physical_intermediate_size, hidden_size, 1),
+            ("fc2", hidden_size, physical_intermediate_size, 0))
+        if nvfp4:
+            from rpu_backend.quant.convert_qwen3_nvfp4 import _check_nvfp4_shape
+            for name, rows, cols, partition in packed_shapes:
+                _check_nvfp4_shape(f"Qwen3-VL Vision {name}", rows, cols, partition, num_cores)
+        if w4a16:
+            from rpu_backend.quant.convert_qwen3_w4a16 import _check_int4_shape
+            for name, rows, cols, partition in packed_shapes:
+                _check_int4_shape(f"Qwen3-VL Vision {name}", rows, cols, partition, num_cores)
 
         # From this point onward the conversion mutates published Parameters.
         # Leave a poison marker on BaseException so retry cannot double-swizzle
@@ -772,12 +862,15 @@ def _convert_vision_block_weights_for_rpu(
         fc2_b = fc2_b.contiguous()
         block.mlp.linear_fc2.weight = nn.Parameter(fc2_w, requires_grad=False)
         block._rpu_fc2_b = fc2_b
+        if nvfp4:
+            (block._rpu_q_ts, block._rpu_k_ts, block._rpu_v_ts,
+             block._rpu_o_ts, block._rpu_fc1_ts, block._rpu_fc2_ts) = tensor_scales
 
     block._rpu_qwen3vl_vision_logical_geometry = (
         logical_head_dim, logical_intermediate_size)
     block._rpu_qwen3vl_vision_physical_geometry = physical_geometry
     block._rpu_qwen3vl_vision_num_cores = num_cores
-    block._rpu_qwen3vl_vision_weights_converted = bool(w8a16)
+    block._rpu_qwen3vl_vision_weights_converted = mode
 
 
 def _use_w8_vision_weight_banks(config, *, w8a16: bool,
@@ -911,6 +1004,27 @@ def _convert_vision_merger_for_rpu(merger, cores: int = 8, *, w8a16: bool = Fals
     )
 
 
+@contextlib.contextmanager
+def _intra_ddr_flush_suspended():
+    """Run eager reduced auxiliary GEMMs without the intra-RPU weight flush.
+
+    Their weights were published once at install and every activation crosses
+    a force-flushed CPU boundary, so the intra-RPU flush only re-cleans the
+    whole weight allocation before each launch (32/20 MB per merger Linear).
+    LingBot v2's reduced builder keeps that flush on for its cross-handle
+    prefix KV; the other callers already run with it off. The caller's
+    setting is restored on exit.
+    """
+    intra_flush = torch.rpu.get_ddr_flush()
+    if intra_flush:
+        torch.rpu.set_ddr_flush(False)
+    try:
+        yield
+    finally:
+        if intra_flush:
+            torch.rpu.set_ddr_flush(True)
+
+
 def _merger_forward_on_device(
     merger, x_cpu_f32: torch.Tensor, *, keep_fp16: bool = False,
     linear_acc32: bool = False,
@@ -918,8 +1032,9 @@ def _merger_forward_on_device(
     """Mirror `Qwen3VLVisionPatchMerger.forward` with its GEMMs on device.
 
     `merger.norm` runs on CPU fp32 (as installed); the post-norm `[N/sm², merge_hidden]`
-    activation hops to device fp16 for both Linear calls; eager exact-ERF GELU follows the
-    registered CPU fallback. The result is an independent CPU FP32 snapshot by
+    activation hops to RPU fp16 for both Linear calls. fc1 applies the exact-ERF GELU
+    on the cores (the BASE SPM kernel the eight-core fused merger uses) before its
+    write-back, in the same submission. The result is an independent CPU FP32 snapshot by
     default, or FP16 for the internal text consumer. Requires
     `_convert_vision_merger_for_rpu`.
     """
@@ -928,14 +1043,14 @@ def _merger_forward_on_device(
     xr = xn.to(device="rpu", dtype=torch.float16).contiguous()
     w8a16 = getattr(merger, "_rpu_merger_w8a16", False)
     cores = getattr(merger, "_rpu_merger_num_cores", 8)
-    xr = torch.ops.rpu.linear_with_accumulation(
-        xr, merger._rpu_fc1_w, merger._rpu_fc1_b, 1, cores, linear_acc32,
-        merger._rpu_fc1_scale if w8a16 else None)
-    xr = torch.nn.functional.gelu(xr)  # graph-aware CPU exact-erf fallback
-    xr = torch.ops.rpu.linear_with_accumulation(
-        xr, merger._rpu_fc2_w, merger._rpu_fc2_b, 1, cores, linear_acc32,
-        merger._rpu_fc2_scale if w8a16 else None)
-    # device .cpu() may expose shared DDR. Both consumers need an independent
+    with _intra_ddr_flush_suspended():
+        xr = torch.ops.rpu.linear_with_accumulation(
+            xr, merger._rpu_fc1_w, merger._rpu_fc1_b, 1, cores, linear_acc32,
+            merger._rpu_fc1_scale if w8a16 else None, gelu_erf=True)
+        xr = torch.ops.rpu.linear_with_accumulation(
+            xr, merger._rpu_fc2_w, merger._rpu_fc2_b, 1, cores, linear_acc32,
+            merger._rpu_fc2_scale if w8a16 else None)
+    # RPU .cpu() may expose shared DDR. Both consumers need an independent
     # snapshot; the text consumer can keep the existing FP16 values instead
     # of expanding them to FP32 only to round back before its scatter.
     host = xr.cpu()
@@ -945,13 +1060,13 @@ def _merger_forward_on_device(
 def _vision_patch_linear(vision_model, hs):
     cores = getattr(vision_model, "_rpu_vision_num_cores", 8)
     if cores != 8:
-        if (cores != 4 or not getattr(vision_model, "_rpu_vision_aux_w8a16", False)
-                or getattr(vision_model, "_rpu_vision_aux_num_cores", None) != cores):
-            raise ValueError("reduced Vision patch projection requires its bound W8 layout")
-        return torch.ops.rpu.linear_with_accumulation(
-            hs, vision_model._rpu_patch_embed_w_rpu, vision_model._rpu_patch_embed_b_rpu,
-            1, cores, getattr(vision_model, "_rpu_vision_linear_acc32", False),
-            vision_model._rpu_vision_patch_embed_scale)
+        if cores != 4 or getattr(vision_model, "_rpu_vision_aux_num_cores", None) != cores:
+            raise ValueError("reduced Vision patch projection requires its bound four-core layout")
+        with _intra_ddr_flush_suspended():
+            return torch.ops.rpu.linear_with_accumulation(
+                hs, vision_model._rpu_patch_embed_w_rpu, vision_model._rpu_patch_embed_b_rpu,
+                1, cores, getattr(vision_model, "_rpu_vision_linear_acc32", False),
+                vision_model._rpu_vision_patch_embed_scale)
     output_shape = (
         *hs.shape[:-1], vision_model._rpu_patch_embed_w_rpu.shape[0]
     )
@@ -980,25 +1095,29 @@ def _vision_patch_linear(vision_model, hs):
     return output_slot
 
 
-def enable_qwen3_vl_vision_merger_on_device(vision_model, cores: int = 8, *, w8a16: bool = False) -> None:
-    """Move patch and merger GEMMs to device before the first Vision dispatch.
+def enable_qwen3_vl_vision_merger_on_device(
+        vision_model, cores: int = 8, *, w8a16: bool = False, patch_embed: bool = True) -> None:
+    """Move patch and merger GEMMs to RPU before the first Vision dispatch.
 
-    An already enabled install is a no-op. CPU FP32 LayerNorm is retained;
-    patch/merger activations and GELU intermediates use FP16, changing rounding relative
+    `cores` must equal the installed Vision owner (8, or 4 for reduced
+    budgets). `patch_embed=False` moves only the mergers and keeps the CPU
+    patch projection. An already enabled install is a no-op. CPU FP32
+    LayerNorm is retained; patch/merger activations use FP16 and the merger
+    GELU runs on the device (exact-ERF BASE kernel), changing rounding relative
     to CPU FP32 mergers. Validate this precision path for the exact model profile.
     """
-    if type(w8a16) is not bool:
-        raise TypeError("Vision auxiliary w8a16 must be a bool")
-    if (cores not in (4, 8) or getattr(vision_model, "_rpu_vision_num_cores", 8) != cores
-            or (cores == 4 and not w8a16)):
-        raise ValueError("reduced-core Vision keeps FP16 auxiliaries on CPU; W8 auxiliaries require the bound four-core layout")
-    if (getattr(vision_model, "_rpu_patch_embed_on_device", False)
+    if type(w8a16) is not bool or type(patch_embed) is not bool:
+        raise TypeError("Vision auxiliary w8a16 and patch_embed must be bools")
+    if cores not in (4, 8) or getattr(vision_model, "_rpu_vision_num_cores", 8) != cores:
+        raise ValueError("Vision auxiliaries require the installed four- or eight-core Vision layout")
+    if ((getattr(vision_model, "_rpu_patch_embed_on_device", False)
+            or getattr(vision_model, "_rpu_vision_merger_on_device", False))
             and (getattr(vision_model, "_rpu_vision_aux_w8a16", False) != w8a16
                  or getattr(vision_model, "_rpu_vision_aux_num_cores", 8) != cores)):
         raise ValueError("Vision auxiliary precision or core layout cannot change after installation")
     mergers = (vision_model.merger, *vision_model.deepstack_merger_list)
     if (getattr(vision_model, "_rpu_vision_merger_on_device", False)
-            and getattr(vision_model, "_rpu_patch_embed_on_device", False)
+            and (getattr(vision_model, "_rpu_patch_embed_on_device", False) or not patch_embed)
             and all(getattr(merger, "_rpu_merger_on_device", False) for merger in mergers)):
         return
     if getattr(vision_model, "_rpu_vision_handle", None) is None:
@@ -1018,7 +1137,7 @@ def enable_qwen3_vl_vision_merger_on_device(vision_model, cores: int = 8, *, w8a
         for merger in mergers:
             _convert_vision_merger_for_rpu(merger, cores, w8a16=w8a16)
         # Folded Conv3d weights MUST be col-swizzled for rpu_linear.
-        if not getattr(vision_model, "_rpu_patch_embed_on_device", False):
+        if patch_embed and not getattr(vision_model, "_rpu_patch_embed_on_device", False):
             pe_w = vision_model._rpu_vision_patch_embed_w
             pe_b = vision_model._rpu_vision_patch_embed_b
             if w8a16:
@@ -1061,8 +1180,8 @@ def register_qwen3vl_vision_fused_merger(vision_model, cores: int = 8, *, w8a16:
     """
     if type(w8a16) is not bool:
         raise TypeError("Vision fused merger w8a16 must be a bool")
-    if cores != 8 or getattr(vision_model, "_rpu_vision_num_cores", 8) != 8:
-        raise ValueError("reduced-core Vision keeps patch embedding and mergers on CPU")
+    if cores not in (4, 8) or getattr(vision_model, "_rpu_vision_num_cores", 8) != cores:
+        raise ValueError("Vision fused merger requires the installed four- or eight-core Vision layout")
     if getattr(vision_model, "_rpu_vision_fused_merger", False):
         if getattr(vision_model, "_rpu_vision_fused_merger_w8a16", False) != w8a16:
             raise ValueError("Vision fused merger precision cannot change after installation")
@@ -1475,6 +1594,8 @@ def install_qwen3_vl_vision_for_rpu(
     max_seq_len: int = QWEN3_VL_VISION_DEFAULT_MAX_SEQ_LEN,
     w8a16: bool = False,
     execution_chunk_size: str | int = "auto",
+    w4a16: bool = False,
+    nvfp4: bool = False,
     _allow_graph_blocked_32b: bool = False,
     _allow_padded_8b: bool = False,
     _allow_runtime_quantized_large: bool = False,
@@ -1487,6 +1608,18 @@ def install_qwen3_vl_vision_for_rpu(
     A replacement is published only after its Python state and native handle
     are fully configured. Any failure destroys the pending handle immediately
     and restores the previously published install.
+
+    ``w4a16`` (default False) packs the blocks' six projections as G32 RTN
+    W4: the exact 2B/4B tower (24 blocks) at 4 or 8 cores, or, with the
+    private ``_allow_runtime_quantized_large``, the padded 8B/32B tower (27
+    blocks) at 4 cores only. The patch embedding and mergers keep their own
+    precision. It excludes ``w8a16``, the weight banks and the other private
+    large-tower flags.
+
+    ``nvfp4`` (default False) installs the same six projections of the same
+    tower as NVFP4 with six per-projection FP32 tensor-scale tables; the
+    patch embedding and mergers stay FP16. It excludes ``w8a16``, ``w4a16``
+    and the same private flags.
     """
     if graph_runtime_policy is not None and not isinstance(
         graph_runtime_policy, rpu_backend.graph.GraphRuntimePolicy
@@ -1513,6 +1646,35 @@ def install_qwen3_vl_vision_for_rpu(
             "install_qwen3_vl_vision_for_rpu: w8a16 must be a bool, "
             f"got {type(w8a16).__name__}."
         )
+    if not isinstance(w4a16, bool):
+        raise TypeError(
+            "install_qwen3_vl_vision_for_rpu: w4a16 must be a bool, "
+            f"got {type(w4a16).__name__}."
+        )
+    if w4a16 and (
+        w8a16 or _allow_graph_blocked_32b or _allow_padded_8b or _pack_fp16_block_weights
+        or not (num_cores == 4 if _allow_runtime_quantized_large else _is_qwen3_vl_w4_vision_tower(
+            vision_config or vision_model.config, len(vision_model.blocks)))
+    ):
+        # The large tower itself is checked with the runtime-quantized path below.
+        raise ValueError(
+            "install_qwen3_vl_vision_for_rpu: packed W4 Vision requires the exact "
+            "Qwen3-VL 2B/4B tower, or the runtime-quantized 8B/32B tower on 4 cores, "
+            "without w8a16, weight banks or other private large-tower paths")
+    if not isinstance(nvfp4, bool):
+        raise TypeError(
+            "install_qwen3_vl_vision_for_rpu: nvfp4 must be a bool, "
+            f"got {type(nvfp4).__name__}."
+        )
+    if nvfp4 and (
+        w8a16 or w4a16 or _allow_graph_blocked_32b or _allow_padded_8b
+        or _allow_runtime_quantized_large or _pack_fp16_block_weights
+        or not _is_qwen3_vl_w4_vision_tower(
+            vision_config or vision_model.config, len(vision_model.blocks))
+    ):
+        raise ValueError(
+            "install_qwen3_vl_vision_for_rpu: NVFP4 Vision requires the exact Qwen3-VL "
+            "2B/4B tower without w8a16, w4a16, weight banks or private large-tower paths")
     if execution_chunk_size != "auto" and (
         isinstance(execution_chunk_size, bool)
         or not isinstance(execution_chunk_size, int)
@@ -1567,7 +1729,8 @@ def install_qwen3_vl_vision_for_rpu(
             "may only be installed by the gated top-level adapter."
         )
     if _allow_runtime_quantized_large and not (
-        w8a16 and num_cores in (4, 8) and len(vision_model.blocks) == 27
+        (w8a16 and num_cores in (4, 8) or w4a16 and num_cores == 4)
+        and len(vision_model.blocks) == 27
         and (is_8b_vision or is_32b_vision)
         and all(type(getattr(cfg, name, None)) is int for name in (
             "hidden_size", "intermediate_size", "depth", "num_heads", "patch_size",
@@ -1578,7 +1741,9 @@ def install_qwen3_vl_vision_for_rpu(
         and (canonical_vision_type(cfg, "qwen3_vl"), cfg.in_channels, cfg.num_position_embeddings)
         == ("qwen3_vl", 3, 2304)
     ):
-        raise ValueError("runtime quantized large Vision requires the exact 8B/32B W8 tower")
+        raise ValueError(
+            "runtime quantized large Vision requires the exact 8B/32B tower: "
+            "W8 on 4 or 8 cores, or packed W4 on 4 cores")
     if _allow_graph_blocked_32b and (not is_32b_vision or w8a16):
         raise ValueError(
             "install_qwen3_vl_vision_for_rpu: the private 32B path requires "
@@ -1601,8 +1766,6 @@ def install_qwen3_vl_vision_for_rpu(
         )
     host_fp32_patch = rpu_env_bool("RPU_QWEN3VL_VISION_HOST_FP32_PATCH")
     vision_batch = rpu_env_bool("RPU_QWEN3VL_VISION_BATCH")
-    if num_cores != 8 and vision_batch:
-        raise ValueError("four-core Vision requires per-image execution; packed image batches require 8 cores")
     try:
         vision_batch_cap = int(os.environ.get("RPU_QWEN3VL_VISION_BATCH_CAP", "3"))
     except ValueError as exc:
@@ -1638,6 +1801,8 @@ def install_qwen3_vl_vision_for_rpu(
             max_hw=max_hw,
             max_seq_len=max_seq_len,
             w8a16=w8a16,
+            w4a16=w4a16,
+            nvfp4=nvfp4,
             execution_chunk_size=execution_chunk_size,
             host_fp32_patch=host_fp32_patch,
             vision_batch=vision_batch,
@@ -1700,6 +1865,8 @@ def _install_qwen3_vl_vision_for_rpu_impl(
     max_hw: int = QWEN3_VL_VISION_DEFAULT_MAX_HW,
     max_seq_len: int = QWEN3_VL_VISION_DEFAULT_MAX_SEQ_LEN,
     w8a16: bool = False,
+    w4a16: bool = False,
+    nvfp4: bool = False,
     execution_chunk_size: str | int = "auto",
     host_fp32_patch: bool,
     vision_batch: bool,
@@ -1758,7 +1925,7 @@ def _install_qwen3_vl_vision_for_rpu_impl(
     # ------------------------------------------------------------------ #
     # Step 1: prepare encoder weights while the old install remains published.
     # ------------------------------------------------------------------ #
-    if w8a16:
+    if w8a16 or w4a16 or nvfp4:
         # Reject a corrupt later layer before an earlier block is swizzled.
         for block in vision_model.blocks:
             if getattr(block, "_rpu_qwen3vl_vision_weights_converted", None) is None:
@@ -1769,6 +1936,7 @@ def _install_qwen3_vl_vision_for_rpu_impl(
             num_heads,
             hidden_size,
             w8a16=w8a16,
+            **({"w4a16": True} if w4a16 else {"nvfp4": True} if nvfp4 else {}),
             physical_head_dim=physical_head_dim,
             physical_intermediate_size=physical_intermediate_size,
             **({"num_cores": num_cores} if num_cores != 8 else {}),
@@ -1783,22 +1951,30 @@ def _install_qwen3_vl_vision_for_rpu_impl(
     q_b_list, k_b_list, v_b_list, o_b_list = [], [], [], []
     fc1_b_list, fc2_b_list = [], []
     # W8A16: parallel int8 weights stay int8 (no fp16 cast) + per-output-channel fp16 scales.
+    # W4A16: packed uint8 weights + controller-striped G32 scale payloads.
+    # NVFP4: packed uint8 weights + striped uint8 block scales; the per-layer
+    # FP32 tensor scales become one [24] table per projection.
     q_s_list, k_s_list, v_s_list, o_s_list, fc1_s_list, fc2_s_list = [], [], [], [], [], []
+    tensor_scales = [[] for _ in range(6)]
 
-    pack_w8_blocks = (_allow_runtime_quantized_large or _use_w8_vision_weight_banks(
+    pack_w8_blocks = ((_allow_runtime_quantized_large and w8a16) or _use_w8_vision_weight_banks(
         cfg, w8a16=w8a16, num_cores=num_cores, num_layers=num_layers))
     for block in vision_model.blocks:
         block_weights = _vision_block_weights_to_rpu(
             (block._rpu_q_w, block._rpu_k_w, block._rpu_v_w,
              block.attn.proj.weight.data, block.mlp.linear_fc1.weight.data,
              block.mlp.linear_fc2.weight.data),
-            w8a16=w8a16, pack_weights=pack_w8_blocks or _pack_fp16_block_weights)
+            w8a16=w8a16 or w4a16 or nvfp4,
+            pack_weights=pack_w8_blocks or _pack_fp16_block_weights)
         for weights, weight in zip(
                 (q_w_list, k_w_list, v_w_list, o_w_list, fc1_w_list, fc2_w_list),
                 block_weights, strict=True):
             weights.append(weight)
 
-        if w8a16:
+        if nvfp4:
+            for scales, role in zip(tensor_scales, ("q", "k", "v", "o", "fc1", "fc2"), strict=True):
+                scales.append(getattr(block, f"_rpu_{role}_ts"))
+        if w8a16 or w4a16 or nvfp4:
             q_s_list.append(block._rpu_q_ws.to(device="rpu"))
             k_s_list.append(block._rpu_k_ws.to(device="rpu"))
             v_s_list.append(block._rpu_v_ws.to(device="rpu"))
@@ -1818,6 +1994,12 @@ def _install_qwen3_vl_vision_for_rpu_impl(
 
         fc1_b_list.append(block._rpu_fc1_b.to(dtype=torch.float16, device="rpu"))
         fc2_b_list.append(block._rpu_fc2_b.to(dtype=torch.float16, device="rpu"))
+    if nvfp4:
+        from rpu_backend.quant.convert_qwen3_nvfp4 import pad_nvfp4_tensor_scales
+        tensor_scale_tables = [pad_nvfp4_tensor_scales(scales).to(device="rpu")
+                               for scales in tensor_scales]
+    else:
+        tensor_scale_tables = []
 
     # ------------------------------------------------------------------ #
     # Step 3: prepare the native set_weights arguments.
@@ -1916,13 +2098,21 @@ def _install_qwen3_vl_vision_for_rpu_impl(
         vision_model, handle, torch.ops.rpu.qwen3vl_vision_destroy,
         graphs=(vision_graph_cache,),
         keepalive=(_vision_args, q_s_list, k_s_list, v_s_list, o_s_list,
-                   fc1_s_list, fc2_s_list, freq_cos, freq_sin,
+                   fc1_s_list, fc2_s_list, tensor_scale_tables, freq_cos, freq_sin,
                    vision_kv_cache, patch_embed_w, patch_embed_b),
         label="Vision", handle_name="_rpu_vision_handle")
     handle_finalizer = resource.finalizer
     _install_state["pending_resource"] = resource
-
-    if w8a16:  # the _w8a16 op only exists on the w8a16-built extension
+    if nvfp4:
+        torch.ops.rpu.qwen3vl_vision_set_weights_nvfp4(
+            handle, *_vision_args,
+            q_s_list, k_s_list, v_s_list, o_s_list, fc1_s_list, fc2_s_list,
+            tensor_scale_tables)
+    elif w4a16:
+        torch.ops.rpu.qwen3vl_vision_set_weights_w4a16(
+            handle, *_vision_args,
+            q_s_list, k_s_list, v_s_list, o_s_list, fc1_s_list, fc2_s_list)
+    elif w8a16:  # the _w8a16 op only exists on the w8a16-built extension
         torch.ops.rpu.qwen3vl_vision_set_weights_w8a16(
             handle, *_vision_args,
             q_s_list, k_s_list, v_s_list, o_s_list, fc1_s_list, fc2_s_list)
@@ -1955,6 +2145,8 @@ def _install_qwen3_vl_vision_for_rpu_impl(
     vision_model._rpu_vision_has_dispatched = False
     vision_model._rpu_vision_num_layers = num_layers
     vision_model._rpu_vision_num_cores = num_cores
+    vision_model._rpu_vision_w4a16 = w4a16
+    vision_model._rpu_vision_nvfp4 = nvfp4
     vision_model._rpu_vision_hidden_size = hidden_size
     vision_model._rpu_vision_logical_head_dim = logical_head_dim
     vision_model._rpu_vision_physical_head_dim = physical_head_dim
@@ -2215,14 +2407,12 @@ def _rpu_vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tenso
     deepstack_hash = self._rpu_vision_deepstack_hash
     num_cores = getattr(self, "_rpu_vision_num_cores", 8)
     if num_cores != 8:
-        if (getattr(self, "_rpu_vision_fused_merger", False)
-                or getattr(self, "_rpu_prefix_scatter_consume_only_allowed", False)):
+        if getattr(self, "_rpu_prefix_scatter_consume_only_allowed", False):
             raise RuntimeError("reduced-core Vision does not use eight-core fused merger routes")
         if (getattr(self, "_rpu_patch_embed_on_device", False)
                 or getattr(self, "_rpu_vision_merger_on_device", False)):
             mergers = (self.merger, *self.deepstack_merger_list)
-            if (not all(getattr(self, name, False) for name in (
-                    "_rpu_patch_embed_on_device", "_rpu_vision_merger_on_device", "_rpu_vision_aux_w8a16"))
+            if (not getattr(self, "_rpu_vision_merger_on_device", False)
                     or getattr(self, "_rpu_vision_aux_num_cores", None) != num_cores
                     or any(getattr(m, "_rpu_merger_num_cores", None) != num_cores for m in mergers)):
                 raise RuntimeError("reduced-core Vision auxiliary weights differ from the cold layout")
@@ -2372,7 +2562,7 @@ def _rpu_vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tenso
         exact_chunk=_exact_chunk, fused_merger=_fused_merger and not _adaptive_merger,
         allow_chunked_single=_adaptive_merger, default_pair_n256=_default_pair_n256,
         raw_group_supported=(raw_group_supported if _batch_on and _fused_merger
-            and not _fp16_chunked_merger and num_cores == 8 else None))
+            and not _fp16_chunked_merger and num_cores in (4, 8) else None))
     if _prefix_scatter_consume_only and len(groups) != 1:
         raise RuntimeError(
             "Qwen3-VL prefix-scatter consume-only requires exactly one packed "
@@ -2663,6 +2853,14 @@ def _rpu_vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tenso
         last_hidden = (last_hidden_per_image[0] if len(last_hidden_per_image) == 1
                        else torch.cat(last_hidden_per_image, dim=0))  # [N_total, hidden] device
         last_hidden_cpu = last_hidden.detach().cpu().float()
+        if merger_on_device:
+            # Every group's output is already a fresh snapshot, so the
+            # Vision owner's SPM layout is dead on four and eight cores.
+            # Release it before the eager merger GEMMs: their row pass is
+            # sized from free SPM and re-reads the weight per pass, so a live
+            # layout leaves them more passes. The end-of-call reset below
+            # already makes the next forward re-lay out its temporaries.
+            torch.ops.rpu.spm_alloc_reset_temporary()
         if merger_on_device:
             merged = _merger_forward_on_device(
                 self.merger, last_hidden_cpu, keep_fp16=_keep_merged_fp16,

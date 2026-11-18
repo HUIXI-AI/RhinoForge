@@ -4,7 +4,8 @@ The grouped kernel consumes one TP-swizzled DDR tensor per projection.  Raw
 Hugging Face experts are stored as ``gate_up_proj[E,2I,H]`` and
 ``down_proj[E,H,I]``; gate/up must be split before either quantization or
 swizzle.  FP8 is the Rhino RPU grouped ABI (raw E4M3 codes plus FP16 per-output
-scale), not the official 128x128 block-scale checkpoint format.
+scale), not the official 128x128 block-scale checkpoint format. Routed INT8
+uses the same per-output FP16 scale with signed codes (grouped mode 1).
 """
 from __future__ import annotations
 
@@ -108,16 +109,27 @@ def _prepare_routed(experts, num_cores: int):
         )
     gate, up = gate_up[:, :i, :], gate_up[:, i:, :]
 
-    if gate_up.dtype != torch.uint8:
+    if gate_up.dtype == torch.int8:
+        from .quant_scope import INT8_PROFILE_ID
+
+        mode = MODE_INT8
+        markers = {
+            "rpu_weight_mode": MODE_INT8,
+            "rpu_int8_scale_axis": -1,
+            "rpu_quant_profile": INT8_PROFILE_ID,
+        }
+    elif gate_up.dtype == torch.uint8:
+        mode = MODE_FP8_E4M3
+        markers = {
+            "rpu_fp8_format": "fp8_e4m3",
+            "rpu_weight_mode": MODE_FP8_E4M3,
+            "rpu_fp8_scale_axis": -1,
+        }
+    else:
         raise TypeError(
             "Qwen3.5-35B-A3B routed experts require raw uint8 E4M3 mode-5 "
-            f"storage, got {gate_up.dtype}"
+            f"or signed int8 mode-1 storage, got {gate_up.dtype}"
         )
-    markers = {
-        "rpu_fp8_format": "fp8_e4m3",
-        "rpu_weight_mode": MODE_FP8_E4M3,
-        "rpu_fp8_scale_axis": -1,
-    }
     mismatched = {
         name: getattr(experts, name, None)
         for name, expected in markers.items()
@@ -125,10 +137,9 @@ def _prepare_routed(experts, num_cores: int):
     }
     if mismatched:
         raise ValueError(
-            "routed raw uint8 tensors are missing the exact typed mode-5 "
+            f"routed {gate_up.dtype} tensors are missing the exact typed mode-{mode} "
             f"markers: {mismatched}"
         )
-    mode = MODE_FP8_E4M3
     gate_up_scale = _source_scale(experts, "gate_up_proj_scale")
     down_scale = _source_scale(experts, "down_proj_scale")
     if tuple(gate_up_scale.shape) != (e, two_i):
@@ -195,9 +206,9 @@ def prepare_moe_layer_weights(
         routed_gate, routed_up, routed_down, gate_s, up_s, down_s, mode = routed
     if type(grouped_acc32) is not bool:
         raise TypeError("grouped_acc32 must be bool")
-    if mode == MODE_UINT4 and grouped_acc32:
-        raise ValueError("grouped UINT4 supports ACC16 only")
-    if mode == MODE_FP8_E4M3 and not grouped_acc32:
+    if mode in (MODE_UINT4, MODE_INT8) and grouped_acc32:
+        raise ValueError("grouped UINT4 / routed INT8 support ACC16 only")
+    if mode in (MODE_FP8_E4M3, MODE_INT8) and not grouped_acc32:
         # Published BASE advances per-expert scale addresses in 256-byte units.
         # Pad each expert independently at cold installation. EXP ACC32 keeps
         # its original logical-width stride, so its owner must remain unpadded.

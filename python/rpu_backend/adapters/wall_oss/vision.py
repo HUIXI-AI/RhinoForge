@@ -48,15 +48,17 @@ from rpu_backend.runtime.weights import (
     tp_row_swizzle_mc_weight,
 )
 from rpu_backend.adapters.wall_oss.llm import (
+    _fold_residual,
+    _fold_w8_residual,
     _resolve_ckpt,
     _SafeTensorStore,
     _to_rpu_int8,
+    _validate_residual_scale,
 )
 from rpu_backend.adapters.wall_oss.checkpoint_validation import (
     validate_w8_nvfp4_checkpoint_pair,
 )
 
-_VISION_CORES = 8           # MHA: attn_tp = min(8, num_heads=16) = 8 (all cores)
 _MAX_BATCH_SEQ = 768        # batched-vision ceiling = 3×256 (one forward for the 3-camera
                             # case). Fits the full-VLA SPM after the vision temp-peak work
                             # (per-image sdpa_tmp + up→residual1 alias). Override via
@@ -411,6 +413,7 @@ def _configure_qwen25vl_vision_handle(
     execution_routes=(False, False, False, False, False, _RMSNORM_CAP_BASE),
     chunk_size=0,
     per_window_sdpa=False, _owned_vision=None, sorting=None, linear_acc32=False,
+    num_cores=8,
 ):
     """Configure a pending handle; owned diagnostics retire via their parent."""
     from rpu_backend.api._execution import _require_execution_process_safe
@@ -419,6 +422,8 @@ def _configure_qwen25vl_vision_handle(
     if _owned_vision is not None:
         _owned_vision._handle = handle
     try:
+        if num_cores != 8:
+            torch.ops.rpu.qwen25vl_vision_set_execution_core_count(handle, num_cores)
         if sorting is not None:
             torch.ops.rpu.qwen25vl_vision_set_wall_sorting_routes(
                 handle, *sorting.vision_args()
@@ -429,6 +434,13 @@ def _configure_qwen25vl_vision_handle(
         if linear_acc32:
             torch.ops.rpu.qwen25vl_vision_set_linear_acc32(handle, True)
         set_weights(handle, *weight_args)
+        if num_cores != 8:
+            expected = (num_cores, num_cores, num_cores, 8)
+            native = tuple(torch.ops.rpu.qwen25vl_vision_get_execution_topology(handle))
+            if native != expected:
+                raise RuntimeError(
+                    "Qwen2.5-VL Vision native topology differs from its weight "
+                    f"layout: actual={native}, expected={expected}")
         torch.ops.rpu.qwen25vl_vision_set_chunk_envelope(handle, int(max_seq_len), 0)
         torch.ops.rpu.qwen25vl_vision_set_chunk_size(handle, chunk_size)
         if per_window_sdpa:
@@ -459,7 +471,8 @@ class WallOssVision:
                  hidden_size, num_layers, spatial_merge_size, window,
                  window_size, patch_size, experimental_schedule=None,
                  execution_chunk_size="auto", per_window_sdpa=False,
-                 fused_merger=False, mixed_precision=False, linear_acc32=False):
+                 fused_merger=False, mixed_precision=False, linear_acc32=False,
+                 num_cores=8):
         self._gc_retirement_enabled = False
         schedule = (
             _claim_experimental_schedule()
@@ -479,8 +492,11 @@ class WallOssVision:
         self._patch_size = patch_size
         self._execution_chunk_size = execution_chunk_size
         self._linear_acc32 = linear_acc32
+        self._num_cores = num_cores
         self._per_window_sdpa = per_window_sdpa
-        self._batch_vision = rpu_env_bool(
+        # Packed multi-image dispatch is an eight-core layout; the four-lane
+        # owner encodes each camera as its own single-image subgroup.
+        self._batch_vision = num_cores == 8 and rpu_env_bool(
             "RPU_WALL_OSS_BATCH_VISION", default=True
         )
         try:
@@ -668,14 +684,14 @@ class WallOssVision:
             )
         if per_window_sdpa and (
             not self._window
-            or N != 1
+            or (N != 1 and batch_on)
             or mixed_precision
             or layer_group != 0
             or weight_outer
         ):
             raise ValueError(
-                "per-window Vision SDPA is restricted to the controlled "
-                "single-image FP16 normal schedule"
+                "per-window Vision SDPA is restricted to the normal schedule "
+                "with one image per native forward"
             )
         if layer_group == 32:
             if not batch_on:
@@ -1036,7 +1052,7 @@ class WallOssVision:
         fold[:, K] = -(W * shift).sum(dim=1)                       # bias at homogeneous col K
         self._patch_w_fold_cpu = fold
         self._patch_w_fold_rpu = _to_rpu_half(
-            tp_col_swizzle_mc_weight(fold.to(torch.float16), _VISION_CORES))
+            tp_col_swizzle_mc_weight(fold.to(torch.float16), self._num_cores))
         return True
 
     def _index_rpu(self, kind: str, indices: torch.Tensor) -> torch.Tensor:
@@ -1122,9 +1138,13 @@ class WallOssVision:
                                    window_index, seq: int, smu: int) -> torch.Tensor:
         """Consume a prepared FP16 raster input through the ordinary device path."""
         device_input = x.to("rpu")
+        # Eight-core FP16 F.linear already accumulates in FP32; a reduced owner
+        # names its lanes explicitly with the same accumulation.
+        cores = getattr(self, "_num_cores", 8)
         embed = (torch.ops.rpu.linear_with_accumulation(
-            device_input, weight, None, 1, _VISION_CORES, True)
-            if self._linear_acc32 else F.linear(device_input, weight))
+            device_input, weight, None, 1, cores, True)
+            if self._linear_acc32 or cores != 8
+            else F.linear(device_input, weight))
         if window_index is not None:
             perm = self._patch_perm_ids(window_index, seq, smu)
             embed = torch.ops.rpu.gather_embedding(embed.contiguous(), perm)
@@ -1225,6 +1245,11 @@ class WallOssVision:
             a6_plan, seq=seq, image_batch_count=1,
             chunk_size=planned_chunk_size,
         )
+        # `out` lives in DDR; release the graph's temporary layout, as
+        # _forward_group does. Without this the next camera's eager patch
+        # embedding starts above it, which a four-core layout (half the
+        # cores, twice the rows per core) leaves too little room for.
+        torch.ops.rpu.spm_alloc_reset_temporary()
 
         if self._fused_merger:
             # C++ post_fn already ran the merger; `out` is [seq/4, out_hidden]
@@ -1460,6 +1485,8 @@ def build_wall_oss_vision(
     graph_runtime_policy=None,
     per_window_sdpa: bool = False,
     rmsnorm_fixed32: bool = False,
+    num_cores: int = 8,
+    residual_scale: int = 1,
     _owned_vision: WallOssVision | None = None,
 ) -> WallOssVision:
     """Load `visual.*` weights and install the RPU Qwen2.5-VL ViT vision tower.
@@ -1470,7 +1497,23 @@ def build_wall_oss_vision(
 
     ``ckpt_dir``/``fp16_ckpt_dir`` default to ``None`` → resolved at call time
     under the current ``$RPU_MODEL_CACHE`` (W8A16 vs fp16 registry path).
+
+    ``num_cores`` is 8 (default, every Wall-OSS route) or 4: the four-lane owner
+    InternVLA and reduced-core Wall-OSS use, admitted only for uniform FP16 or
+    W8A16 weights with full, dense-window or per-window attention, DDR RoPE and
+    the eager merger, one image per native forward. Per-window needs 16-aligned
+    windows, so a 252x252 grid takes the dense mask. Every other value is refused.
+
+    ``residual_scale`` is 1 (default, no fold) or 4, and 4 only on the four-lane
+    owner: it divides the patch embedding, attention ``proj``, MLP ``up`` (and
+    the two biases that land in the residual) and the merger's last Linear by
+    4 and every RMSNorm epsilon by 16, so the residual stream stays inside FP16
+    where the Wall RTC images overflow it. The merged output is then 1/4 of the
+    model's, the scale the text model built with the same value expects.
     """
+    if type(num_cores) is not int or num_cores not in (4, 8):
+        raise ValueError(f"Qwen2.5-VL Vision num_cores must be 4 or 8, got {num_cores!r}")
+    _validate_residual_scale(residual_scale, num_cores, "Qwen2.5-VL Vision")
     if graph_runtime_policy is not None:
         from rpu_backend.graph import GraphRuntimePolicy
         if not isinstance(graph_runtime_policy, GraphRuntimePolicy):
@@ -1517,8 +1560,11 @@ def build_wall_oss_vision(
                          or per_window_sdpa or rmsnorm_fixed32):
         raise ValueError("Wall Vision ACC32 supports ordinary base only; RTC/exact/per-window modes retain their fixed accumulation")
     rope_spm = rpu_env_bool("RPU_WALL_OSS_VISION_ROPE_SPM")
+    # On the four-lane owner the selector names per-window SDPA, its only native
+    # window route; the eight-core row-reuse route below does not exist there.
     native_window_sdpa = rpu_env_bool(
-        "RPU_WALL_OSS_VISION_NATIVE_WINDOW_SDPA")
+        "RPU_WALL_OSS_VISION_NATIVE_WINDOW_SDPA") and not (
+            num_cores != 8 and per_window_sdpa)
     sorting = sorting_config_from_env()
     fp16_transfer = not w8a16 and bool(sorting.fp16_mask & 1)
     if rpu_env_bool("RPU_WALL_OSS_VISION_PAIR_252") and not (
@@ -1560,6 +1606,24 @@ def build_wall_oss_vision(
             "W8A16 or opted-in FP16 weight-outer/window/mixed/fused-merger profile, "
             "or uniform FP16/W8 window/fused-merger with row reuse for three16x16 grids"
         )
+    if num_cores != 8:
+        selected = [name for name, active in (
+            ("linear_acc32", linear_acc32),
+            ("rmsnorm_fixed32", rmsnorm_fixed32),
+            ("RPU_WALL_OSS_VISION_MIXED_PRECISION", mixed_precision),
+            ("RPU_WALL_OSS_VISION_NATIVE_WINDOW_SDPA", native_window_sdpa),
+            ("RPU_WALL_OSS_VISION_PAIR_252", rpu_env_bool("RPU_WALL_OSS_VISION_PAIR_252")),
+            ("Wall Vision sorting routes", sorting.vision_args() != (0, False, False)),
+            ("experimental Vision schedule", experimental_schedule != (0, False)),
+        ) if active]
+        if selected:
+            raise ValueError(
+                f"{num_cores}-core Qwen2.5-VL Vision admits only uniform FP16 or W8A16 "
+                f"with full or window attention; refused: {', '.join(selected)}")
+        if graph_runtime_policy is not None and (
+                graph_runtime_policy.execution_core_count != num_cores):
+            raise ValueError(
+                "Qwen2.5-VL Vision graph_runtime_policy core count must match num_cores")
     if per_window_sdpa and (
         experimental_schedule != (0, False)
         or mixed_precision
@@ -1583,7 +1647,8 @@ def build_wall_oss_vision(
     OUT_HID = vc["out_hidden_size"]    # 2048
     WIN_SIZE = vc["window_size"]       # 112
     PATCH = vc["patch_size"]           # 14
-    EPS = 1e-6                         # Qwen2_5_VLRMSNorm eps
+    # Qwen2_5_VLRMSNorm eps; RMSNorm(x/s, eps/s^2) == RMSNorm(x, eps).
+    EPS = 1e-6 / residual_scale ** 2
     DIM = NHEADS * HD                  # 1280 (= HID; qkv split unit)
     INTER_PAD = _INTER_PAD_W8A16 if w8a16 or fp16_transfer else _INTER_PAD
 
@@ -1673,21 +1738,30 @@ def build_wall_oss_vision(
             up_scale = _pad_1d(up_scale.contiguous(), INTER_PAD)
             down_scale = gr(f"{p}.mlp.down_proj.weight_scale")
 
+        if residual_scale != 1:
+            # 1/s on every write into the residual stream: attention output, Up
+            # (so SiLU*Up and Down shrink with it) and both biases landing there.
+            ob, ub, db = (_fold_residual(t, residual_scale) for t in (ob, ub, db))
+            if w8a16:
+                ow, o_scale = _fold_w8_residual(ow, o_scale, residual_scale)
+                uw, up_scale = _fold_w8_residual(uw, up_scale, residual_scale)
+            else:
+                ow, uw = (_fold_residual(t, residual_scale) for t in (ow, uw))
         # Attention Q/K/V col-partition + O row-partition; MLP gate/up col + down
-        # row — all 8-core (MHA, attn_tp=8). Bias NOT swizzled (col-swizzle keeps
+        # row — all on the owner's cores (MHA, attn_tp = num_cores). Bias NOT swizzled (col-swizzle keeps
         # each core's output channels contiguous, matching the C++ bias scatter).
         if w8a16:
-            q_w.append(_to_rpu_int8(tp_col_swizzle_mc_weight(qw, _VISION_CORES, dwidth=1)))
-            k_w.append(_to_rpu_int8(tp_col_swizzle_mc_weight(kw, _VISION_CORES, dwidth=1)))
-            v_w.append(_to_rpu_int8(tp_col_swizzle_mc_weight(vw, _VISION_CORES, dwidth=1)))
-            o_w.append(_to_rpu_int8(tp_row_swizzle_mc_weight(ow, _VISION_CORES, dwidth=1)))
-            gate_w.append(_to_rpu_int8(tp_col_swizzle_mc_weight(gw, _VISION_CORES, dwidth=1)))
-            up_w.append(_to_rpu_int8(tp_col_swizzle_mc_weight(uw, _VISION_CORES, dwidth=1)))
+            q_w.append(_to_rpu_int8(tp_col_swizzle_mc_weight(qw, num_cores, dwidth=1)))
+            k_w.append(_to_rpu_int8(tp_col_swizzle_mc_weight(kw, num_cores, dwidth=1)))
+            v_w.append(_to_rpu_int8(tp_col_swizzle_mc_weight(vw, num_cores, dwidth=1)))
+            o_w.append(_to_rpu_int8(tp_row_swizzle_mc_weight(ow, num_cores, dwidth=1)))
+            gate_w.append(_to_rpu_int8(tp_col_swizzle_mc_weight(gw, num_cores, dwidth=1)))
+            up_w.append(_to_rpu_int8(tp_col_swizzle_mc_weight(uw, num_cores, dwidth=1)))
             down_w.append(
-                _to_rpu_half(tp_row_swizzle_mc_weight(dw.half(), _VISION_CORES))
+                _to_rpu_half(tp_row_swizzle_mc_weight(dw.half(), num_cores))
                 if mixed_w8a16 and L == 17
                 else _to_rpu_int8(
-                    tp_row_swizzle_mc_weight(dw, _VISION_CORES, dwidth=1)
+                    tp_row_swizzle_mc_weight(dw, num_cores, dwidth=1)
                 )
             )
             q_s.append(_to_rpu_half(qs)); k_s.append(_to_rpu_half(ks)); v_s.append(_to_rpu_half(vs))
@@ -1696,13 +1770,13 @@ def build_wall_oss_vision(
             up_s.append(_to_rpu_half(up_scale))
             down_s.append(_to_rpu_half(down_scale))
         else:
-            q_w.append(_to_rpu_half(tp_col_swizzle_mc_weight(qw.half(), _VISION_CORES)))
-            k_w.append(_to_rpu_half(tp_col_swizzle_mc_weight(kw.half(), _VISION_CORES)))
-            v_w.append(_to_rpu_half(tp_col_swizzle_mc_weight(vw.half(), _VISION_CORES)))
-            o_w.append(_to_rpu_half(tp_row_swizzle_mc_weight(ow.half(), _VISION_CORES)))
-            gate_w.append(_to_rpu_half(tp_col_swizzle_mc_weight(gw.half(), _VISION_CORES)))
-            up_w.append(_to_rpu_half(tp_col_swizzle_mc_weight(uw.half(), _VISION_CORES)))
-            down_w.append(_to_rpu_half(tp_row_swizzle_mc_weight(dw.half(), _VISION_CORES)))
+            q_w.append(_to_rpu_half(tp_col_swizzle_mc_weight(qw.half(), num_cores)))
+            k_w.append(_to_rpu_half(tp_col_swizzle_mc_weight(kw.half(), num_cores)))
+            v_w.append(_to_rpu_half(tp_col_swizzle_mc_weight(vw.half(), num_cores)))
+            o_w.append(_to_rpu_half(tp_row_swizzle_mc_weight(ow.half(), num_cores)))
+            gate_w.append(_to_rpu_half(tp_col_swizzle_mc_weight(gw.half(), num_cores)))
+            up_w.append(_to_rpu_half(tp_col_swizzle_mc_weight(uw.half(), num_cores)))
+            down_w.append(_to_rpu_half(tp_row_swizzle_mc_weight(dw.half(), num_cores)))
 
         q_b.append(_to_rpu_half(qb)); k_b.append(_to_rpu_half(kb)); v_b.append(_to_rpu_half(vb))
         o_b.append(_to_rpu_half(ob))
@@ -1731,11 +1805,14 @@ def build_wall_oss_vision(
 
     cache = RPUCache(
         num_layers=num_layers, batch_size=1, max_seq_len=max_seq_len,
-        num_kv_heads=NHEADS, head_dim=HD, attn_tp=min(8, NHEADS),
+        num_kv_heads=NHEADS, head_dim=HD, attn_tp=min(num_cores, NHEADS),
     )
     if _owned_vision is not None:
         _owned_vision.cache = cache
         _owned_vision._keepalive = (weight_args, freq_cos, freq_sin)
+    if graph_runtime_policy is None and num_cores != 8:
+        graph_runtime_policy = rpu_backend.graph.GraphRuntimePolicy.from_environment(
+            execution_core_count=num_cores)
     graph_cache = rpu_backend.graph.GraphCache(
         **({"runtime_policy": graph_runtime_policy}
            if graph_runtime_policy is not None else {}))
@@ -1743,7 +1820,8 @@ def build_wall_oss_vision(
         _owned_vision._graph_cache = graph_cache
 
     # patch_embed: fold Conv3d [HID,3,2,14,14] → Linear [HID, 1176], CPU fp32, no bias.
-    patch_w = g_cpu("visual.patch_embed.proj.weight").reshape(HID, -1).contiguous()
+    patch_w = _fold_residual(g_cpu("visual.patch_embed.proj.weight").reshape(HID, -1),
+                             residual_scale).contiguous()
 
     # merger: RMSNorm (CPU fp32) → reshape(-1, 4*HID) → Linear → GELU → Linear.
     # The two Linears dominate vision wall (~40ms CPU fp32: m0 5120x5120 + m2
@@ -1755,11 +1833,14 @@ def build_wall_oss_vision(
     ln_q_w = g_cpu("visual.merger.ln_q.weight")
     ln_q_w_rpu = _to_rpu_half(ln_q_w)               # device weight for the on-device rms_norm
     m0_b_rpu = _to_rpu_half(g_cpu("visual.merger.mlp.0.bias"))
-    m2_b_rpu = _to_rpu_half(g_cpu("visual.merger.mlp.2.bias"))
+    # The merged tokens enter the text residual stream, so its last Linear
+    # carries the same 1/s.
+    m2_w = _fold_residual(g_cpu("visual.merger.mlp.2.weight"), residual_scale)
+    m2_b_rpu = _to_rpu_half(_fold_residual(g_cpu("visual.merger.mlp.2.bias"), residual_scale))
     m0_w_rpu = _to_rpu_half(tp_col_swizzle_mc_weight(
-        g_cpu("visual.merger.mlp.0.weight").half(), _VISION_CORES))   # [5120,5120]
+        g_cpu("visual.merger.mlp.0.weight").half(), num_cores))   # [5120,5120]
     m2_w_rpu = _to_rpu_half(tp_col_swizzle_mc_weight(
-        g_cpu("visual.merger.mlp.2.weight").half(), _VISION_CORES))   # [2048,5120]
+        m2_w.half(), num_cores))   # [2048,5120]
 
     # Plumb merger weights into the C++ fused subsystem. The fused post_fn runs
     # m0 as a COL-partition GEMM (matches m0_w_rpu's col-swizzle) and m2 as a
@@ -1768,7 +1849,7 @@ def build_wall_oss_vision(
     # → COL, so it needs the COL-swizzled m2_w_rpu. The C++ ROW GEMM needs a
     # ROW-swizzled m2 — register that separately; the eager path keeps m2_w_rpu.
     m2_w_rpu_row = _to_rpu_half(tp_row_swizzle_mc_weight(
-        g_cpu("visual.merger.mlp.2.weight").half(), _VISION_CORES))   # [2048,5120] row
+        m2_w.half(), num_cores))   # [2048,5120] row
     merger_args = (
         ln_q_w_rpu, m0_w_rpu, m0_b_rpu, m2_w_rpu_row, m2_b_rpu, OUT_HID
     )
@@ -1785,20 +1866,22 @@ def build_wall_oss_vision(
         else:
             xr = _rmsnorm_cpu(x.cpu().float(), ln_q_w, EPS).reshape(-1, merge_hidden)
             xr = _to_rpu_half(xr)                    # [N, 5120] RPU fp16
+        # A reduced owner names its lanes; eight-core FP16 F.linear is ACC32 too.
+        explicit = linear_acc32 or num_cores != 8
         xr = (torch.ops.rpu.linear_with_accumulation(
-            xr, m0_w_rpu, m0_b_rpu, 1, _VISION_CORES, True)
-            if linear_acc32 else F.linear(xr, m0_w_rpu, m0_b_rpu))
+            xr, m0_w_rpu, m0_b_rpu, 1, num_cores, True)
+            if explicit else F.linear(xr, m0_w_rpu, m0_b_rpu))
         xr = F.gelu(xr)                              # graph-aware CPU exact-erf fallback
         xr = (torch.ops.rpu.linear_with_accumulation(
-            xr, m2_w_rpu, m2_b_rpu, 1, _VISION_CORES, True)
-            if linear_acc32 else F.linear(xr, m2_w_rpu, m2_b_rpu))
+            xr, m2_w_rpu, m2_b_rpu, 1, num_cores, True)
+            if explicit else F.linear(xr, m2_w_rpu, m2_b_rpu))
         return xr if device_out else xr.float().cpu()   # device fp16 OR CPU fp32 (legacy)
 
     # On-device patch_embed weight: pad K (1176) to a multiple of 16, col-swizzle, upload
     # once. F.linear on rpu then replaces the per-frame CPU fp32 GEMM.
     _pe_k = ((patch_w.size(1) + 15) // 16) * 16
     patch_w_rpu = _to_rpu_half(tp_col_swizzle_mc_weight(
-        F.pad(patch_w.to(torch.float16), (0, _pe_k - patch_w.size(1))), _VISION_CORES))
+        F.pad(patch_w.to(torch.float16), (0, _pe_k - patch_w.size(1))), num_cores))
 
     # Standalone handles stay builder-owned until their tracked finalizer exists;
     # diagnostic children publish the handle immediately to the parent instead.
@@ -1824,6 +1907,7 @@ def build_wall_oss_vision(
         ),
         per_window_sdpa=per_window_sdpa,
         _owned_vision=_owned_vision, sorting=sorting, linear_acc32=linear_acc32,
+        num_cores=num_cores,
     )
     vis = None
     try:
@@ -1838,6 +1922,7 @@ def build_wall_oss_vision(
             per_window_sdpa=per_window_sdpa,
             fused_merger=fused_merger,
             mixed_precision=mixed_precision, linear_acc32=linear_acc32,
+            num_cores=num_cores,
         )
         if _owned_vision is None:
             vis = WallOssVision.__new__(WallOssVision)

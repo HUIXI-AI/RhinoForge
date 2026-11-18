@@ -135,6 +135,14 @@ def _validate_execution_geometry(adapter: "Pi05Adapter") -> None:
         len(image_features) if batch_vision and image_features else 1
     )
     vision_required = num_vision_chunks * 256
+    for selector in ("qkv_w8a8", "mlp_w8a8"):
+        if not vision.get("vision", {}).get(selector, False):
+            continue
+        from .cores import core_topology
+        if core_topology(execution).num_cores != 8 or num_vision_chunks not in (2, 3):
+            raise ValueError(f"Pi0.5 vision.{selector} requires TP8 and two or three packed cameras")
+        if vision.get("vision", {}).get("linear_acc32", False):
+            raise ValueError(f"Pi0.5 vision.{selector} requires ACC16")
     vision_chunk = vision.get("vision", {}).get("chunk_size", "auto")
     if isinstance(vision_chunk, int) and vision_chunk != vision_required:
         mode = (
@@ -154,8 +162,9 @@ def _preflight_pi05_cold_model(lerobot_policy: Any, *, attn_tp: int = 8):
     quant_config = getattr(lerobot_policy, "_pi05_quant_config", {}) or {}
     nvfp4_scales = set()
     if quant_config.get("method") == "nvfp4a16" and quant_config.get("nvfp4_abi") == "striped_v2":
-        if attn_tp != 8:
-            raise RPUBackendError("Pi05 NVFP4 striped_v2 requires TP8 before swizzle")
+        # TP8 attention, or the reduced profile's four lanes (cores.validate_reduced_policy).
+        if attn_tp not in (4, 8):
+            raise RPUBackendError("Pi05 NVFP4 striped_v2 requires attention TP4 or TP8 before swizzle")
         for module_name, module in lerobot_policy.named_modules():
             ts = getattr(module, "tensor_scale", None)
             if (getattr(module, "_pi05_nvfp4_abi", None) == "striped_v2"
@@ -250,6 +259,34 @@ def _preflight_pi05_cold_model(lerobot_policy: Any, *, attn_tp: int = 8):
         int4_children,
         vlm_q_dtype in (torch.int8, torch.uint8),
     )
+
+
+def _preflight_siglip_w4a16(execution: Any, cold_model: tuple) -> bool:
+    """Resolve the cold Vision W4 selector before allocator claim.
+
+    Vision W4 installs SigLIP on four lanes at every budget, one camera at a
+    time. COLD_MODEL is the _preflight_pi05_cold_model result; its last field
+    is the SigLIP W8 default (quantized VLM), read only when W4 is selected.
+    """
+    from rpu_backend.adapters.siglip import (
+        SIGLIP_W4A16_EIGHT_LANES, _SIGLIP_PROJECTION_NAMES,
+        _siglip_w4a16_enabled, _siglip_w8a16_projection_names,
+    )
+    from .cores import vision_batch_enabled
+
+    if not _siglip_w4a16_enabled():
+        return False
+    if vision_batch_enabled(execution):
+        raise RPUBackendError(
+            f"Pi0.5 {SIGLIP_W4A16_EIGHT_LANES}; at num_cores 8 it runs one "
+            "camera at a time on four lanes: set RPU_PI05_SIGLIP_BATCH=0, or "
+            "RPU_PI05_SIGLIP_W4A16=0")
+    if _siglip_w8a16_projection_names(
+            default_enabled=cold_model[-1]) != _SIGLIP_PROJECTION_NAMES:
+        raise RPUBackendError(
+            "RPU_PI05_SIGLIP_W4A16=1 requires RPU_PI05_SIGLIP_W8A16=1 with "
+            "RPU_PI05_SIGLIP_W8A16_SCOPE=all")
+    return True
 
 
 def _apply_vlm_chunk_size(adapter: "Pi05Adapter", vlm: Any) -> None:
@@ -532,11 +569,10 @@ def _selected_prefill_pair_rows(adapter) -> int:
     if text_tokens != 32:
         if cameras not in (2, 3):
             raise ValueError(f"Pi0.5 T{text_tokens} requires exactly two or three cameras")
-        if text_tokens == 192 and cameras != 3:
-            # P960 pairs as C480: the C464 layout at 480 rows, three cameras only.
-            raise ValueError("Pi0.5 T192 requires exactly three cameras")
-        if getattr(adapter, "_rpu_execution", {}).get("model", {}).get("num_cores", 8) != 8:
-            raise ValueError(f"Pi0.5 T{text_tokens} currently requires exactly eight cores")
+        if text_tokens == 192:
+            if cameras != 3:
+                # P960 pairs as C480 at 8 cores (generic chunking on 4/6 cores), three cameras only.
+                raise ValueError("Pi0.5 T192 requires exactly three cameras")
         return (256 * cameras + text_tokens) // 2
     return 272 if cameras == 2 else 400
 
@@ -1041,6 +1077,10 @@ class Pi05Adapter:
         for old, new, stage in zip(old_views[1:], resolved[1:], ("vision", "prefill", "action")):
             if bool(old.get(stage, {}).get("linear_acc32", False)) != bool(new.get(stage, {}).get("linear_acc32", False)):
                 raise ValueError(f"Pi0.5 {stage}.linear_acc32 is cold-only; close and reload the policy")
+        for selector in ("qkv_w8a8", "mlp_w8a8"):
+            if (old_views[1].get("vision", {}).get(selector, False)
+                    != resolved[1].get("vision", {}).get(selector, False)):
+                raise ValueError(f"Pi0.5 vision.{selector} is cold-only; close and reload the policy")
         try:
             self._rpu_execution = resolved[0]
             _validate_execution_geometry(self)
@@ -1993,6 +2033,24 @@ class Pi05Adapter:
 
             self._validate_cold_pad16_requests()
             cold_model = _preflight_pi05_cold_model(self._lerobot_policy, attn_tp=topology.attn_tp)
+            siglip_w4a16 = _preflight_siglip_w4a16(self._rpu_execution, cold_model)
+            # Vision W4 keeps SigLIP on four lanes under every budget (the
+            # padded o/fc2 row K splits into 64-aligned pgrp lanes only at 4).
+            vision_lanes = 4 if siglip_w4a16 else topology.attn_tp
+            _vision_execution = self._resolve_execution(
+                self._rpu_execution, entry_point="Pi05Adapter.to_rpu"
+            )[1]
+            _vision_qkv_w8a8 = _vision_execution.get("vision", {}).get("qkv_w8a8", False)
+            _vision_mlp_w8a8 = _vision_execution.get("vision", {}).get("mlp_w8a8", False)
+            if _vision_qkv_w8a8 or _vision_mlp_w8a8:
+                from rpu_backend.adapters.siglip import _validate_siglip_w8a8
+                _validate_siglip_w8a8(
+                    cold_model[5], cold_model[6], qkv_w8a8=_vision_qkv_w8a8,
+                    mlp_w8a8=_vision_mlp_w8a8,
+                    num_images=len(self._lerobot_policy.model.config.image_features),
+                    num_cores=vision_lanes,
+                    linear_acc32=_vision_execution.get("vision", {}).get("linear_acc32", False),
+                    w8a16_default=cold_model[10])
             graph_runtime_policy = _pi05_graph_runtime_policy(self._graph_runtime_policy_request)
             if graph_runtime_policy.execution_core_count != topology.num_cores:
                 graph_runtime_policy = replace(
@@ -2119,12 +2177,13 @@ class Pi05Adapter:
                     mlp_num_cores=topology.mlp_tp, lm_head_num_cores=topology.attn_tp,
                     execution_core_count=topology.num_cores)
                 if _expert_int4:
-                    pack_int4_projections_inplace(expert, _expert_int4, attn_num_cores=expert_attn_tp, group_size=_int4_group_size)
+                    pack_int4_projections_inplace(expert, _expert_int4, attn_num_cores=expert_attn_tp,
+                                                  group_size=_int4_group_size, mlp_num_cores=topology.mlp_tp)
 
                 # SigLIP projector swizzle — delegate to weights.py
                 # (preserves Pitfall-1 belt via _rpu_weights_converted sentinel).
                 from .weights import swizzle_projector_inplace
-                swizzle_projector_inplace(projector, num_cores=topology.attn_tp)
+                swizzle_projector_inplace(projector, num_cores=vision_lanes)
 
                 # v5-05 D-01: SigLIP encoder swizzle runs on CPU before move-to-device.
                 # Helper lifted from _internal/patches/siglip_pi05.py to
@@ -2134,7 +2193,7 @@ class Pi05Adapter:
                 from rpu_backend.adapters.siglip import _convert_siglip_weights_for_rpu
                 _convert_siglip_weights_for_rpu(
                     siglip_inner, w8a16_default=siglip_w8a16_default,
-                    num_cores=topology.attn_tp)
+                    num_cores=vision_lanes, w4a16=siglip_w4a16)
 
                 # --- Step D: move subsystems to device ---
                 vlm._rpu_attn_tp = vlm_attn_tp
@@ -2200,9 +2259,12 @@ class Pi05Adapter:
                 self._siglip_handle = patch_siglip_model_for_rpu_all_layers_once(
                     siglip_inner, projector, num_images=_num_cam,
                     w8a16_default=siglip_w8a16_default,
-                    num_cores=topology.attn_tp,
+                    num_cores=vision_lanes,
                     runtime_policy=graph_runtime_policy,
-                    linear_acc32=bool(_vision_execution.get("vision", {}).get("linear_acc32", False)))
+                    linear_acc32=bool(_vision_execution.get("vision", {}).get("linear_acc32", False)),
+                    w4a16=siglip_w4a16,
+                    **({"qkv_w8a8": True} if _vision_qkv_w8a8 else {}),
+                    **({"mlp_w8a8": True} if _vision_mlp_w8a8 else {}))
                 _vision_chunk = _vision_execution.get(
                     "vision", {}
                 ).get("chunk_size", "auto")

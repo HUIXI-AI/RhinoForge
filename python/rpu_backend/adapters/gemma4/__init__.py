@@ -11,6 +11,18 @@ KV sharing, four normalization stages, QK/V normalization, dual RoPE,
 PLE side inputs, layer scaling, a tied language head and softcap=30.
 Sliding-window attention uses an offset KV read, with graph signatures
 bucketed by ceil(total_kv/16) beyond the 512-token window.
+
+On-install ``quantization="w8a16"`` (per-channel INT8) or ``"w4a16"`` (G32 RTN)
+quantizes the seven decoder projections of the exact E4B float checkpoint once,
+at 4/6/8 cores (cold-only, ACC16). PLE, norms, embeddings and the tied
+lm_head stay as in FP16; scales reach the native owner through
+``gemma4_set_weight_scales``.
+
+The tied lm_head runs on the Rhino RPU as an ordinary Linear (FP16 weight, FP32
+accumulation, ``topology.head_tp`` lanes) and only the softcap stays on the
+CPU. The input embedding and the PLE side input stay on the CPU: each forward
+gathers its few token rows from the tables, and the PLE projection weight is
+converted to FP32 once at install.
 """
 from __future__ import annotations
 
@@ -63,6 +75,8 @@ _SUPPORTED_LAYER_TYPES = tuple(
     for i in range(42)
 )
 _BUILD_LOCK = threading.Lock()
+_ON_INSTALL_QUANTIZATION = ("w8a16", "w4a16")
+_PROJECTION_ROLES = ("q", "k", "v", "o", "gate", "up", "down")
 # model.num_cores (4/6/8, default 8) is a cold budget; see topology.py.
 _EXECUTION_SUPPORTED = {"prefill": ("chunk_size",), "model": ("num_cores",)}
 _INSTALL_ATTRS = (
@@ -71,6 +85,7 @@ _INSTALL_ATTRS = (
     "_rpu_gemma4_retirement_state",
     "_rpu_gemma4_geom",
     "_rpu_gemma4_topology",
+    "_rpu_gemma4_quantization",
     "_rpu_gemma4_graph_cache",
     "_rpu_gemma4_ready",
     "_execution_session",
@@ -148,6 +163,22 @@ def _check_profile(config) -> None:
         )
 
 
+def _validate_gemma4_quant_source(model, quantization: str) -> None:
+    """Admit the original CPU float projections before an on-install recipe."""
+    from rpu_backend.quant.convert_gemma4 import check_gemma4_quant_source
+    from .runtime import PFX
+
+    tc = _text_config(model.config)
+    try:
+        check_gemma4_quant_source(
+            model.state_dict().__getitem__, layer_geometry(tc), pfx=PFX,
+            quantization=quantization, hidden_size=int(tc.hidden_size),
+            num_q_heads=int(tc.num_attention_heads),
+            intermediate_size=int(tc.intermediate_size))
+    except ValueError as exc:
+        raise UnsupportedModelError(str(exc)) from exc
+
+
 def _validate_max_seq(value, *, name="model._rpu_max_seq") -> int:
     if isinstance(value, bool) or not isinstance(value, Integral) or value < 1:
         raise ValueError(f"{name} must be a positive integer, got {value!r}")
@@ -160,14 +191,14 @@ class Gemma4Adapter:
     Builds the mixed-geometry fused decoder (``torch.ops.rpu.gemma4_*``) from a
     loaded HF ``Gemma4ForConditionalGeneration`` and installs a patched
     ``forward`` that routes through it: input embed (xsqrt H) -> PLE side-input ->
-    fused decoder (graph-captured) -> tied lm_head + final softcap. The HF model
-    stays on CPU (embed / PLE tables / tied lm_head live there); only the decoder
-    weights are swizzled onto the device.
+    fused decoder (graph-captured) -> tied lm_head (Rhino RPU Linear) + final softcap.
+    The HF model stays on CPU (embed / PLE tables live there); the decoder
+    weights and a swizzled copy of the tied lm_head are placed on the Rhino RPU.
     """
 
     arch = HF_ARCH
 
-    def __init__(self, model, *, rpu_execution=None):
+    def __init__(self, model, *, rpu_execution=None, quantization=None):
         from rpu_backend.api._execution import (
             bind_rpu_execution,
             normalize_rpu_execution,
@@ -186,12 +217,21 @@ class Gemma4Adapter:
             )
         self.model = model
         _check_profile(model.config)
+        if (getattr(model.to, "__rpu_wrapped__", False)
+                and getattr(model.to, "__rpu_quantization__", None) != quantization):
+            raise UnsupportedModelError(
+                "Gemma4 on-install quantization is cold-only; reload the model to change it")
         self._rpu_execution = bind_rpu_execution(
             model,
             rpu_execution,
             entry_point="Gemma4Adapter",
             supported=supported_execution,
         )
+        self._quantization = quantization
+        if quantization is not None:
+            self.preflight_quantization(model.config, self._rpu_execution, quantization)
+            if not getattr(model, "_rpu_gemma4_ready", False):
+                _validate_gemma4_quant_source(model, quantization)
 
         # Idempotent `.to('rpu')` interceptor (matches Qwen3VLAdapter): without
         # it, `from_pretrained(...).to('rpu')` hits HF's native `nn.Module.to`
@@ -219,11 +259,35 @@ class Gemma4Adapter:
             return original_to(*args, **kwargs)
 
         rpu_aware_to.__rpu_wrapped__ = True
+        rpu_aware_to.__rpu_quantization__ = quantization
         model.to = rpu_aware_to
 
     @classmethod
     def preflight(cls, config) -> None:
         _check_profile(config)
+
+    @classmethod
+    def preflight_quantization(cls, config, execution_config, quantization) -> int:
+        """Admit an on-install recipe before any weight is read.
+
+        ``quantization`` is ``"w8a16"`` (per-channel INT8) or ``"w4a16"`` (G32
+        RTN) for the exact E4B float checkpoint at model.num_cores 4, 6 or 8
+        (omitted: 8). Returns the admitted core budget.
+        """
+        _check_profile(config)
+        if quantization not in _ON_INSTALL_QUANTIZATION:
+            raise UnsupportedModelError(
+                f"unknown Gemma4 on-install recipe {quantization!r}; "
+                f"expected one of {_ON_INSTALL_QUANTIZATION}")
+        if any(getattr(c, "quantization_config", None) is not None
+               for c in (config, _text_config(config))):
+            raise UnsupportedModelError(
+                "Gemma4 on-install quantization requires the original float "
+                "checkpoint, not a pre-quantized one")
+        try:
+            return execution_num_cores(execution_config)
+        except ValueError as exc:
+            raise UnsupportedModelError(str(exc)) from exc
 
     def to_rpu(self):
         model = self.model
@@ -248,6 +312,18 @@ class Gemma4Adapter:
         max_seq = _validate_max_seq(
             getattr(model, "_rpu_max_seq", DEFAULT_MAX_SEQ),
         )
+        quantization = getattr(self, "_quantization", None)
+        if quantization is not None:
+            import torch
+
+            # Refuse before the irreversible swizzle.
+            self.preflight_quantization(
+                model.config, getattr(model, "_rpu_execution", None), quantization)
+            if not hasattr(torch.ops.rpu, "gemma4_set_weight_scales"):
+                raise RPUBackendError(
+                    f"Gemma4 {quantization} requires a native extension built "
+                    "with gemma4_set_weight_scales; rebuild it")
+            _validate_gemma4_quant_source(model, quantization)
         if not _BUILD_LOCK.acquire(blocking=False):
             raise RPUBackendError(
                 "Gemma4Adapter.to_rpu(): another Gemma4 build is in progress."
@@ -271,7 +347,8 @@ class Gemma4Adapter:
             _claim_live_instance(model)
             claimed = True
             result = _build_rpu_model(
-                model, max_seq=max_seq, _install_state=install_state
+                model, max_seq=max_seq, _install_state=install_state,
+                quantization=quantization,
             )
             self._execution_session = model._execution_session
             return result
@@ -356,8 +433,12 @@ def _execution_plan(model, handle, seq_len, position, horizon, graph_cache=None)
     return plan_box["result"]
 
 
-def _build_rpu_model(model, *, max_seq=None, _install_state=None):
-    """Swizzle the decoder onto the device + patch ``forward`` (call-time heavy imports)."""
+def _build_rpu_model(model, *, max_seq=None, _install_state=None, quantization=None):
+    """Swizzle the decoder onto the device + patch ``forward`` (call-time heavy imports).
+
+    ``quantization`` (None, ``"w8a16"`` or ``"w4a16"``) was admitted by
+    ``Gemma4Adapter.preflight_quantization``.
+    """
     import types
 
     import torch
@@ -380,7 +461,7 @@ def _build_rpu_model(model, *, max_seq=None, _install_state=None):
         execution_num_cores(getattr(model, "_rpu_execution", None)),
         intermediate_size=int(tc.intermediate_size),
         ple_dim=int(tc.hidden_size_per_layer_input),
-        num_kv_heads=max_num_kv_heads(geom))
+        num_kv_heads=max_num_kv_heads(geom), quantization=quantization)
     H = int(tc.hidden_size)
     NQ = int(tc.num_attention_heads)
     IS = int(tc.intermediate_size)
@@ -399,16 +480,41 @@ def _build_rpu_model(model, *, max_seq=None, _install_state=None):
     sd = model.state_dict()
     raw = lambda nm: sd[nm].float()
 
-    # Decoder + PLE weights -> swizzled fp16 on device (MLP6 zero-padded first).
-    lists, ple = rt.swizzle_decoder_and_ple(raw, geom, topology=topology)
+    # Decoder + PLE weights -> swizzled fp16 (or quantized projections) on device
+    # (MLP6 zero-padded first).
+    lists, ple = rt.swizzle_decoder_and_ple(
+        raw, geom, topology=topology, quantization=quantization)
+    scale_lists = ()
+    if quantization is not None:
+        # Each projection's own FP16 scale, in set_weight_scales order. Checked
+        # here, before the native owner exists.
+        weight_dtype = {"w8a16": torch.int8, "w4a16": torch.uint8}[quantization]
+        scale_lists = tuple(lists.pop(f"{role}_scale") for role in _PROJECTION_ROLES)
+
+        def scale_ok(weight, scale):
+            expected = (1, weight.size(0)) if quantization == "w8a16" else (2, 32)
+            return (weight.dtype == weight_dtype and torch.is_tensor(scale)
+                    and scale.dtype == torch.float16 and scale.device == weight.device
+                    and scale.is_contiguous() and (scale.dim(), scale.size(0)) == expected)
+
+        for role, scales in zip(_PROJECTION_ROLES, scale_lists):
+            if len(scales) != len(lists[role]) or not all(
+                    scale_ok(weight, scale) for weight, scale in zip(lists[role], scales)):
+                raise ValueError(
+                    f"Gemma4 {quantization} install requires every projection's "
+                    "own FP16 scale beside its quantized weight")
     rope_tables = make_rope_tables(tc, max_seq, device="rpu", dtype=torch.float16)
     final_norm_w = raw(rt.PFX + "norm.weight").to(torch.float16).to("rpu")
 
-    # CPU weights kept for the patched forward (input embed + PLE side + tied lm_head).
+    # CPU weights kept for the patched forward (input embed + PLE side input).
     embed_w = sd[rt.PFX + "embed_tokens.weight"]
     eptl_w = sd[rt.PFX + "embed_tokens_per_layer.weight"]
     plmp_w = sd[rt.PFX + "per_layer_model_projection.weight"]
+    plmp_rpu_w = rt.upload_model_projection(plmp_w, topology.num_cores)
     pln_w = sd[rt.PFX + "per_layer_projection_norm.weight"]
+    vocab_size = int(embed_w.shape[0]) if isinstance(embed_w, torch.Tensor) else int(tc.vocab_size)
+    # Tied lm_head on the RPU; embed_w above still serves the input embedding.
+    head_w = rt.upload_lm_head(embed_w, topology.head_tp)
 
     gc = rpu_backend.graph.GraphCache(runtime_policy=_gemma4_graph_runtime_policy(topology.num_cores))
     dyn = geometry_dyn_dims(geom)
@@ -522,13 +628,16 @@ def _build_rpu_model(model, *, max_seq=None, _install_state=None):
                         f"the cache position (expected {want.tolist()}); explicit "
                         "or non-contiguous positions are not supported.")
 
-        hidden = (torch.nn.functional.embedding(ids, embed_w).float() * (H ** 0.5)
-                  ).to(dtype=torch.float16, device="cpu")
+        raw_emb = torch.nn.functional.embedding(ids, embed_w)
+        hidden = (raw_emb.float() * (H ** 0.5)).to(dtype=torch.float16, device="cpu")
         side = rt.compute_side_input(
             ids, embed_weight=embed_w, embed_per_layer_weight=eptl_w,
             model_projection_weight=plmp_w, projection_norm_weight=pln_w,
             num_layers=L, hidden_size=H, ple_dim=PD, eps=eps,
-            num_cores=topology.ple_tp)
+            num_cores=topology.ple_tp,
+            model_projection_rpu=plmp_rpu_w,
+            model_projection_lanes=topology.num_cores,
+            raw_embeds=raw_emb if isinstance(raw_emb, torch.Tensor) else None)
 
         # T4: when the total context exceeds the sliding window, the fused decoder
         # routes sliding(hd256) layers through a windowed MASK_2D over an offset KV
@@ -562,10 +671,12 @@ def _build_rpu_model(model, *, max_seq=None, _install_state=None):
             ),
         })
         vars(self)["_rpu_last_execution_plan"] = receipt
-        final_hidden = out.cpu().float().reshape(B, S, H)
+        final_hidden = out.reshape(B, S, H)
         if logits_to_keep:
             final_hidden = final_hidden[:, -int(logits_to_keep):, :]
-        logits = rt.softcap_lm_logits(final_hidden, embed_w, cap)   # [B, S', vocab]
+        logits = rt.device_lm_logits(final_hidden, head_w, topology.head_tp, cap)  # [B, S', vocab]
+        if logits.shape[-1] > vocab_size:
+            logits = logits[..., :vocab_size]
         cache.position = position + S
         cache._seen_tokens = cache.position
         return CausalLMOutputWithPast(logits=logits, past_key_values=cache)
@@ -585,7 +696,7 @@ def _build_rpu_model(model, *, max_seq=None, _install_state=None):
     resource = _InstalledNativeResource(
         model, None, torch.ops.rpu.gemma4_destroy,
         graphs=(gc,), keepalive=(lists, ple, rope_tables, final_norm_w,
-                                embed_w, eptl_w, plmp_w, pln_w),
+                                embed_w, eptl_w, plmp_w, plmp_rpu_w, pln_w, scale_lists, head_w),
         label="Gemma4", handle_name="_rpu_gemma4_handle")
     try:
         resource.handle = handle = int(torch.ops.rpu.gemma4_create())
@@ -605,6 +716,8 @@ def _build_rpu_model(model, *, max_seq=None, _install_state=None):
                 raise RuntimeError(
                     f"Gemma4 native topology mismatch: {actual} != "
                     f"{topology.native_readback()}")
+        if quantization is not None:
+            torch.ops.rpu.gemma4_set_weight_scales(handle, *scale_lists)
         torch.ops.rpu.gemma4_set_chunk_envelope(handle, max_seq, 0)
 
         def invalidate_execution_graphs(_old, _new, _generation, *, force_rebuild=False):
@@ -634,6 +747,7 @@ def _build_rpu_model(model, *, max_seq=None, _install_state=None):
         model._rpu_gemma4_handle_finalizer = resource.finalizer
         model._rpu_gemma4_geom = geom
         model._rpu_gemma4_topology = topology
+        model._rpu_gemma4_quantization = quantization
         model._rpu_gemma4_graph_cache = gc
         model._execution_session = session
         model.build_rpu_cache = make_cache

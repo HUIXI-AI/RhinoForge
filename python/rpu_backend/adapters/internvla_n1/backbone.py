@@ -13,6 +13,9 @@ Delta vs `adapters/wall_oss/llm.py`:
     does NOT apply here — 28 q-heads is not a multiple of 8 (would break num_q%num_kv and the
     8-core q partition). So this port runs the attention phase 4-core.
   * lm_head is NOT fused (vocab 151668 % 8 != 0) and not needed for vlm_tokens — embed stays CPU.
+  * `model.num_cores` 4/6: attention keeps its four lanes; the MLP follows the budget
+    (six lanes use the zero-padded 19008 width). The headless decoder is created with
+    vocab 0 and the native exact InternVLA text admission.
 
 The head/tail glue (embed lookup, image-embed scatter, latent-query append, 3D M-RoPE
 position_ids, last-4 slice) is done by the caller / `forward_embeds`; this class owns only the
@@ -33,7 +36,10 @@ import rpu_backend
 from rpu_backend.runtime.rope_partial import build_interleaved_mrope_cos_sin
 from rpu_backend.runtime.control import rpu_env_bool
 from rpu_backend.api.cache import RPUCache
-from rpu_backend.runtime.weights import tp_col_swizzle_mc_weight, tp_row_swizzle_mc_weight
+from rpu_backend.runtime.topology import decoder_mlp_intermediate_size
+from rpu_backend.runtime.weights import (
+    pad_decoder_mlp_projection, tp_col_swizzle_mc_weight, tp_row_swizzle_mc_weight,
+)
 from rpu_backend.runtime.decoder import plan_bounded_prefill_execution
 from rpu_backend.runtime._native_retirement import _InstalledNativeResource
 from rpu_backend.api._execution import execution_serialized
@@ -42,7 +48,7 @@ from rpu_backend.adapters.wall_oss.llm import (
     _partial_mrope_enabled,
 )
 from ._policy import require_controlled_evaluation, verify_asset_manifest
-from .execution import BACKBONE_COMPONENT, component_execution
+from .execution import BACKBONE_COMPONENT, component_execution, internvla_core_count
 
 
 _PROFILE = {
@@ -356,6 +362,9 @@ def build_qwen25vl_backbone(
         BACKBONE_COMPONENT,
         entry_point="build_qwen25vl_backbone",
     )
+    # Attention keeps its four lanes at every budget; the MLP follows the
+    # budget, with six lanes on the native 18944 -> 19008 zero-padded width.
+    cores = internvla_core_count(execution)
     require_controlled_evaluation(asset_manifest)
     partial_mrope = _partial_mrope_enabled()
     host_cache = rpu_env_bool("RPU_INTERNVLA_HOST_CACHE", default=True)
@@ -431,9 +440,22 @@ def build_qwen25vl_backbone(
     def row(w, tp):
         return (_to_rpu_int8(tp_row_swizzle_mc_weight(w, tp, dwidth=1)) if w8a16
                 else _to_rpu_half(tp_row_swizzle_mc_weight(w.half(), tp)))
-    def col8(w):
-        return (_to_rpu_int8(tp_col_swizzle_mc_weight(w, 8, dwidth=1)) if w8a16
-                else _to_rpu_half(tp_col_swizzle_mc_weight(w.half(), 8)))
+    mlp_tp = cores
+    physical_inter = decoder_mlp_intermediate_size(INTER, mlp_tp)
+    def col_mlp(w):
+        return (_to_rpu_int8(tp_col_swizzle_mc_weight(w, mlp_tp, dwidth=1)) if w8a16
+                else _to_rpu_half(tp_col_swizzle_mc_weight(w.half(), mlp_tp)))
+    def mlp_weight(key, name):
+        w = gf(key)
+        return (w if physical_inter == INTER else pad_decoder_mlp_projection(
+            w, projection_name=name, logical_size=INTER, physical_size=physical_inter))
+    def mlp_scale(key):
+        scale = gf(key)
+        if physical_inter == INTER:
+            return _to_rpu_half(scale)
+        padded = scale.new_ones(physical_inter)  # zero weight rows; unit scale
+        padded[:INTER].copy_(scale)
+        return _to_rpu_half(padded)
 
     for L in layer_indices:
         p = f"model.layers.{L}"
@@ -444,9 +466,9 @@ def build_qwen25vl_backbone(
         q_b.append(_to_rpu_half(gf(f"{p}.self_attn.q_proj.bias")))
         k_b.append(_to_rpu_half(gf(f"{p}.self_attn.k_proj.bias")))
         v_b.append(_to_rpu_half(gf(f"{p}.self_attn.v_proj.bias")))
-        gate.append(col8(gf(f"{p}.mlp.gate_proj.weight")))
-        up.append(col8(gf(f"{p}.mlp.up_proj.weight")))
-        down.append(row(gf(f"{p}.mlp.down_proj.weight"), 8))
+        gate.append(col_mlp(mlp_weight(f"{p}.mlp.gate_proj.weight", "gate_proj")))
+        up.append(col_mlp(mlp_weight(f"{p}.mlp.up_proj.weight", "up_proj")))
+        down.append(row(mlp_weight(f"{p}.mlp.down_proj.weight", "down_proj"), mlp_tp))
         in_norm.append(_to_rpu_half(gf(f"{p}.input_layernorm.weight")))
         post_norm.append(_to_rpu_half(gf(f"{p}.post_attention_layernorm.weight")))
         if w8a16:
@@ -454,8 +476,8 @@ def build_qwen25vl_backbone(
             k_s.append(_to_rpu_half(gf(f"{p}.self_attn.k_proj.weight_scale")))
             v_s.append(_to_rpu_half(gf(f"{p}.self_attn.v_proj.weight_scale")))
             o_s.append(_to_rpu_half(gf(f"{p}.self_attn.o_proj.weight_scale")))
-            gate_s.append(_to_rpu_half(gf(f"{p}.mlp.gate_proj.weight_scale")))
-            up_s.append(_to_rpu_half(gf(f"{p}.mlp.up_proj.weight_scale")))
+            gate_s.append(mlp_scale(f"{p}.mlp.gate_proj.weight_scale"))
+            up_s.append(mlp_scale(f"{p}.mlp.up_proj.weight_scale"))
             down_s.append(_to_rpu_half(gf(f"{p}.mlp.down_proj.weight_scale")))
 
     final_norm_w = _to_rpu_half(gf("model.norm.weight"))
@@ -473,15 +495,25 @@ def build_qwen25vl_backbone(
     cache = RPUCache(
         num_layers=num_layers, batch_size=1, max_seq_len=max_seq_len,
         num_kv_heads=NKV, head_dim=HD, attn_tp=attn_tp)
-    graph_cache = rpu_backend.graph.GraphCache()
+    graph_cache = rpu_backend.graph.GraphCache(**({} if cores == 8 else {
+        "runtime_policy": rpu_backend.graph.GraphRuntimePolicy.from_environment(
+            execution_core_count=cores)}))
     pending = Qwen25VLBackbone.__new__(Qwen25VLBackbone)
-    handle = torch.ops.rpu.causal_decoder_create()
+    # The headless decoder has no vocabulary head at any budget.
+    handle = (torch.ops.rpu.causal_decoder_create() if cores == 8 else
+              torch.ops.rpu.causal_decoder_create(num_cores=cores, vocab_size=0))
     resource = _InstalledNativeResource(
         pending, handle, torch.ops.rpu.causal_decoder_destroy,
         graphs=(graph_cache,), keepalive=(args, cache),
         label="InternVLA System-2", handle_name="_handle")
     try:
         set_weights(handle, *args)
+        if cores != 8:
+            native = tuple(torch.ops.rpu.causal_decoder_topology(handle))
+            if native != (cores, attn_tp, mlp_tp, 4, 8):
+                raise RuntimeError(
+                    "InternVLA System-2 native topology differs from its weight layout: "
+                    f"actual={native}, expected={(cores, attn_tp, mlp_tp, 4, 8)}")
         torch.ops.rpu.causal_decoder_set_chunk_envelope(
             handle, int(max_seq_len), _CERTIFIED_CHUNK_SIZE)
         torch.ops.rpu.causal_decoder_set_chunk_size_override(handle, 0)

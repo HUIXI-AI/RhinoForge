@@ -46,20 +46,43 @@ _NAVDP_EXECUTION_COMPONENTS = {
 _NAVDP_DDR_ROUTE_REASONS = {
     "cross_attention": "MEMORY_CROSS_DDR_REQUIRED_NO_RAW_RESIDENCY_ABI",
 }
+# The cold core count travels with the component view. Eight heads split
+# evenly only over four or eight cores, so the six-core InternVLA budget
+# still runs this head on four.
+_NAVDP_SUPPORTED = {
+    **_NAVDP_EXECUTION_COMPONENTS[_NAVDP_COMPONENT], "model": ("num_cores",)}
+
+
+def navdp_core_count(execution) -> int:
+    return (execution or {}).get("model", {}).get("num_cores", 8)
 
 
 def _resolve_navdp_execution(value, *, entry_point: str):
     local = normalize_rpu_execution(
         value,
         entry_point=entry_point,
+        supported=_NAVDP_SUPPORTED,
         supported_components=_NAVDP_EXECUTION_COMPONENTS,
     )
-    return resolve_component_rpu_execution(
+    cores = navdp_core_count(local)
+    if cores not in (4, 8):
+        raise ValueError(
+            f"{entry_point}: NavDP has no {cores}-core owner; "
+            "model.num_cores must be 4 or 8")
+    resolved = resolve_component_rpu_execution(
         local,
         _NAVDP_COMPONENT,
         entry_point=entry_point,
+        supported=_NAVDP_SUPPORTED,
         supported_components=_NAVDP_EXECUTION_COMPONENTS,
         profile_auto={"action": {"chunk_size": "auto"}},
+    )
+    if cores == 8:
+        return resolved
+    return normalize_rpu_execution(
+        {**resolved, "model": {"num_cores": cores}},
+        entry_point=entry_point,
+        supported=_NAVDP_SUPPORTED,
     )
 
 
@@ -125,12 +148,12 @@ def _hr(t):
     return t.to(torch.float16).to("rpu").contiguous()
 
 
-def _col(w):
-    return _hr(tp_col_swizzle_mc_weight(w.to(torch.float16), TP))
+def _col(w, tp=TP):
+    return _hr(tp_col_swizzle_mc_weight(w.to(torch.float16), tp))
 
 
-def _row(w):
-    return _hr(tp_row_swizzle_mc_weight(w.to(torch.float16), TP))
+def _row(w, tp=TP):
+    return _hr(tp_row_swizzle_mc_weight(w.to(torch.float16), tp))
 
 
 class SinusoidalPosEmb(torch.nn.Module):
@@ -172,6 +195,7 @@ class NavdpRuntime:
                 execution_config,
                 entry_point="build_navdp",
             )
+            self._num_cores = navdp_core_count(self._rpu_execution)
             self._fmb_execution_component_id = _NAVDP_COMPONENT
             self._fmb_execution_generation = 0
             if type(_defer_execution_session) is not bool:
@@ -180,8 +204,9 @@ class NavdpRuntime:
             if not _defer_execution_session:
                 self._standalone_execution_session = bind_execution_session(
                     self, self._rpu_execution, entry_point="NavdpRuntime",
+                    supported=_NAVDP_SUPPORTED,
                     supported_components=_NAVDP_EXECUTION_COMPONENTS,
-                    validate=lambda value: _resolve_navdp_execution(value, entry_point="NavDP reconfigure"),
+                    validate=self._validate_execution,
                     apply=self._apply_execution_reconfigure,
                     rollback=self._rollback_execution_reconfigure,
                     graph_mode=GRAPH_COMPOSITE_CHILD,
@@ -397,7 +422,8 @@ class NavdpRuntime:
             BPS = sample_num * PREDICT_SIZE
             if batch_n is None:
                 self._batch_cache = RPUCache(num_layers=NUM_LAYERS, batch_size=sample_num,
-                                             max_seq_len=_CACHE_LEN, num_kv_heads=NUM_HEADS, head_dim=HEAD_DIM)
+                                             max_seq_len=_CACHE_LEN, num_kv_heads=NUM_HEADS, head_dim=HEAD_DIM,
+                                             attn_tp=self._num_cores)
                 self._native_resource.keepalive = (
                     self._native_resource.keepalive, self._batch_cache)
                 self._batch_n = sample_num
@@ -491,6 +517,14 @@ class NavdpRuntime:
             outs.append(r[:, :ACTION_DIM].to(device="cpu", dtype=torch.float32))
         return torch.stack(outs, 0)
 
+    def _validate_execution(self, value):
+        resolved = _resolve_navdp_execution(value, entry_point="NavDP reconfigure")
+        if navdp_core_count(resolved) != self._num_cores:
+            raise ValueError(
+                "NavDP model.num_cores is cold-only: build a fresh runtime "
+                "to change topology")
+        return resolved
+
     def _require_execution_session(self):
         _require_execution_process_safe()
         if self._handle is None:
@@ -544,6 +578,7 @@ def build_navdp(
         rpu_execution,
         entry_point="build_navdp",
     )
+    tp = navdp_core_count(execution)
     denoise_unroll = rpu_env_bool("RPU_NAVDP_DENOISE_UNROLL")
     batch_unroll = rpu_env_bool("RPU_NAVDP_BATCH", default=True)
     spm_kv_by_mha = rpu_env_bool("RPU_NAVDP_SPM_KV_BY_MHA", default=True)
@@ -617,14 +652,14 @@ def build_navdp(
         # split packed MHA in_proj [3H,H] -> q/k/v; bias [3H] -> q/k/v
         siw, sib = L("self_attn.in_proj_weight", i), L("self_attn.in_proj_bias", i)
         ciw, cib = L("multihead_attn.in_proj_weight", i), L("multihead_attn.in_proj_bias", i)
-        lists["sq_w"].append(_col(siw[0:H]));   lists["sk_w"].append(_col(siw[H:2*H]));   lists["sv_w"].append(_col(siw[2*H:3*H]))
+        lists["sq_w"].append(_col(siw[0:H], tp));   lists["sk_w"].append(_col(siw[H:2*H], tp));   lists["sv_w"].append(_col(siw[2*H:3*H], tp))
         lists["sq_b"].append(_hr(sib[0:H]));    lists["sk_b"].append(_hr(sib[H:2*H]));    lists["sv_b"].append(_hr(sib[2*H:3*H]))
-        lists["so_w"].append(_row(L("self_attn.out_proj.weight", i)));  lists["so_b"].append(_hr(L("self_attn.out_proj.bias", i)))
-        lists["cq_w"].append(_col(ciw[0:H]));   lists["ck_w"].append(_col(ciw[H:2*H]));   lists["cv_w"].append(_col(ciw[2*H:3*H]))
+        lists["so_w"].append(_row(L("self_attn.out_proj.weight", i), tp));  lists["so_b"].append(_hr(L("self_attn.out_proj.bias", i)))
+        lists["cq_w"].append(_col(ciw[0:H], tp));   lists["ck_w"].append(_col(ciw[H:2*H], tp));   lists["cv_w"].append(_col(ciw[2*H:3*H], tp))
         lists["cq_b"].append(_hr(cib[0:H]));    lists["ck_b"].append(_hr(cib[H:2*H]));    lists["cv_b"].append(_hr(cib[2*H:3*H]))
-        lists["co_w"].append(_row(L("multihead_attn.out_proj.weight", i)));  lists["co_b"].append(_hr(L("multihead_attn.out_proj.bias", i)))
-        lists["ff1_w"].append(_col(L("linear1.weight", i)));  lists["ff1_b"].append(_hr(L("linear1.bias", i)))
-        lists["ff2_w"].append(_row(L("linear2.weight", i)));  lists["ff2_b"].append(_hr(L("linear2.bias", i)))
+        lists["co_w"].append(_row(L("multihead_attn.out_proj.weight", i), tp));  lists["co_b"].append(_hr(L("multihead_attn.out_proj.bias", i)))
+        lists["ff1_w"].append(_col(L("linear1.weight", i), tp));  lists["ff1_b"].append(_hr(L("linear1.bias", i)))
+        lists["ff2_w"].append(_row(L("linear2.weight", i), tp));  lists["ff2_b"].append(_hr(L("linear2.bias", i)))
         for n in ("n1", "n2", "n3"):
             src = {"n1": "norm1", "n2": "norm2", "n3": "norm3"}[n]
             lists[f"{n}_w"].append(_hr(L(f"{src}.weight", i)));  lists[f"{n}_b"].append(_hr(L(f"{src}.bias", i)))
@@ -636,9 +671,14 @@ def build_navdp(
         "ln_w": sd["layernorm.weight"].float(), "ln_b": sd["layernorm.bias"].float(),
         "ah_w": sd["action_head.weight"].float(), "ah_b": sd["action_head.bias"].float(),
     }
-    gc = rpu_backend.graph.GraphCache()
+    if tp == 8:
+        gc = rpu_backend.graph.GraphCache()
+    else:
+        from rpu_backend.graph import GraphRuntimePolicy
+        gc = rpu_backend.graph.GraphCache(
+            runtime_policy=GraphRuntimePolicy.from_environment(execution_core_count=tp))
     cache = RPUCache(num_layers=NUM_LAYERS, batch_size=1, max_seq_len=_CACHE_LEN,
-                     num_kv_heads=NUM_HEADS, head_dim=HEAD_DIM)
+                     num_kv_heads=NUM_HEADS, head_dim=HEAD_DIM, attn_tp=tp)
 
     pending = NavdpRuntime.__new__(NavdpRuntime)
     pending._handle = torch.ops.rpu.navdp_create(True, spm_kv_by_mha)
@@ -646,6 +686,8 @@ def build_navdp(
         pending, pending._handle, torch.ops.rpu.navdp_destroy, graphs=(gc,),
         keepalive=(lists, cache), label="InternVLA NavDP", handle_name="_handle")
     try:
+        if tp != 8:
+            torch.ops.rpu.navdp_set_execution_core_count(pending._handle, tp)
         torch.ops.rpu.navdp_set_weights(
             pending._handle,
             lists["sq_w"], lists["sk_w"], lists["sv_w"], lists["so_w"],
@@ -656,6 +698,12 @@ def build_navdp(
             lists["n1_w"], lists["n1_b"], lists["n2_w"], lists["n2_b"],
             lists["n3_w"], lists["n3_b"], NUM_HEADS, HEAD_DIM, HIDDEN,
             FF_INTER, MEMORY_LEN, PREDICT_SIZE, ACTION_DIM, EPS)
+        if tp != 8:
+            topology = tuple(torch.ops.rpu.navdp_get_execution_topology(pending._handle))
+            if topology != (tp, tp, tp, 8, NUM_HEADS, FF_INTER):
+                raise RuntimeError(
+                    f"NavDP native topology {topology} does not match the "
+                    f"{tp}-core install")
 
         torch.ops.rpu.navdp_set_chunk_envelope(pending._handle, int(cache.max_seq_len), 0)
         NavdpRuntime.__init__(

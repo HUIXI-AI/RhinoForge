@@ -65,6 +65,9 @@ _RTC_REAL_PREFIX_MIN = 599
 _RTC_REAL_PREFIX_MAX = 671
 _RTC_PREFILL_EXECUTION_LEN = 672
 _RTC_PREFILL_CHUNK_SIZE = 336
+# Below eight cores RTC has no BF16 boundary kernels; Vision and expert-0 fold
+# this residual scale instead (see build_wall_oss_vision / build_wall_oss_llm).
+_REDUCED_RTC_RESIDUAL_SCALE = 4
 
 WALL_OSS_TEXT_COMPONENT = "text_backbone"
 WALL_OSS_VISION_COMPONENT = "vision_encoder"
@@ -76,6 +79,38 @@ WALL_OSS_EXECUTION_COMPONENTS = {
     WALL_OSS_VISION_COMPONENT: {"vision": ("chunk_size", "linear_acc32")},
     WALL_OSS_ACTION_COMPONENT: {"action": ("chunk_size", "linear_acc32")},
 }
+_MODEL_SCOPE = {"model": ("num_cores",)}
+# The public core budget belongs to the composite and is cold-only. At 4/6 cores
+# the text backbone uses its template (attention 4 / MLP = budget); Vision and the
+# action expert have four-lane owners only, so they run on four cores in both.
+_EXECUTION_SUPPORTED = {
+    **_MODEL_SCOPE,
+    **{stage: fields
+       for stages in WALL_OSS_EXECUTION_COMPONENTS.values()
+       for stage, fields in stages.items()},
+}
+_REDUCED_LANES = 4
+
+
+def _wall_core_count(execution) -> int:
+    # normalize_rpu_execution already admitted 4, 6 or 8.
+    return (execution or {}).get("model", {}).get("num_cores", 8)
+
+
+def _wall_component_cores(budget: int, component: str) -> int:
+    if budget == 8:
+        return 8
+    return budget if component == WALL_OSS_TEXT_COMPONENT else _REDUCED_LANES
+
+
+def _with_cores(config, cores: int, component: str, *, entry_point: str):
+    if cores == 8:
+        return config
+    return normalize_rpu_execution(
+        {**config, "model": {"num_cores": cores}},
+        entry_point=entry_point,
+        supported={**WALL_OSS_EXECUTION_COMPONENTS[component], **_MODEL_SCOPE},
+    )
 
 
 def resolve_wall_oss_execution_components(value, *, entry_point: str):
@@ -83,12 +118,14 @@ def resolve_wall_oss_execution_components(value, *, entry_point: str):
     root = normalize_rpu_execution(
         value,
         entry_point=entry_point,
+        supported=_EXECUTION_SUPPORTED,
         supported_components=WALL_OSS_EXECUTION_COMPONENTS,
     )
     text = resolve_component_rpu_execution(
         root,
         WALL_OSS_TEXT_COMPONENT,
         entry_point=entry_point,
+        supported=_EXECUTION_SUPPORTED,
         supported_components=WALL_OSS_EXECUTION_COMPONENTS,
         profile_auto={"prefill": {"chunk_size": "auto"}},
     )
@@ -96,6 +133,7 @@ def resolve_wall_oss_execution_components(value, *, entry_point: str):
         root,
         WALL_OSS_VISION_COMPONENT,
         entry_point=entry_point,
+        supported=_EXECUTION_SUPPORTED,
         supported_components=WALL_OSS_EXECUTION_COMPONENTS,
         profile_auto={"vision": {"chunk_size": "auto"}},
     )
@@ -103,23 +141,39 @@ def resolve_wall_oss_execution_components(value, *, entry_point: str):
         root,
         WALL_OSS_ACTION_COMPONENT,
         entry_point=entry_point,
+        supported=_EXECUTION_SUPPORTED,
         supported_components=WALL_OSS_EXECUTION_COMPONENTS,
         profile_auto={"action": {"chunk_size": "auto"}},
     )
+    budget = _wall_core_count(root)
+    if budget != 8 and vision.get("vision", {}).get("chunk_size") in (512, 768):
+        raise ValueError(
+            f"{entry_point}: vision.chunk_size 512/768 packs images into one "
+            "dispatch, which needs eight cores; use 'auto' or 256 at "
+            f"model.num_cores={budget}")
+    text, vision, action = (
+        _with_cores(config, _wall_component_cores(budget, component), component,
+                    entry_point=entry_point)
+        for config, component in (
+            (text, WALL_OSS_TEXT_COMPONENT),
+            (vision, WALL_OSS_VISION_COMPONENT),
+            (action, WALL_OSS_ACTION_COMPONENT)))
     return root, text, vision, action
 
 
-def _action_builder_execution(text, action):
+def _action_builder_execution(text, action, budget=8):
     """Give the action builder its action child plus its owned text child."""
     return normalize_rpu_execution(
         {
             "prefill": dict(text.get("prefill", {})),
             "action": dict(action.get("action", {})),
+            **({} if budget == 8 else {"model": {"num_cores": budget}}),
         },
         entry_point="build_wall_oss_action",
         supported={
             "prefill": ("chunk_size", "padding_rows", "padding_budget", "linear_acc32"),
             "action": ("chunk_size", "linear_acc32"),
+            **_MODEL_SCOPE,
         },
     )
 
@@ -515,6 +569,7 @@ class WallOssVLA:
             self,
             self._rpu_execution,
             entry_point="WallOssVLA",
+            supported=_EXECUTION_SUPPORTED,
             supported_components=WALL_OSS_EXECUTION_COMPONENTS,
             validate=self.validate_execution_reconfigure,
             apply=self.apply_execution_reconfigure,
@@ -701,10 +756,14 @@ class WallOssVLA:
     def validate_execution_reconfigure(self, execution_config) -> None:
         if self._closed:
             raise RuntimeError("Wall-OSS runtime is closed")
-        _root, text, vision, action = self._resolve_execution(
+        root, text, vision, action = self._resolve_execution(
             execution_config,
             entry_point="WallOssVLA.reconfigure",
         )
+        if _wall_core_count(root) != _wall_core_count(self._rpu_execution):
+            raise ValueError(
+                "Wall-OSS model.num_cores is cold-only: build a fresh runtime "
+                "to change topology")
         for stage, current, requested in (
             ("prefill", self._text_execution, text),
             ("vision", self._vision_execution, vision),
@@ -942,7 +1001,14 @@ class WallOssVLA:
                     f"envelope [{_RTC_REAL_PREFIX_MIN}, {_RTC_REAL_PREFIX_MAX}]: "
                     f"got {real_len}"
                 )
-            if real_len <= 640:
+            bucket = 640 if real_len <= 640 else _RTC_PREFILL_EXECUTION_LEN
+            if self.llm.residual_scale != 1:
+                # A residual-scaled expert 0 is the 4/6-core build: same
+                # P640/P672 buckets, and the reduced text planner owns each
+                # bucket's chunk (its four-lane attention caps it at 256).
+                return self.llm.prefill_execution_plan(
+                    bucket, reserve_rows=int(horizon))
+            if bucket == 640:
                 return 640, 320
             return _RTC_PREFILL_EXECUTION_LEN, _RTC_PREFILL_CHUNK_SIZE
         return self.llm.prefill_execution_plan(
@@ -1213,7 +1279,7 @@ class WallOssVLA:
                         pos_prefix[real_len:] = pos_prefix[real_len - 1]
                     self.llm.forward_embeds(
                         inputs_embeds, pos_prefix, logical_len=real_len,
-                        reserve_rows=H,
+                        reserve_rows=H, fixed_bucket=self.rtc_enabled,
                     )
                     pos_action = torch.arange(
                         real_len, real_len + H, dtype=torch.int32
@@ -1918,7 +1984,7 @@ class WallOssVLA:
         # 6. expert-0 prefill → shared cache prefix K/V at [0, padded_len). cache.position = padded_len.
         prefix_last = self.llm.forward_embeds(
             inputs_embeds, pos_prefix_2d, logical_len=real_len,
-            reserve_rows=H,
+            reserve_rows=H, fixed_bucket=self.rtc_enabled,
         )
         _mk("7_prefill.forward_embeds(wrap+hw)")
         P = self.llm.cache.position
@@ -1980,6 +2046,10 @@ class WallOssVLA:
             _rev = getattr(self.vision, "_pending_rev", None)
             if _rev is not None:
                 merged_diag = merged_diag[_rev[0].cpu().long()]
+            # Diagnostics stay in model units under a reduced-core residual scale.
+            merged_diag = merged_diag * self.llm.residual_scale
+            if self.llm.residual_scale != 1:
+                inputs_embeds = inputs_embeds.float().cpu() * self.llm.residual_scale
 
         return {
             "action": action, "x_norm": out["x_norm"], "xs": out["xs"], "vs": out["vs"],
@@ -2052,6 +2122,9 @@ def build_wall_oss_vla(
             with ``w8a16=True`` selects the overflow-safe hybrid W8A16 path;
             controlled W4A16 evaluation additionally requires
             ``rtc_w8_ckpt_dir`` for the exact paired W8A16 Vision tower.
+            At ``model.num_cores`` 4 or 6, RTC admits FP16 and uniform W8A16:
+            Vision and expert-0 fold a residual scale of 4 instead of the
+            eight-core BF16 boundaries, on the same P640/P672 buckets.
         rtc_w8_ckpt_dir: exact W8A16 companion for RTC W4A16 Vision. It is
             valid only with ``rtc=True, w4a16=True``.
         action_w4a16_ckpt_dir: paired W4A16 checkpoint for expert-1 Action only
@@ -2073,9 +2146,31 @@ def build_wall_oss_vla(
             entry_point="build_wall_oss_vla",
         )
     )
+    budget = _wall_core_count(execution_config)
     action_builder_execution = _action_builder_execution(
-        text_execution, action_execution
+        text_execution, action_execution, budget
     )
+    if budget != 8:
+        # These compositions and selectors have eight-core owners only; refuse
+        # them before any weight is read or process selector is pinned.
+        selected = [name for name, active in (
+            ("w4a16", w4a16), ("nvfp4a16", nvfp4a16),
+            ("nvfp4_wint4_scope", nvfp4_wint4_scope),
+            ("action_w4a16_ckpt_dir", action_w4a16_ckpt_dir is not None),
+            ("RPU_WALL_OSS_ATTN_TP8", rpu_env_bool("RPU_WALL_OSS_ATTN_TP8")),
+            ("RPU_WALL_OSS_FUSED_ASSEMBLE", rpu_env_bool("RPU_WALL_OSS_FUSED_ASSEMBLE")),
+            ("RPU_WALL_OSS_VISION_PAIR_252", rpu_env_bool("RPU_WALL_OSS_VISION_PAIR_252")),
+        ) if active]
+        if selected:
+            raise ValueError(
+                f"build_wall_oss_vla: model.num_cores={budget} has no route for "
+                f"{', '.join(selected)}; turn them off or use eight cores")
+        if graph_runtime_policy is not None:
+            # One policy names one execution prefix; at six cores the text and
+            # the four-lane children differ, so each derives its own.
+            raise ValueError(
+                f"build_wall_oss_vla: model.num_cores={budget} derives each child's "
+                "Graph policy; graph_runtime_policy is eight-core only")
     if rtc and any(
         config.get(stage, {}).get("linear_acc32", False)
         for stage, config in (("prefill", text_execution),
@@ -2159,14 +2254,16 @@ def build_wall_oss_vla(
     )
     if rtc:
         _validate_rtc_training_metadata(aux_ckpt_dir)
-    # Wall-OSS keeps attention on all eight cores. Every residual reduction is
-    # scheduled by the shared ring launcher; there is no model-scoped route.
+    # At eight cores Wall-OSS keeps attention on all eight cores (4/6 cores use
+    # four lanes). Every residual reduction is scheduled by the shared ring
+    # launcher; there is no model-scoped route.
     if rtc:
         os.environ["RPU_WALL_OSS_ACTION_FP32_TAIL"] = "0"
         os.environ["RPU_WALL_OSS_FUSED_DENOISE"] = "1"
         os.environ["RPU_WALL_OSS_DENOISE_UNROLL"] = "1"
-        os.environ["RPU_WALL_OSS_ATTN_TP8"] = "1"
         os.environ["RPU_WALL_OSS_VISION_FUSED_MERGER"] = "1"
+    if rtc and budget == 8:
+        os.environ["RPU_WALL_OSS_ATTN_TP8"] = "1"
         if w8a16:
             # Exact RTC W8 defaults to the measured exact-MIMC implementation
             # (which reuses the SISC by-MHA dataflow); explicit 0 retains Normal.
@@ -2180,7 +2277,8 @@ def build_wall_oss_vla(
         os.environ["RPU_WALL_OSS_PREFILL_MIXED_PRECISION"] = "1"
         if w4a16:
             os.environ["RPU_WALL_OSS_EXPERT0_DOWN_INT4"] = "0"
-    os.environ.setdefault("RPU_WALL_OSS_ATTN_TP8", "1")
+    if budget == 8:
+        os.environ.setdefault("RPU_WALL_OSS_ATTN_TP8", "1")
     #  • RPU_WALL_OSS_FAST_REPLAY — on a warm graph REPLAY, skip the host op-stream re-walk
     #    (run_all_layers pushes cursor to the end after the per-call input-prep, which lives
     #    OUTSIDE the body loop, has already run). Eliminates ~11 ms/predict on the 10-step
@@ -2206,16 +2304,19 @@ def build_wall_oss_vla(
     #    reverse-gather into each image slot), dropping the merged DDR round-trip. Bit-exact
     #    (3img action_cos 0.99998850 == off; 1img 0.9961313 == off). Single-subgroup forwards
     #    only (mixed-size/cat falls back). ~−0.7 ms op-level (below E2E noise floor).
-    os.environ.setdefault("RPU_WALL_OSS_FUSED_ASSEMBLE", "1")
+    if budget == 8:
+        os.environ.setdefault("RPU_WALL_OSS_FUSED_ASSEMBLE", "1")
     #  • RPU_WALL_OSS_VISION_ROPE_SPM — broadcast the ViT 2D-RoPE cos/sin tables into SPM once
     #    and use the SPM-table rope_2d kernel (per-token cos/sin gather hits SPM not DDR).
     #    rope_2d is the #1 vision kernel (33% of vision compute); numerically identical math.
+    #    The four-lane Vision owner runs the same kernel on its own lanes.
     os.environ.setdefault("RPU_WALL_OSS_VISION_ROPE_SPM", "1")
     #  • RPU_WALL_OSS_VISION_FUSED_MERGER — fold the vision merger into qwen25vl_vision_forward
     #    via the base-class post_fn, so the merger's ~54 kernels re-emit inside the vision graph
     #    instead of on the host. Lands ON TOP of FAST_REPLAY (the fix lets fast-replay skip only
     #    the layer body and re-emit post_fn on the normal path): 174.0→165.7 ms median E2E
     #    (−8.3 ms, 5 runs each, 2026-06-15 A/B), action_cos 0.99886 ≥ 0.99 gate (vs 0.99888 off).
+    #    The four-lane Vision owner runs the same fused post_fn on its own four lanes.
     os.environ.setdefault("RPU_WALL_OSS_VISION_FUSED_MERGER", "1")
     #  • RPU_WALL_OSS_PARTIAL_MROPE — required Qwen2.5-VL path: host-bake contiguous
     #    T/H/W frequency chunks and stream them through partial_mrope. The legacy C++
@@ -2292,22 +2393,30 @@ def build_wall_oss_vla(
         pair_arena_policy = GraphRuntimePolicy.from_environment(graph_arena_count=5)
         if not pair_arena_policy.prepare_arenas():
             raise RuntimeError("Wall-OSS paired Vision requires five cold Graph arenas")
+    # Reduced Vision runs one camera per native forward on its four-lane owner.
+    # Its window blocks take the dense mask, which serves every grid, unless the
+    # window selector asks for per-window SDPA (16-aligned windows, so not 252x252).
+    vision_cores = _wall_component_cores(budget, WALL_OSS_VISION_COMPONENT)
+    vision_per_window = budget != 8 and rpu_env_bool("RPU_WALL_OSS_VISION_NATIVE_WINDOW_SDPA")
+    residual_kwargs = (
+        {"residual_scale": _REDUCED_RTC_RESIDUAL_SCALE} if rtc and budget != 8 else {})
     llm = action = vision = None
     try:
-        if rtc and (w8a16 or w4a16 or (fp16_transfer_mask & 2)):
+        if rtc and (w8a16 or w4a16 or (fp16_transfer_mask & 2) or budget != 8):
             quant_kwargs = (
                 {"w8a16": True} if w8a16 else
                 {"w4a16": True} if w4a16 else {}
             )
             rmsnorm_kwargs = (
                 {"rmsnorm_fixed32": True}
-                if w8a16 or (fp16_transfer_mask & 2) else {}
+                if budget == 8 and (w8a16 or (fp16_transfer_mask & 2)) else {}
             )
             llm = build_wall_oss_llm(
                 ckpt_dir, expert=0, max_seq_len=max_seq_len,
                 fp16_ckpt_dir=fp16_ckpt_dir,
                 execution_config=text_execution,
-                **quant_kwargs, **rmsnorm_kwargs, **graph_policy_options)
+                **quant_kwargs, **rmsnorm_kwargs, **residual_kwargs,
+                **graph_policy_options)
             action_quant_kwargs = (
                 {"w4a16": True} if action_w4a16_ckpt_dir is not None
                 else quant_kwargs
@@ -2351,13 +2460,15 @@ def build_wall_oss_vla(
             vision = build_wall_oss_vision(
                 vision_ckpt, window=True, w8a16=True,
                 fp16_ckpt_dir=fp16_ckpt_dir,
-                execution_config=vision_execution,
-                **rmsnorm_kwargs, **graph_policy_options)
+                execution_config=vision_execution, num_cores=vision_cores,
+                per_window_sdpa=vision_per_window,
+                **rmsnorm_kwargs, **residual_kwargs, **graph_policy_options)
         elif w8_nvfp4a16 or nvfp4_wint4_scope:
             vision = build_wall_oss_vision(
                 ckpt_dir, window=True, w8a16=True,
                 fp16_ckpt_dir=fp16_ckpt_dir,
-                execution_config=vision_execution, **graph_policy_options)
+                execution_config=vision_execution, num_cores=vision_cores,
+                per_window_sdpa=vision_per_window, **graph_policy_options)
         elif w4a16 or nvfp4a16:
             # Vision tower stays INT8 (loaded from the w8a16 ckpt) — the w4a16
             # ckpt's vision is fp16 (converter quantizes decoder only), and an
@@ -2372,7 +2483,9 @@ def build_wall_oss_vla(
                 ckpt_dir, window=True, w8a16=w8a16,
                 fp16_ckpt_dir=fp16_ckpt_dir,
                 execution_config=vision_execution,
-                rmsnorm_fixed32=bool(fp16_transfer_mask & 1), **graph_policy_options)
+                rmsnorm_fixed32=bool(fp16_transfer_mask & 1), num_cores=vision_cores,
+                per_window_sdpa=vision_per_window, **residual_kwargs,
+                **graph_policy_options)
         runtime = WallOssVLA(
             vision=vision, action=action, processor=processor,
             rope_helper=rope, normalizer=normalizer,

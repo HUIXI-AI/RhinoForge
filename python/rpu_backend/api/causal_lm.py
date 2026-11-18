@@ -162,9 +162,12 @@ class RPUModelForCausalLM:
     Use `RPUModelForCausalLM.from_pretrained(repo, dtype=torch.float16)` to load
     on CPU; call `.to('rpu')` on the returned model to perform weight swizzle +
     per-instance patches. Or pass `device='rpu'` to combine both (D-01 shortcut).
-    `quantization='w4a16'` selects TP8/G32 dense Qwen3 decoder quantization;
-    'w4a16_lm_head' also quantizes the head. Embedding and norms stay FP16.
-    The 32B recipes require the one-step device='rpu' streaming loader.
+    `quantization='w4a16'` selects G32 decoder quantization for dense Qwen3 and
+    Llama-3.2-1B; 'w4a16_lm_head' also quantizes the Qwen3 head. 'nvfp4'
+    quantizes the decoder projections of Qwen3 0.6B-14B or Llama-3.2-1B to
+    NVFP4 with an FP16 head. 'w8a16' (Llama-3.2-1B) quantizes them to
+    per-channel INT8. Embedding and norms stay FP16. The 32B W4 recipes require
+    the one-step device='rpu' streaming loader.
     """
 
     # Reserved hf_kwargs the library manages internally — passing any of these
@@ -200,15 +203,17 @@ class RPUModelForCausalLM:
             if isinstance(max_seq_len, bool) or not isinstance(max_seq_len, Integral) or max_seq_len <= 0:
                 raise ValueError("max_seq_len must be a positive integer")
             max_seq_len = int(max_seq_len)
-        if quantization not in (None, "w4a16", "w4a16_lm_head"):
+        if quantization not in (None, "w8a16", "w4a16", "w4a16_lm_head", "nvfp4"):
             raise UnsupportedModelError(
-                "quantization must be None, 'w4a16' or 'w4a16_lm_head' (dense Qwen3, G32, TP8)"
+                "quantization must be None, 'w4a16' (dense Qwen3 or Llama-3.2-1B, G32), "
+                "'w4a16_lm_head' (dense Qwen3, G32), 'w8a16' (Llama-3.2-1B) "
+                "or 'nvfp4' (dense Qwen3-0.6B to 14B or Llama-3.2-1B)"
             )
         execution_config = normalize_rpu_execution(
             rpu_execution,
             entry_point="RPUModelForCausalLM.from_pretrained",
             supported={
-                "prefill": ("chunk_size", "padding_rows", "padding_budget", "linear_acc32"),
+                "prefill": ("chunk_size", "padding_rows", "padding_budget", "linear_acc32", "linear_w8a8"),
                 "model": ("num_cores",),
             },
         )
@@ -287,8 +292,9 @@ class RPUModelForCausalLM:
         # config-derived constraints (envelope, dtype, etc.) here.
         staged_w4 = False
         if quantization is not None:
-            if arch != "Qwen3ForCausalLM":
-                raise UnsupportedModelError("on-install W4 requires a plain Qwen3 FP16 source")
+            if arch not in ("Qwen3ForCausalLM", "LlamaForCausalLM"):
+                raise UnsupportedModelError(
+                    "on-install quantization requires a plain Qwen3 or Llama-3.2-1B FP16 source")
             profile = adapter_cls.preflight_quantization(config, execution_config, quantization)
             staged_w4 = profile.num_layers == 64
             if staged_w4 and not move_to_rpu:

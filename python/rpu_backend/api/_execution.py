@@ -23,7 +23,7 @@ _COLD_BOOL_FIELDS = (
     "preload_replay_skip", "bake_merger", "fused_merger", "prefix_prep_cache",
     "prefix_prep_rpu", "prefix_no_clone", "partial_mrope", "merger_scatter",
     "shared_cache", "prefix_alias", "denoise_unroll", "linear_acc32", "gelu_erf_ultra",
-    "moe_resident_prefill",
+    "moe_resident_prefill", "qkv_w8a8", "mlp_w8a8", "linear_w8a8",
 )
 _FIELDS = ("chunk_size", "padding_rows", "padding_budget", *_COLD_BOOL_FIELDS)
 _COMPONENTS = "components"
@@ -38,7 +38,7 @@ PI05_VISION_COMPONENT = "vision_encoder"
 PI05_TEXT_COMPONENT = "language_model"
 PI05_ACTION_COMPONENT = "action_expert"
 PI05_EXECUTION_COMPONENTS = {
-    PI05_VISION_COMPONENT: {"vision": ("chunk_size", "linear_acc32")},
+    PI05_VISION_COMPONENT: {"vision": ("chunk_size", "linear_acc32", "qkv_w8a8", "mlp_w8a8")},
     PI05_TEXT_COMPONENT: {"prefill": ("chunk_size", "padding_rows", "padding_budget", "linear_acc32")},
     PI05_ACTION_COMPONENT: {"action": ("chunk_size", "linear_acc32")},
 }
@@ -452,7 +452,7 @@ _CAUSAL_DECODER_EXECUTION_SUPPORTED = {
 }
 _QWEN3_EXECUTION_SUPPORTED = {
     **_CAUSAL_DECODER_EXECUTION_SUPPORTED,
-    "prefill": ("chunk_size", "padding_rows", "padding_budget", "linear_acc32"),
+    "prefill": ("chunk_size", "padding_rows", "padding_budget", "linear_acc32", "linear_w8a8"),
     "model": ("num_cores",),
 }
 # Llama keeps its prefill fields (no linear_acc32) and adds the cold budget.
@@ -595,8 +595,29 @@ def llama_core_profile(config, num_cores):
     return profile if valid else None
 
 
+def llama_dense_quant_profile(config):
+    """The exact Llama-3.2-1B FP16 source for on-install W8A16/W4A16/NVFP4.
+
+    Same checks as the reduced-core admission, applied at every core budget.
+    """
+    profile = llama_core_profile(config, 8)
+    if profile is None:
+        raise ValueError(
+            "Llama on-install quantization requires the exact Llama-3.2-1B FP16 "
+            "decoder (16 layers, H2048/I8192, Q32/KV8/D64, vocab 128256, no "
+            "attention/MLP bias, SiLU, default or llama3 RoPE, no quantization config)")
+    return profile
+
+
+# GR00T N1.7 runs only the first 16 layers of exact Qwen3-VL-2B text
+# (select_layer 16, headless). It is the one admitted truncated text and reuses
+# the 2B template; native admission mirrors it as qwen3_vl_text_prefix_num_layers.
+GR00T_QWEN3_VL_TEXT_PREFIX_LAYERS = 16
+
+
 def qwen3_vl_text_core_profile(config, num_cores):
     """Exact dense M-RoPE text admission, separate from plain Qwen3."""
+    from dataclasses import replace
     from rpu_backend.runtime.topology import decoder_geometry_profile
 
     profile = decoder_geometry_profile(
@@ -610,13 +631,15 @@ def qwen3_vl_text_core_profile(config, num_cores):
             or getattr(config, "rope_scaling", None) or {})
     layers = getattr(config, "num_hidden_layers", None)
     layer_types = getattr(config, "layer_types", None)
+    prefix = (profile is not None and profile.hidden_size == 2048
+              and layers == GR00T_QWEN3_VL_TEXT_PREFIX_LAYERS)
     valid = (
         profile is not None and profile.qk_norm
         and profile.hidden_size in (2048, 2560, 4096, 5120)
         and (profile.hidden_size != 5120 or profile.num_layers == 64)
         and getattr(config, "model_type", None) == "qwen3_vl_text"
         and isinstance(layers, Integral) and not isinstance(layers, bool)
-        and layers == profile.num_layers
+        and (layers == profile.num_layers or prefix)
         and getattr(config, "hidden_act", None) == "silu"
         and getattr(config, "rms_norm_eps", None) == 1e-6
         and getattr(config, "attention_bias", None) is False
@@ -637,14 +660,16 @@ def qwen3_vl_text_core_profile(config, num_cores):
     if not valid and num_cores != 8:
         raise ValueError("model.num_cores=4/6 requires exact dense Qwen3-VL "
                          "2B/4B/8B/32B text semantics with interleaved M-RoPE")
-    return profile if valid else None
+    if not valid:
+        return None
+    return replace(profile, num_layers=layers) if prefix else profile
 
 
 def qwen3_vl_text_topology(config, num_cores, *, packed_w4=False):
-    """Resolve the admitted text template, shared by FP16, W8 and packed W4.
+    """Resolve the admitted text template, shared by FP16, W8, packed W4 and NVFP4.
 
-    Packed W4 keeps the six-lane MLP; its installer pads the physical width
-    with the shared 32xTP physical MLP alignment rather than using MLP4.
+    Packed W4 and NVFP4 keep the six-lane MLP; their installers pad the physical
+    width with 32xTP (signed W4) or 64xTP (NVFP4) rather than using MLP4.
     """
     from rpu_backend.runtime.topology import resolve_decoder_topology
 

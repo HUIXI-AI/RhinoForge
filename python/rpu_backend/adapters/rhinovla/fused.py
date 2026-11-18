@@ -82,6 +82,10 @@ def _aligned_rhino_action_prefix(prefix_mask, *, prefix_len, suffix_len, capacit
     return position, torch.nn.functional.pad(prefix_mask, (0, position - prefix_len), value=0)
 
 
+# Native selectors whose owners exist for eight cores only.
+RHINO_REDUCED_NATIVE_OFF = ("packed_qkv",)
+
+
 @dataclasses.dataclass(frozen=True)
 class _RhinoVLANativeColdConfig:
     """One immutable Python-owned selector snapshot for a native handle."""
@@ -100,7 +104,7 @@ class _RhinoVLANativeColdConfig:
     aligned_kv: bool = False
 
     @classmethod
-    def from_env(cls) -> "_RhinoVLANativeColdConfig":
+    def from_env(cls, *, num_cores=8) -> "_RhinoVLANativeColdConfig":
         config = cls(
             denoise_static_context_cache=rpu_env_bool(
                 "RPU_RHINOVLA_DENOISE_STATIC_CONTEXT_CACHE"
@@ -125,6 +129,10 @@ class _RhinoVLANativeColdConfig:
             packed_qkv=rpu_env_bool("RPU_RHINOVLA_PACKED_QKV"),
             aligned_kv=rpu_env_bool("RPU_RHINOVLA_ALIGNED_KV"),
         )
+        if num_cores != 8:
+            # These owners exist for eight cores only; one TOML serves every
+            # budget, so a reduced budget turns them off here.
+            config = dataclasses.replace(config, **dict.fromkeys(RHINO_REDUCED_NATIVE_OFF, False))
         if config.expert_fusions or config.adarms_resident:
             if not config.precompute_adarms or config.skip_adarms_gemv:
                 raise ValueError("RhinoVLA expert transfer requires PRECOMPUTE_ADARMS and rejects SKIP_ADARMS_GEMV")
@@ -275,6 +283,7 @@ _RHINO_RUNTIME_INSTALL_ATTRS = (
     "_fmb_execution_generation",
     "_rpu_native_cold_config",
     "_rpu_full_w8a16",
+    "_rpu_execution_topology",
     "_rpu_last_execution_plan",
     "_rpu_handle",
     "_rpu_handle_finalizer",
@@ -517,7 +526,7 @@ def _validate_rhino_prefix_mask(
 
 
 def patch_rhino_vla_for_rpu(expert, *, prefix_len, suffix_len, max_seq_len=2048,
-                            cpu_rotary_emb=None, full_w8a16=False):
+                            cpu_rotary_emb=None, full_w8a16=False, num_cores=8):
     """Patch a RhinoVLA action expert transactionally onto its fused C++ op.
 
     Weight/M-RoPE/KV/GraphCache state is prepared before native handle creation.
@@ -531,6 +540,7 @@ def patch_rhino_vla_for_rpu(expert, *, prefix_len, suffix_len, max_seq_len=2048,
         suffix_len: suffix token count = action_horizon + (1 if use_state_token).
         max_seq_len: RPUCache allocation length.
         cpu_rotary_emb: a CPU clone of the Qwen3-VL rotary (cloned BEFORE .to('rpu')).
+        num_cores: execution budget; must match the conversion's.
 
     Returns:
         int handle (also stored as expert._rpu_handle).
@@ -565,7 +575,9 @@ def patch_rhino_vla_for_rpu(expert, *, prefix_len, suffix_len, max_seq_len=2048,
     if len(expert.layers) == 0:
         raise RuntimeError("patch_rhino_vla_for_rpu: expert has no layers")
 
-    native_cold = _RhinoVLANativeColdConfig.from_env()
+    if getattr(expert, "_rpu_num_cores", 8) != num_cores:
+        raise ValueError("patch_rhino_vla_for_rpu: the expert was converted for a different core budget")
+    native_cold = _RhinoVLANativeColdConfig.from_env(num_cores=num_cores)
 
     expert_state = vars(expert)
     install_snapshot = {
@@ -584,7 +596,9 @@ def patch_rhino_vla_for_rpu(expert, *, prefix_len, suffix_len, max_seq_len=2048,
         _require_execution_process_safe()
 
     import rpu_backend as _rb
-    graph_cache = _rb.graph.GraphCache()
+    graph_cache = _rb.graph.GraphCache(**({} if num_cores == 8 else {
+        "runtime_policy": _rb.graph.GraphRuntimePolicy.from_environment(
+            execution_core_count=num_cores)}))
     _GraphSignature = _rb.graph.GraphSignature
 
     # -- gather per-layer weight lists --
@@ -612,7 +626,8 @@ def patch_rhino_vla_for_rpu(expert, *, prefix_len, suffix_len, max_seq_len=2048,
     cos_cached, sin_cached = _precompute_mrope_cos_sin(
         cpu_rotary, 0, max_seq_len
     )
-    kv_cache = _create_kv_cache(expert.config, max_seq_len)
+    kv_cache = _create_kv_cache(expert.config, max_seq_len,
+                                attn_tp=None if num_cores == 8 else 4)
     print(f"[Rhino] M-RoPE precomputed: cos/sin [{max_seq_len}, {cos_cached.shape[-1]}], "
           f"KV cache max_seq={max_seq_len}")
 
@@ -928,6 +943,9 @@ def patch_rhino_vla_for_rpu(expert, *, prefix_len, suffix_len, max_seq_len=2048,
         label="RhinoVLA action", handle_name="_rpu_handle")
     handle_finalizer = resource.finalizer
     try:
+        if num_cores != 8:
+            # The budget precedes the runtime config and weights it validates.
+            torch.ops.rpu.rhino_vla_set_execution_core_count(handle, num_cores)
         torch.ops.rpu.rhino_vla_set_runtime_config(
             handle,
             native_cold.denoise_static_context_cache,
@@ -950,6 +968,10 @@ def patch_rhino_vla_for_rpu(expert, *, prefix_len, suffix_len, max_seq_len=2048,
             torch.ops.rpu.rhino_vla_set_weights_w8a16(handle, *set_weights_args, *scale_lists)
         else:
             torch.ops.rpu.rhino_vla_set_weights(handle, *set_weights_args)
+        topology = (num_cores, 8, 8, 8) if num_cores == 8 else (num_cores, 4, num_cores, 8)
+        if (num_cores != 8 and tuple(torch.ops.rpu.rhino_vla_get_execution_topology(handle))
+                != topology):
+            raise RuntimeError("RhinoVLA native expert topology does not match the core budget")
         torch.ops.rpu.rhino_vla_set_chunk_envelope(handle, int(kv_cache.max_seq_len), 0)
         torch.ops.rpu.rhino_vla_set_rope_position(handle, int(prefix_len))
 
@@ -965,6 +987,7 @@ def patch_rhino_vla_for_rpu(expert, *, prefix_len, suffix_len, max_seq_len=2048,
         expert._fmb_execution_generation = 0
         expert._rpu_native_cold_config = native_cold
         expert._rpu_full_w8a16 = bool(full_w8a16)
+        expert._rpu_execution_topology = topology
         expert._rpu_handle = handle
         expert._rpu_handle_finalizer = handle_finalizer
         expert._rpu_retirement_state = resource

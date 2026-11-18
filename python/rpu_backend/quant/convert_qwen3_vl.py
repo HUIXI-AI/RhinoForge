@@ -25,6 +25,16 @@ from safetensors.torch import load_file, save_file
 from ._common import quantize_linear_per_channel
 from .convert_qwen3 import _checkpoint_layout, _copy_sidecar_files
 from .int4_pgrp_pack import quantize_int4_group_wise
+from .precision_recipes import produced, write_record
+
+FAMILY = "qwen3_vl"
+# Registered precision recipes this converter produces. Both W4 recipes take bits=4:
+# an AWQ source keeps its AWQ text projections, a dense source is RTN G32.
+RECIPES = {
+    "w8a16_text_head_vision": {"bits": 8},
+    "w4a16_text_awq_head_rtn_g32_vision_w8a16": {"bits": 4},
+    "w4a16_text_head_rtn_g32_vision_w8a16": {"bits": 4},
+}
 
 
 PROFILE = "qwen3_vl_4b_w8a16_runtime_align_v1"
@@ -228,7 +238,15 @@ def _awq_checkpoint_schema(config):
     return projections, expected
 
 
-def _convert_awq_checkpoint(src, dst, config, *, bits):
+def produced_recipe(bits: int, *, awq_source: bool = False) -> str | None:
+    """The registered recipe BITS produce from an AWQ or a dense source."""
+    if bits == 4:
+        return ("w4a16_text_awq_head_rtn_g32_vision_w8a16" if awq_source
+                else "w4a16_text_head_rtn_g32_vision_w8a16")
+    return "w8a16_text_head_vision" if bits == 8 and not awq_source else None
+
+
+def _convert_awq_checkpoint(src, dst, config, *, bits, recipe=None):
     """Preserve calibrated Text7 and every AWQ floating constant; quantize only head."""
     if not matches_runtime_geometry(config):
         raise ValueError("AWQ conversion requires exact Qwen3-VL runtime geometry")
@@ -259,8 +277,8 @@ def _convert_awq_checkpoint(src, dst, config, *, bits):
     tmp = dst.with_name(f".{dst.name}.tmp-{os.getpid()}")
     if tmp.exists():
         raise FileExistsError(f"temporary output already exists: {tmp}")
-    stats = {"profile": quant_config["profile"], "source_quantization": AWQ_SOURCE_QUANTIZATION,
-             "recipe": AWQ_RUNTIME_RECIPE, "n_quantized": 0,
+    stats = {"profile": quant_config["profile"], "precision_recipe": recipe,
+             "source_quantization": AWQ_SOURCE_QUANTIZATION, "recipe": AWQ_RUNTIME_RECIPE, "n_quantized": 0,
              "n_preserved_text_projections": 0, "bytes_out": 0, "n_shards": 0}
     output_map = {}
     projection_bases = {name[:-7]: shape for name, shape in projections.items()}
@@ -315,6 +333,7 @@ def _convert_awq_checkpoint(src, dst, config, *, bits):
         config["quant_config"] = quant_config
         (tmp / "config.json").write_text(json.dumps(config, indent=2) + "\n")
         _copy_sidecar_files(src, tmp, set(shards))
+        write_record(tmp, FAMILY, recipe)
         tmp.rename(dst)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -322,12 +341,16 @@ def _convert_awq_checkpoint(src, dst, config, *, bits):
     return stats
 
 
-def convert_checkpoint(src: str | Path, dst: str | Path, *, bits: int = 8) -> dict:
+def convert_checkpoint(src: str | Path, dst: str | Path, *, bits: int = 8,
+                       recipe: str | None = None) -> dict:
+    """RECIPE, when given, must be the registered recipe BITS produce from this source."""
     src, dst = Path(src).expanduser().resolve(), Path(dst).expanduser().resolve()
     config = json.loads((src / "config.json").read_text())
     from .load_qwen3_vl_awq import is_qwen3_vl_awq_config
-    if is_qwen3_vl_awq_config(config, allow_padded_8b=True):
-        return _convert_awq_checkpoint(src, dst, config, bits=bits)
+    awq_source = is_qwen3_vl_awq_config(config, allow_padded_8b=True)
+    recipe = produced(FAMILY, produced_recipe(bits, awq_source=awq_source), recipe)
+    if awq_source:
+        return _convert_awq_checkpoint(src, dst, config, bits=bits, recipe=recipe)
     text = config.get("text_config", {})
     # The top-level ImageText flag controls the head. Large official sources
     # omit TextConfig.tie_word_embeddings. That text-only field cannot permit
@@ -376,7 +399,8 @@ def convert_checkpoint(src: str | Path, dst: str | Path, *, bits: int = 8) -> di
     tmp = dst.with_name(f".{dst.name}.tmp-{os.getpid()}")
     if tmp.exists():
         raise FileExistsError(f"temporary output already exists: {tmp}")
-    stats = {"profile": quant_config["profile"], "n_quantized": 0, "bytes_out": 0, "n_shards": len(shards)}
+    stats = {"profile": quant_config["profile"], "precision_recipe": recipe, "n_quantized": 0, "bytes_out": 0,
+             "n_shards": len(shards)}
     output_map = {}
     try:
         tmp.mkdir(parents=True)
@@ -421,6 +445,7 @@ def convert_checkpoint(src: str | Path, dst: str | Path, *, bits: int = 8) -> di
         config["quant_config"] = quant_config
         (tmp / "config.json").write_text(json.dumps(config, indent=2) + "\n")
         _copy_sidecar_files(src, tmp, set(shards))
+        write_record(tmp, FAMILY, recipe)
         tmp.rename(dst)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -428,13 +453,18 @@ def convert_checkpoint(src: str | Path, dst: str | Path, *, bits: int = 8) -> di
     return stats
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--src", required=True)
     parser.add_argument("--dst", required=True)
-    parser.add_argument("--bits", type=int, choices=(8, 4), default=8)
-    args = parser.parse_args()
-    print(json.dumps(convert_checkpoint(args.src, args.dst, bits=args.bits), indent=2))
+    parser.add_argument("--bits", type=int, choices=(8, 4), help="8 (default) or 4")
+    parser.add_argument("--recipe", choices=sorted(RECIPES),
+                        help="registered precision recipe; sets --bits and requires its AWQ or dense source")
+    args = parser.parse_args(argv)
+    if args.recipe is not None and args.bits is not None:
+        parser.error("--recipe sets --bits; drop --bits")
+    bits = RECIPES[args.recipe]["bits"] if args.recipe is not None else 8 if args.bits is None else args.bits
+    print(json.dumps(convert_checkpoint(args.src, args.dst, bits=bits, recipe=args.recipe), indent=2))
 
 
 if __name__ == "__main__":

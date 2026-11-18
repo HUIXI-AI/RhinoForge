@@ -135,6 +135,8 @@ PLANNER_SENSITIVE_ATTRS: frozenset[str] = frozenset({
     "_rpu_w8a16_staged_plan",
     # Physical geometry and layout identity.
     "_rpu_attn_tp",
+    "_rpu_execution_topology",
+    "_rpu_num_cores",
     "_rpu_decoder_deepstack_hash",
     "_rpu_decoder_hidden_size",
     "_rpu_decoder_num_layers",

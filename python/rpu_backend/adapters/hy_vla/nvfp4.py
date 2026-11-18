@@ -30,11 +30,14 @@ def quantize_expert_nvfp4_cpu(
     to the caller and precedes quantization. Returned bytes use the canonical
     generic NVFP4 physical ABI and must not undergo another weight transform.
     """
-    shapes = {(2048, 1024), (1024, 1024)} if partition == 1 else {(1024, 2048)}
+    # TP8 duplicates K/V to 1024 rows; the reduced four-core child keeps KV4.
+    kv_rows = 1024 if num_cores == 8 else 512
+    shapes = {(2048, 1024), (kv_rows, 1024)} if partition == 1 else {(1024, 2048)}
     if (not isinstance(weight, torch.Tensor) or weight.device.type != "cpu" or
             not weight.is_floating_point() or tuple(weight.shape) not in shapes or
-            partition not in (0, 1) or num_cores != 8):
-        raise ValueError("HyVLA NVFP4 requires an exact CPU Expert TP8 projection")
+            partition not in (0, 1) or num_cores not in (4, 8)):
+        raise ValueError(
+            "HyVLA NVFP4 requires an exact CPU Expert TP8 or four-core projection")
     codes, block_scale, tensor_scale = quantize_nvfp4(weight.half().contiguous())
     n, k = weight.shape
     packed = swizzle_pack_nvfp4(codes, partition, num_cores).reshape(n, k // 2)

@@ -39,6 +39,7 @@ from .execution import (
     FORMER_COMPONENT,
     RGB_COMPONENT,
     component_execution,
+    internvla_core_count,
     plan_navdp_component,
     publish_execution_receipt,
     resolve_internvla_execution,
@@ -197,8 +198,15 @@ class RGBDTowerRPU:
         self._fmb_execution_component_id = component_id
         self._fmb_execution_generation = 0
         self.nh, self.hd, self.hidden, self.inter, self.eps = nh, hd, hidden, inter, eps
-        self.tp = NUM_CORES                  # padded heads = 8
-        self._gc = rpu_backend.graph.GraphCache()
+        # Eight and four cores run 8 padded heads; six cores run the 6 heads unpadded.
+        self.tp = internvla_core_count(self._rpu_execution)
+        self.heads = 6 if self.tp == 6 else 8
+        if standalone_compatibility and self.tp != NUM_CORES:
+            raise ValueError("standalone DINOv2-S compatibility has only its eight-core owner")
+        self._gc = (rpu_backend.graph.GraphCache() if self.tp == NUM_CORES else
+                    rpu_backend.graph.GraphCache(
+                        runtime_policy=rpu_backend.graph.GraphRuntimePolicy.from_environment(
+                            execution_core_count=self.tp)))
         self._position_seq_len = None
         self._pos_embed_224 = None
         if getattr(self.tower, "num_register_tokens", 0) == 0:
@@ -269,9 +277,9 @@ class RGBDTowerRPU:
             if not self._final_norm_on_rpu:
                 raise RuntimeError("DINO output MLP requires final norm on device")
             keepalive = [
-                _hr(tp_col_swizzle_mc_weight(first_weight.half(), NUM_CORES)),
+                _hr(tp_col_swizzle_mc_weight(first_weight.half(), self.tp)),
                 _hr(first_bias),
-                _hr(tp_row_swizzle_mc_weight(second_weight.half(), NUM_CORES)),
+                _hr(tp_row_swizzle_mc_weight(second_weight.half(), self.tp)),
                 _hr(second_bias),
             ]
             self._native_keepalive.append(keepalive)
@@ -285,7 +293,7 @@ class RGBDTowerRPU:
 
     def _install(self):
         blocks = list(self.tower.blocks)
-        H, hd, nh, tgt = self.hidden, self.hd, self.nh, self.tp
+        H, hd, nh, tgt = self.hidden, self.hd, self.nh, self.heads
         qw, kw, vw, ow, upw, dnw = [], [], [], [], [], []
         ln1w, ln1b, ln2w, ln2b = [], [], [], []
         qb, vb, ob, upb, dnb, ga, gm = [], [], [], [], [], [], []
@@ -312,9 +320,18 @@ class RGBDTowerRPU:
             ga.append(_hr(blk.ls1.gamma.data)); gm.append(_hr(blk.ls2.gamma.data))
         self._native_keepalive.append((qw, kw, vw, ow, upw, dnw, ln1w, ln1b, ln2w, ln2b,
                                        qb, vb, ob, upb, dnb, ga, gm))
+        if self.tp != NUM_CORES:
+            # Cold topology precedes weights; eight-core installs keep the old calls.
+            torch.ops.rpu.dinov3_vision_set_execution_core_count(self.handle, self.tp)
         torch.ops.rpu.dinov3_vision_set_weights(
             self.handle, qw, kw, vw, ow, upw, dnw, ln1w, ln1b, ln2w, ln2b,
             qb, vb, ob, upb, dnb, ga, gm, tgt, hd, H, self.inter, self.eps)
+        if self.tp != NUM_CORES:
+            actual = tuple(torch.ops.rpu.dinov3_vision_get_execution_topology(self.handle))
+            expected = (self.tp, self.tp, self.tp, NUM_CORES, tgt, self.inter)
+            if actual != expected:
+                raise RuntimeError(
+                    f"InternVLA DINOv2-S native topology mismatch: {actual} != {expected}")
         # identity RoPE (cos=1, sin=0) → rope_2d is a no-op; pos-embed added on CPU instead
         mx = 16
         cos = torch.ones(mx, hd // 4, dtype=torch.float16).to("rpu").contiguous()
@@ -331,7 +348,7 @@ class RGBDTowerRPU:
             max_seq_len=512,
             num_kv_heads=tgt,
             head_dim=hd,
-            attn_tp=min(NUM_CORES, tgt),
+            attn_tp=min(self.tp, tgt),
         )
         self._native_keepalive.append(self.cache)
 
@@ -486,8 +503,8 @@ class RGBDTowerRPU:
         }
 
 
-def _col(w): return _hr(tp_col_swizzle_mc_weight(w.to(torch.float16), NUM_CORES))
-def _row(w): return _hr(tp_row_swizzle_mc_weight(w.to(torch.float16), NUM_CORES))
+def _col(w, tp=NUM_CORES): return _hr(tp_col_swizzle_mc_weight(w.to(torch.float16), tp))
+def _row(w, tp=NUM_CORES): return _hr(tp_row_swizzle_mc_weight(w.to(torch.float16), tp))
 
 
 class FormerRPU(nn.Module):
@@ -516,6 +533,9 @@ class FormerRPU(nn.Module):
         )
         self._fmb_execution_component_id = FORMER_COMPONENT
         self._fmb_execution_generation = 0
+        # Reduced budgets run the Former on four cores (component_execution
+        # admits only 4 or 8 here): 2 heads, 96 q/k/v and 512 FFN channels each.
+        tp = self.tp = internvla_core_count(self._rpu_execution)
         from safetensors.torch import load_file
         sd = load_file(str(checkpoint)); P = "rgbd_encoder.former_net.layers"
         actual_layers = {
@@ -570,18 +590,22 @@ class FormerRPU(nn.Module):
             p = f"{P}.{i}"
             siw, sib = gg(f"{p}.self_attn.in_proj_weight"), gg(f"{p}.self_attn.in_proj_bias")
             ciw, cib = gg(f"{p}.multihead_attn.in_proj_weight"), gg(f"{p}.multihead_attn.in_proj_bias")
-            L["sq_w"].append(_col(siw[0:H])); L["sk_w"].append(_col(siw[H:2*H])); L["sv_w"].append(_col(siw[2*H:3*H]))
+            L["sq_w"].append(_col(siw[0:H], tp)); L["sk_w"].append(_col(siw[H:2*H], tp)); L["sv_w"].append(_col(siw[2*H:3*H], tp))
             L["sq_b"].append(_hr(sib[0:H])); L["sk_b"].append(_hr(sib[H:2*H])); L["sv_b"].append(_hr(sib[2*H:3*H]))
-            L["so_w"].append(_row(gg(f"{p}.self_attn.out_proj.weight"))); L["so_b"].append(_hr(gg(f"{p}.self_attn.out_proj.bias")))
-            L["cq_w"].append(_col(ciw[0:H])); L["ck_w"].append(_col(ciw[H:2*H])); L["cv_w"].append(_col(ciw[2*H:3*H]))
+            L["so_w"].append(_row(gg(f"{p}.self_attn.out_proj.weight"), tp)); L["so_b"].append(_hr(gg(f"{p}.self_attn.out_proj.bias")))
+            L["cq_w"].append(_col(ciw[0:H], tp)); L["ck_w"].append(_col(ciw[H:2*H], tp)); L["cv_w"].append(_col(ciw[2*H:3*H], tp))
             L["cq_b"].append(_hr(cib[0:H])); L["ck_b"].append(_hr(cib[H:2*H])); L["cv_b"].append(_hr(cib[2*H:3*H]))
-            L["co_w"].append(_row(gg(f"{p}.multihead_attn.out_proj.weight"))); L["co_b"].append(_hr(gg(f"{p}.multihead_attn.out_proj.bias")))
-            L["ff1_w"].append(_col(gg(f"{p}.linear1.weight"))); L["ff1_b"].append(_hr(gg(f"{p}.linear1.bias")))
-            L["ff2_w"].append(_row(gg(f"{p}.linear2.weight"))); L["ff2_b"].append(_hr(gg(f"{p}.linear2.bias")))
+            L["co_w"].append(_row(gg(f"{p}.multihead_attn.out_proj.weight"), tp)); L["co_b"].append(_hr(gg(f"{p}.multihead_attn.out_proj.bias")))
+            L["ff1_w"].append(_col(gg(f"{p}.linear1.weight"), tp)); L["ff1_b"].append(_hr(gg(f"{p}.linear1.bias")))
+            L["ff2_w"].append(_row(gg(f"{p}.linear2.weight"), tp)); L["ff2_b"].append(_hr(gg(f"{p}.linear2.bias")))
             for n, src in (("n1", "norm1"), ("n2", "norm2"), ("n3", "norm3")):
                 L[f"{n}_w"].append(_hr(gg(f"{p}.{src}.weight"))); L[f"{n}_b"].append(_hr(gg(f"{p}.{src}.bias")))
-        self.cache = RPUCache(num_layers=2, batch_size=1, max_seq_len=1152, num_kv_heads=self.NH, head_dim=self.HD)
-        self.gc = rpu_backend.graph.GraphCache()
+        self.cache = RPUCache(num_layers=2, batch_size=1, max_seq_len=1152, num_kv_heads=self.NH, head_dim=self.HD,
+                              attn_tp=tp)
+        self.gc = (rpu_backend.graph.GraphCache() if tp == NUM_CORES else
+                   rpu_backend.graph.GraphCache(
+                       runtime_policy=rpu_backend.graph.GraphRuntimePolicy.from_environment(
+                           execution_core_count=tp)))
         self._input_cache = {}
 
         self.handle = torch.ops.rpu.navdp_create(True, False)
@@ -592,12 +616,20 @@ class FormerRPU(nn.Module):
         self._handle_finalizer = self._native_resource.finalizer
         try:
             torch.ops.rpu.navdp_set_former_mode(self.handle, True)
+            if tp != NUM_CORES:
+                torch.ops.rpu.navdp_set_execution_core_count(self.handle, tp)
             torch.ops.rpu.navdp_set_weights(self.handle,
                 L["sq_w"],L["sk_w"],L["sv_w"],L["so_w"],L["sq_b"],L["sk_b"],L["sv_b"],L["so_b"],
                 L["cq_w"],L["ck_w"],L["cv_w"],L["co_w"],L["cq_b"],L["ck_b"],L["cv_b"],L["co_b"],
                 L["ff1_w"],L["ff1_b"],L["ff2_w"],L["ff2_b"],
                 L["n1_w"],L["n1_b"],L["n2_w"],L["n2_b"],L["n3_w"],L["n3_b"],
                 self.NH, self.HD, self.H, self.FF, self.ML, self.NQ, 3, 1e-5)
+            if tp != NUM_CORES:
+                topology = tuple(torch.ops.rpu.navdp_get_execution_topology(self.handle))
+                if topology != (tp, tp, tp, NUM_CORES, self.NH, self.FF):
+                    raise RuntimeError(
+                        f"InternVLA RGBD Former native topology {topology} does not "
+                        f"match the {tp}-core install")
             torch.ops.rpu.navdp_set_chunk_envelope(self.handle, int(self.cache.max_seq_len), 0)
         except BaseException as error:
             self._native_resource.cleanup_failure(error, self)

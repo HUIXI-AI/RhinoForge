@@ -667,7 +667,7 @@ def pack_shared_gate_up(gate: torch.Tensor, up: torch.Tensor, *,
 
 def build_expert_moe(
     gw, *, max_seq: int, rope_theta: float, runtime_config,
-    geom=None, on_handle_created=None
+    geom=None, on_handle_created=None, num_cores: int = 8
 ):
     """Build the LingBot2 sparse-MoE action expert -> (handle, keep).
 
@@ -683,8 +683,16 @@ def build_expert_moe(
     `on_handle_created`, when provided by the transactional runtime builder, is called
     immediately after native create and before any fallible setter. This publishes partial
     ownership as ``(handle, keep)`` so a failed rollback retains its tensors too.
+
+    `num_cores` is 8, or 4 for the action-expert child of a reduced LingBot2
+    root: attention and every MLP owner then swizzle over four lanes (I512 and
+    the padded shared I768 do not split over six), the eight-core joint shared
+    Gate/Up stays off, and the native handle is created for four cores.
     """
     from rpu_backend.runtime.weights import tp_col_swizzle_mc_weight, tp_row_swizzle_mc_weight
+
+    if num_cores not in (4, 8) or isinstance(num_cores, bool):
+        raise ValueError(f"LingBot2 action expert admits 8 or 4 cores, got {num_cores!r}")
 
     # Per-checkpoint geometry → shadow the module defaults as locals (function body unchanged).
     _g = geom if geom is not None else _default_geom()
@@ -694,6 +702,8 @@ def build_expert_moe(
     SHARED_INTER = _g["SHARED_INTER"]; SHARED_INTER_PAD = _g["SHARED_INTER_PAD"]
     ROUTED_SCALING = _g["ROUTED_SCALING"]; N_ACTION = _g["N_ACTION"]
     ATTN_TP = _g["ATTN_TP"]; MLP_CORES = _g["MLP_CORES"]; ROUTER_CORES = _g["ROUTER_CORES"]
+    if num_cores != 8:
+        ATTN_TP = MLP_CORES = num_cores
     sparse_experts_requested = getattr(runtime_config, "sparse_experts", False)
     joint_shared_requested = (sparse_experts_requested and MLP_CORES == 8 and
                               EXP_HID == SHARED_INTER_PAD == 768 and
@@ -844,6 +854,7 @@ def build_expert_moe(
         runtime_config.fp16_top4,
         runtime_config.routed_only,
         runtime_config.down_acc16,
+        **({} if num_cores == 8 else {"num_cores": num_cores}),
     )
     if on_handle_created is not None:
         on_handle_created(handle, keep)

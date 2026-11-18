@@ -449,18 +449,21 @@ class Qwen3TTSModel:
         predictor.generate = types.MethodType(timed_predictor, predictor)
         self._restore_talker_generate = (talker, talker.generate)
         talker.generate = self._generate_talker
-        from rpu_backend.adapters.qwen3_tts.codec import install_codec_convolutions
+        from rpu_backend.adapters.qwen3_tts.codec import (
+            install_codec_activations, install_codec_convolutions,
+        )
 
         decoder = self._wrapper.model.speech_tokenizer.model.decoder
         install_codec_convolutions(decoder, self._restore)
+        install_codec_activations(decoder, self._restore)
         from rpu_backend.adapters.qwen3_tts.codec_transformer import install_codec_transformer
 
         install_codec_transformer(self, decoder.pre_transformer)
         if self._codec_convolutions["backend"] == "rpu":
-            from rpu_backend.adapters.qwen3_tts.codec import install_rpu_residual_convolutions
+            from rpu_backend.adapters.qwen3_tts.codec import install_rpu_convolutions
 
-            install_rpu_residual_convolutions(decoder, self._restore, self._codec_convolutions,
-                                            num_cores=self._num_cores)
+            install_rpu_convolutions(decoder, self._restore, self._codec_convolutions,
+                                     num_cores=self._num_cores)
         # Outermost codec wrap: the whole code-to-waveform decode, including the
         # transformer frontend and every convolution the installs above replaced.
         decode = decoder.forward
@@ -611,7 +614,7 @@ class Qwen3TTSModel:
             codec_rpu = "codec_transformer" in self._components
             device = self._components["codec_transformer"].get("last_device", "rpu") if codec_rpu else "cpu"
             result["codec_frontend"] = {"device": device,
-                "fallback_reason": (None if device == "rpu" else "sequence exceeds 63 device codec frames")
+                "fallback_reason": (None if device == "rpu" else "native codec frontend unavailable")
                     if codec_rpu else "native lacks explicit TTS codec mode"}
             result["codec_convolutions"] = dict(self._codec_convolutions)
             for name, part in self._components.items():

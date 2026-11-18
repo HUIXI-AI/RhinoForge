@@ -244,18 +244,29 @@ def materialize_staged_qwen3_w4a16_for_rpu(model, *, quantization: str,
         for name in plan.nondecoder_tensor_names:
             install(name)
             if name == "lm_head.weight":
+                from rpu_backend.runtime.topology import decoder_lm_head_vocab_size
+
                 head = model.lm_head
+                head_w = head.weight.detach()
+                padded_vocab = decoder_lm_head_vocab_size(
+                    int(head_w.shape[0]), topology.lm_head_tp)
+                if padded_vocab != int(head_w.shape[0]):
+                    padded = head_w.new_zeros((padded_vocab, int(head_w.shape[1])))
+                    padded[:head_w.shape[0]].copy_(head_w)
+                    head_w = padded
                 if quantization == "w4a16_lm_head":
                     weight, scale = quantize_pack_int4_pgrp_col_bounded(
-                        head.weight.detach(), num_cores=topology.lm_head_tp)
+                        head_w, num_cores=topology.lm_head_tp)
                     head.weight = nn.Parameter(weight, requires_grad=False)
                     head.register_buffer("weight_scale", scale, persistent=False)
                     del weight, scale
                 else:
                     head.weight = nn.Parameter(
-                        transform_linear_weight(head.weight.detach(), 1,
+                        transform_linear_weight(head_w, 1,
                                                 num_cores=topology.lm_head_tp),
                         requires_grad=False)
+                del head_w
+                head.out_features = padded_vocab
                 head._rpu_linear_partition = 1
                 head._rpu_linear_num_cores = topology.lm_head_tp
                 head.to("rpu")

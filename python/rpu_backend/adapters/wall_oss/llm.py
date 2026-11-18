@@ -35,14 +35,16 @@ from safetensors import safe_open
 
 import rpu_backend
 from rpu_backend.runtime import rpu_env_bool
-from rpu_backend.adapters.wall_oss._sorting import sorting_config_from_env
+from rpu_backend.adapters.wall_oss._sorting import WallSortingConfig, sorting_config_from_env
 from rpu_backend.runtime.execution_planner import (
     GRAPH_COMPOSITE_CHILD,
     GRAPH_MODES,
 )
 from rpu_backend.runtime.rope_partial import build_chunked_mrope_cos_sin
 from rpu_backend.api.cache import RPUCache
+from rpu_backend.runtime.topology import decoder_mlp_intermediate_size
 from rpu_backend.runtime.weights import (
+    pad_decoder_mlp_projection,
     tp_col_swizzle_mc_weight,
     tp_row_swizzle_mc_weight,
 )
@@ -63,12 +65,24 @@ from rpu_backend.quant.nvfp4_pack import (
 # + the C++ attention phase all run at this tensor-parallel factor; MLP stays 8.
 _ATTN_TP = 2
 _MLP_CORES = 8
+# model.num_cores 4/6: both experts run the native four-lane attention template
+# (one replicated KV head per lane) and the text MLP follows the budget.
+_REDUCED_ATTN_TP = 4
 _PREFILL_CHUNK_SIZE_CAP_SAFE = 256
 _PREFILL_CHUNK_SIZE_CAP_TP8_PAD16 = 384
+# Four-lane attention with a padded prefix: the native planner prefers the
+# fewest chunks, so P640 runs as 2x320 wherever C320 fits SPM (256x2+128
+# under the old 256 ceiling); P672 keeps 3x224, as no two-chunk shape is legal.
+_PREFILL_CHUNK_SIZE_CAP_REDUCED_PAD16 = 320
 _PREFILL_CHUNK_POLICY_VERSION = 4
 _FMB_GRAPH_COMPOSITE_CHILD = GRAPH_MODES.index(GRAPH_COMPOSITE_CHILD) + 1
 _RMSNORM_CAP_BASE = 1
 _RMSNORM_CAP_FIXED32 = 1 | 4
+# Reduced-core RTC keeps the Vision and expert-0 residual streams inside FP16 by
+# folding 1/4 into every write to them (the eight-core path keeps BF16 boundaries
+# through eight-lane kernels instead). 1 disables the fold.
+_RESIDUAL_SCALES = (1, 4)
+_FP16_MIN_NORMAL = 2.0 ** -14
 
 
 def _kvinsert_pad16_enabled() -> bool:
@@ -83,8 +97,11 @@ def _prefill_staged_mlp_enabled() -> bool:
     return rpu_env_bool("RPU_WALL_OSS_PREFILL_STAGED_MLP")
 
 
-def _eff_attn_tp(nkv_real: int) -> int:
+def _eff_attn_tp(nkv_real: int, num_cores: int = 8) -> int:
     """Effective attention tensor-parallel factor (= number of attention cores).
+
+    Below eight execution cores this is always the four-lane template; the
+    eight-core ``RPU_WALL_OSS_ATTN_TP8`` layout must be off.
 
     Default = ``nkv_real`` (the historical ``attn_tp=min(8,nkv)`` path → 2 cores for
     Wall-OSS). With ``RPU_WALL_OSS_ATTN_TP8=1`` it returns 8: the K/V heads are
@@ -102,6 +119,15 @@ def _eff_attn_tp(nkv_real: int) -> int:
             f"num_key_value_heads must be a positive integer, got {nkv_real!r}"
         )
     nkv_real = int(nkv_real)
+    if num_cores != 8:
+        if rpu_env_bool("RPU_WALL_OSS_ATTN_TP8"):
+            raise ValueError(
+                f"RPU_WALL_OSS_ATTN_TP8 is an eight-core layout; "
+                f"model.num_cores={num_cores} requires it off")
+        if _REDUCED_ATTN_TP % nkv_real != 0:
+            raise ValueError(
+                f"reduced-core Wall attention needs 4 % nkv({nkv_real}) == 0")
+        return _REDUCED_ATTN_TP
     if not rpu_env_bool("RPU_WALL_OSS_ATTN_TP8"):
         return nkv_real
     if _MLP_CORES % nkv_real != 0:
@@ -115,11 +141,18 @@ def _prefill_chunk_size_cap(attn_tp: int) -> int:
     """Return the build-time auto-planner ceiling for text prefill.
 
     The 384-token layout is within the measured SPM envelope only for TP8, and
-    padding keeps the equal-two long-prefix plan legal. Keep the established
-    256-token ceiling for TP2 or an explicitly unpadded prefix.
+    padding keeps the equal-two long-prefix plan legal. The reduced-core
+    four-lane layout raises the ceiling to 320 without equal-two: it is only a
+    ceiling, and the native domain still drops any chunk that misses SPM (the
+    four-core C320 layout needs about 7.45 MB of temporaries). Keep the
+    established 256-token ceiling for TP2 or an explicitly unpadded prefix.
     """
-    if attn_tp == _MLP_CORES and _kvinsert_pad16_enabled():
+    if not _kvinsert_pad16_enabled():
+        return _PREFILL_CHUNK_SIZE_CAP_SAFE
+    if attn_tp == _MLP_CORES:
         return _PREFILL_CHUNK_SIZE_CAP_TP8_PAD16
+    if attn_tp == _REDUCED_ATTN_TP:
+        return _PREFILL_CHUNK_SIZE_CAP_REDUCED_PAD16
     return _PREFILL_CHUNK_SIZE_CAP_SAFE
 
 
@@ -439,6 +472,56 @@ def _expert0_down_int4() -> bool:
     return rpu_env_bool("RPU_WALL_OSS_EXPERT0_DOWN_INT4", default=True)
 
 
+def _validate_residual_scale(value, num_cores: int, owner: str) -> int:
+    """Return ``value`` when it is an admitted residual scale for ``num_cores``.
+
+    Range: 1 (default, no fold) or 4; 4 only below eight cores, where the RTC
+    overflow boundaries have no BF16 route. Anything else is refused.
+    """
+    if type(value) is not int or value not in _RESIDUAL_SCALES:
+        raise ValueError(
+            f"{owner} residual_scale must be one of {_RESIDUAL_SCALES}, got {value!r}")
+    if value != 1 and num_cores == 8:
+        raise ValueError(
+            f"{owner} residual_scale applies below eight cores only; the eight-core "
+            "RTC path keeps its BF16 residual boundaries")
+    return value
+
+
+def _fold_residual(t: torch.Tensor, scale: int) -> torch.Tensor:
+    """``t / scale`` computed in FP32 and stored back in ``t``'s dtype."""
+    return t if scale == 1 else (t.float() / scale).to(t.dtype)
+
+
+def _fold_w8_residual(
+    q: torch.Tensor, channel_scale: torch.Tensor, scale: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fold ``1/scale`` into a per-output-channel W8A16 projection.
+
+    The W8A16 Linear dequantizes each weight on VALU (``q * channel_scale`` to
+    FP16), which flushes FP16 subnormal results. A channel whose
+    ``channel_scale / scale`` stays FP16-normal takes the factor in its scale;
+    the rest keep scale ``2^-14`` and carry the remaining factor in their codes,
+    so no dequantized weight falls below the normal floor. Zero scales stay zero.
+    """
+    if scale == 1:
+        return q, channel_scale
+    if channel_scale.dim() != 1 or q.dim() != 2 or q.size(0) != channel_scale.numel():
+        raise ValueError(
+            "W8A16 residual fold needs [N, K] codes with a per-channel [N] scale, got "
+            f"{tuple(q.shape)} and {tuple(channel_scale.shape)}")
+    source = channel_scale.float()
+    target = source / scale
+    floor = (source > 0) & (target < _FP16_MIN_NORMAL)
+    if not bool(floor.any()):
+        return q, target.to(channel_scale.dtype)
+    ratio = (source / (scale * _FP16_MIN_NORMAL))[:, None]
+    codes = torch.where(
+        floor[:, None], torch.round(q.float() * ratio).clamp(-127, 127), q.float())
+    target = torch.where(floor, torch.full_like(target, _FP16_MIN_NORMAL), target)
+    return codes.to(q.dtype).contiguous(), target.to(channel_scale.dtype)
+
+
 def _chan_first_scale(s: torch.Tensor) -> torch.Tensor:
     """group-wise pgrp scale [G, N] -> [N, G] (channels on dim 0) so the same
     split/slice/replicate code as the per-channel [N] path applies. 1D unchanged."""
@@ -485,11 +568,17 @@ def _configure_causal_decoder_handle(
     *, set_weights, weight_args, chunk_size_cap, equal_two_prefill,
     wall_prefill_routes=(False, False, _RMSNORM_CAP_BASE, False),
     chunk_size_override=0, sorting=None, linear_acc32=False, max_seq_len=2048,
+    num_cores=8, expected_topology=None,
 ):
-    """Create/configure a decoder handle, destroying it on any failed gate."""
+    """Create/configure a decoder handle, destroying it on any failed gate.
+
+    Below eight cores the headless handle is created on its execution prefix
+    and ``expected_topology`` must equal the native readback after weights.
+    """
     from rpu_backend.api._execution import _require_execution_process_safe
     _require_execution_process_safe()
-    handle = torch.ops.rpu.causal_decoder_create()
+    handle = (torch.ops.rpu.causal_decoder_create() if num_cores == 8 else
+              torch.ops.rpu.causal_decoder_create(num_cores=num_cores, vocab_size=0))
     try:
         if linear_acc32:
             torch.ops.rpu.causal_decoder_set_linear_acc32(handle, True)
@@ -501,6 +590,12 @@ def _configure_causal_decoder_handle(
             handle, *wall_prefill_routes
         )
         set_weights(handle, *weight_args)
+        if num_cores != 8:
+            native = tuple(torch.ops.rpu.causal_decoder_topology(handle))
+            if native != tuple(expected_topology):
+                raise RuntimeError(
+                    "Wall-OSS native decoder topology differs from its weight layout: "
+                    f"actual={native}, expected={tuple(expected_topology)}")
         torch.ops.rpu.causal_decoder_set_chunk_size_cap(
             handle, chunk_size_cap
         )
@@ -535,7 +630,7 @@ class WallOssLLM:
                  num_layers, head_dim, rope_theta, mrope_section,
                  prefill_chunk_size_cap, prefill_pad16, prefill_equal_two,
                  attn_geometry, partial_mrope=None, execution_config=None,
-                 prefill_mixed_precision=False):
+                 prefill_mixed_precision=False, residual_scale=1):
         self._gc_retirement_enabled = False
         partial_mrope = (
             _partial_mrope_enabled()
@@ -550,6 +645,9 @@ class WallOssLLM:
         self.cache = cache
         self._graph_cache = graph_cache
         self._embed_w = embed_w          # [vocab, hidden] fp32 CPU
+        # Embeddings and every hidden state before the final norm are 1/s of the
+        # model's; the final-normed output and the prefix K/V are unchanged.
+        self.residual_scale = int(residual_scale)
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self._prefill_chunk_size_cap = prefill_chunk_size_cap
@@ -763,9 +861,13 @@ class WallOssLLM:
 
     def _run_prefill(self, inputs_embeds: torch.Tensor, position_ids: torch.Tensor,
                      op_id: str, *, logical_len: int | None = None,
-                     reserve_rows: int = 0) -> torch.Tensor:
+                     reserve_rows: int = 0, fixed_bucket: bool = False) -> torch.Tensor:
         """Shared LTM prefill body: inputs_embeds [1, seq, H] + mRoPE position_ids
-        [seq, 3] → final-normed last_hidden, filling the cache prefix K/V at [0, seq)."""
+        [seq, 3] → final-normed last_hidden, filling the cache prefix K/V at [0, seq).
+
+        ``fixed_bucket=True`` plans the already padded ``seq`` itself (the RTC
+        P640/P672 buckets), so every REAL length in a bucket shares one native
+        identity; ``logical_len`` still bounds masks and receipts."""
         seq = int(inputs_embeds.size(1))
         if not isinstance(position_ids, torch.Tensor):
             raise TypeError(
@@ -797,10 +899,12 @@ class WallOssLLM:
             and "padding_rows" not in prefill_request
             and "padding_budget" not in prefill_request
         )
+        if not isinstance(fixed_bucket, bool):
+            raise TypeError(f"fixed_bucket must be bool, got {fixed_bucket!r}")
         plan_len = (
             seq
             if (self._prefill_mixed_precision and seq in (640, 672))
-            or base_p640_bucket
+            or base_p640_bucket or fixed_bucket
             else logical_len
         )
         plan_box = {}
@@ -946,10 +1050,13 @@ class WallOssLLM:
     def forward_embeds(self, inputs_embeds: torch.Tensor,
                        position_ids: torch.Tensor, *,
                        logical_len: int | None = None,
-                       reserve_rows: int = 0) -> torch.Tensor:
+                       reserve_rows: int = 0,
+                       fixed_bucket: bool = False) -> torch.Tensor:
         """Prefill from pre-assembled inputs_embeds [1, seq, H] (vision scattered into
         image-token positions) + real 3D mRoPE position_ids [seq, 3] (vision grid +
-        text). Used by the P4 VLA orchestrator. Fills the shared cache prefix K/V."""
+        text). Used by the P4 VLA orchestrator. Fills the shared cache prefix K/V.
+        ``inputs_embeds`` carry this model's ``residual_scale``; ``fixed_bucket``
+        is described in :meth:`_run_prefill`."""
         from rpu_backend.adapters.wall_oss._retirement import _require_open
         _require_open(self)
         if not isinstance(inputs_embeds, torch.Tensor):
@@ -968,6 +1075,7 @@ class WallOssLLM:
             "wall_oss_llm_embeds",
             logical_len=logical_len,
             reserve_rows=reserve_rows,
+            fixed_bucket=fixed_bucket,
         )
         return raw
 
@@ -995,6 +1103,7 @@ def build_wall_oss_llm(
     execution_config=None,
     graph_runtime_policy=None,
     rmsnorm_fixed32: bool = False,
+    residual_scale: int = 1,
 ) -> WallOssLLM:
     """Load expert-`expert` weights and install the device text decoder.
 
@@ -1015,6 +1124,12 @@ def build_wall_oss_llm(
         w8_down_ckpt_dir: W8A16 source for expert-0 ``down_proj`` only. Valid
             exclusively with ``expert=0, nvfp4a16=True`` so NVFP4 covers the
             same projection set as the retained W4A16 pgrp composition.
+        residual_scale: 1 (default, no fold) or 4. 4 is admitted only for
+            expert 0 below eight cores with FP16 or W8A16 weights: it divides
+            the embedding table, ``o_proj`` and ``up_proj`` by 4 and the RMSNorm
+            epsilon by 16, so the residual stream stays inside FP16 where the
+            RTC prefix overflows it. Final-normed outputs and prefix K/V are
+            unchanged; ``inputs_embeds`` given to the model must carry the scale.
     """
     if graph_runtime_policy is not None:
         from rpu_backend.graph import GraphRuntimePolicy
@@ -1023,12 +1138,17 @@ def build_wall_oss_llm(
     from rpu_backend.api._execution import _require_execution_process_safe
     _require_execution_process_safe()
     from rpu_backend.api._execution import normalize_rpu_execution
-    prefill_execution = normalize_rpu_execution(
+    builder_execution = normalize_rpu_execution(
         {"prefill": ({} if execution_config is None else
-                     execution_config.get("prefill", {}))},
+                     execution_config.get("prefill", {})),
+         **({} if execution_config is None or "model" not in execution_config
+            else {"model": execution_config["model"]})},
         entry_point="build_wall_oss_llm",
-        supported={"prefill": ("chunk_size", "padding_rows", "padding_budget", "linear_acc32")},
-    ).get("prefill", {})
+        supported={"prefill": ("chunk_size", "padding_rows", "padding_budget", "linear_acc32"),
+                   "model": ("num_cores",)},
+    )
+    prefill_execution = builder_execution.get("prefill", {})
+    num_cores = builder_execution.get("model", {}).get("num_cores", 8)
     linear_acc32 = prefill_execution.get("linear_acc32", False)
     if linear_acc32 and _prefill_mixed_precision_enabled():
         raise ValueError("Wall-OSS mixed RTC prefill does not support linear_acc32=True")
@@ -1058,6 +1178,27 @@ def build_wall_oss_llm(
             f"{selected_modes}"
         )
     sorting = sorting_config_from_env()
+    _validate_residual_scale(residual_scale, num_cores, "Wall-OSS text")
+    if residual_scale != 1 and expert != 0:
+        raise ValueError("Wall-OSS text residual_scale applies to expert 0 only")
+    if num_cores != 8:
+        selected = [name for name, active in (
+            ("w4a16", w4a16), ("nvfp4a16", nvfp4a16),
+            ("linear_acc32", linear_acc32), ("rmsnorm_fixed32", rmsnorm_fixed32),
+            ("RPU_WALL_OSS_PREFILL_MIXED_PRECISION", _prefill_mixed_precision_enabled()),
+            ("RPU_WALL_OSS_PREFILL_STAGED_MLP", _prefill_staged_mlp_enabled()),
+            ("RPU_WALL_OSS_PREFILL_OWNER_DIRECT_KV",
+             rpu_env_bool("RPU_WALL_OSS_PREFILL_OWNER_DIRECT_KV", default=False)),
+            ("Wall sorting routes", sorting != WallSortingConfig()),
+        ) if active]
+        if selected:
+            raise ValueError(
+                f"{num_cores}-core Wall-OSS text admits only FP16 or W8A16 with "
+                f"ordinary routes; refused: {', '.join(selected)}")
+        if graph_runtime_policy is not None and (
+                graph_runtime_policy.execution_core_count != num_cores):
+            raise ValueError(
+                "Wall-OSS text graph_runtime_policy core count must match num_cores")
     if w8_down_ckpt_dir is not None and (not nvfp4a16 or expert != 0):
         raise ValueError(
             "w8_down_ckpt_dir is valid only for expert=0 with nvfp4a16=True")
@@ -1084,10 +1225,14 @@ def build_wall_oss_llm(
     down_alignment = (32 if down_int4 else 64) * _MLP_CORES
     INTER_PAD = (((INTER + down_alignment - 1) // down_alignment)
                  * down_alignment) if down_4bit else INTER
-    EPS = cfg["rms_norm_eps"]
+    # RMSNorm(x/s, eps/s^2) == RMSNorm(x, eps) for the scaled residual stream.
+    EPS = cfg["rms_norm_eps"] / residual_scale ** 2
     THETA = cfg["rope_theta"]
     MROPE = list(cfg["rope_scaling"]["mrope_section"])  # [16, 24, 24]
-    ATTN_TP = _eff_attn_tp(NKV)     # 2 (default) or 8 via RPU_WALL_OSS_ATTN_TP8
+    # 2 (default) or 8 via RPU_WALL_OSS_ATTN_TP8; 4 below eight execution cores.
+    ATTN_TP = _eff_attn_tp(NKV, num_cores)
+    MLP_TP = num_cores
+    PHYSICAL_INTER = decoder_mlp_intermediate_size(INTER_PAD, MLP_TP)
     # Snapshot the cap with the build-time attention/padding configuration. The
     # C++ setter rejects changes after the first forward, so existing handles and
     # their GraphCache entries cannot be hot-switched by later env changes.
@@ -1209,6 +1354,11 @@ def build_wall_oss_llm(
             ks, vs = _replicate_kv(ks, NKV, HD, REP), _replicate_kv(vs, NKV, HD, REP)
             os = _chan_first_scale(gr(f"{p}.self_attn.o_proj_experts.{expert}.weight_scale"))
 
+        if residual_scale != 1:
+            if w8a16:
+                ow, os = _fold_w8_residual(ow, os, residual_scale)
+            else:
+                ow = _fold_residual(ow, residual_scale)
         # Attention: Q/K/V col-partition + O row-partition, swizzled for attn_tp
         # (matches the C++ num_cores=tp). Bias is NOT swizzled — the col-swizzle
         # keeps core c's output channels in the contiguous slice the C++ bias
@@ -1282,15 +1432,38 @@ def build_wall_oss_llm(
             gate_s = gu_s[:INTER].contiguous()
             up_s = gu_s[INTER:2 * INTER].contiguous()
             down_s = gr(f"{p}.moe.experts.{expert}.down_proj.weight_scale")
-        # MLP: gate/up col-partition + down row-partition, full 8-core.
+        if residual_scale != 1:
+            # Up carries the MLP's 1/s, so SiLU*Up and Down shrink with it.
+            if w8a16:
+                up_w, up_s = _fold_w8_residual(up_w, up_s, residual_scale)
+            else:
+                up_w = _fold_residual(up_w, residual_scale)
+        # MLP: gate/up col-partition + down row-partition on MLP_TP lanes (every
+        # core of the budget). A six-lane MLP is zero-padded to its physical
+        # width with unit scales, as the native topology expects.
+        if PHYSICAL_INTER != INTER_PAD:
+            if not w8a16:
+                gate_w, up_w, down_w = gate_w.half(), up_w.half(), down_w.half()
+            gate_w = pad_decoder_mlp_projection(
+                gate_w, projection_name="gate_proj",
+                logical_size=INTER_PAD, physical_size=PHYSICAL_INTER)
+            up_w = pad_decoder_mlp_projection(
+                up_w, projection_name="up_proj",
+                logical_size=INTER_PAD, physical_size=PHYSICAL_INTER)
+            down_w = pad_decoder_mlp_projection(
+                down_w, projection_name="down_proj",
+                logical_size=INTER_PAD, physical_size=PHYSICAL_INTER)
+            if w8a16:
+                gate_s = F.pad(gate_s, (0, PHYSICAL_INTER - INTER_PAD), value=1.0)
+                up_s = F.pad(up_s, (0, PHYSICAL_INTER - INTER_PAD), value=1.0)
         if w8a16:
-            gate_list.append(_to_rpu_int8(tp_col_swizzle_mc_weight(gate_w, _MLP_CORES, dwidth=1)))
-            up_list.append(_to_rpu_int8(tp_col_swizzle_mc_weight(up_w, _MLP_CORES, dwidth=1)))
+            gate_list.append(_to_rpu_int8(tp_col_swizzle_mc_weight(gate_w, MLP_TP, dwidth=1)))
+            up_list.append(_to_rpu_int8(tp_col_swizzle_mc_weight(up_w, MLP_TP, dwidth=1)))
             down_list.append(
-                _to_rpu_half(tp_row_swizzle_mc_weight(down_w.half(), _MLP_CORES))
+                _to_rpu_half(tp_row_swizzle_mc_weight(down_w.half(), MLP_TP))
                 if mixed_quantized and L == 2
                 else _to_rpu_int8(
-                    tp_row_swizzle_mc_weight(down_w, _MLP_CORES, dwidth=1)
+                    tp_row_swizzle_mc_weight(down_w, MLP_TP, dwidth=1)
                 )
             )
             gate_s_list.append(_to_rpu_half(gate_s))
@@ -1362,21 +1535,25 @@ def build_wall_oss_llm(
                 down_s_list.append(down_s)
                 down_ts_list.append(down_ts)
         else:
-            gate_list.append(_to_rpu_half(tp_col_swizzle_mc_weight(gate_w.half(), _MLP_CORES)))
-            up_list.append(_to_rpu_half(tp_col_swizzle_mc_weight(up_w.half(), _MLP_CORES)))
-            down_list.append(_to_rpu_half(tp_row_swizzle_mc_weight(down_w.half(), _MLP_CORES)))
+            gate_list.append(_to_rpu_half(tp_col_swizzle_mc_weight(gate_w.half(), MLP_TP)))
+            up_list.append(_to_rpu_half(tp_col_swizzle_mc_weight(up_w.half(), MLP_TP)))
+            down_list.append(_to_rpu_half(tp_row_swizzle_mc_weight(down_w.half(), MLP_TP)))
 
         in_norm_list.append(_to_rpu_half(gf(f"{p}.input_layernorms.{expert}.weight")))
         post_norm_list.append(_to_rpu_half(gf(f"{p}.post_attention_layernorms.{expert}.weight")))
 
     final_norm_w = _to_rpu_half(gf(f"model.norms.{expert}.weight"))
     cos, sin = _build_rope_tables(HD, THETA, max_seq_len)
-    embed_w = gf("model.embed_tokens.weight")  # [vocab, H] fp32 CPU (kept for lookup)
+    embed_w = _fold_residual(  # [vocab, H] fp32 CPU (kept for lookup)
+        gf("model.embed_tokens.weight"), residual_scale)
     partial_mrope = _partial_mrope_enabled()
     cache = RPUCache(
         num_layers=num_layers, batch_size=1, max_seq_len=max_seq_len,
         num_kv_heads=NKV_EFF, head_dim=HD, attn_tp=ATTN_TP,
     )
+    if graph_runtime_policy is None and num_cores != 8:
+        graph_runtime_policy = rpu_backend.graph.GraphRuntimePolicy.from_environment(
+            execution_core_count=num_cores)
     graph_cache = rpu_backend.graph.GraphCache(
         **({"runtime_policy": graph_runtime_policy}
            if graph_runtime_policy is not None else {}))
@@ -1434,7 +1611,9 @@ def build_wall_oss_llm(
             PREFILL_OWNER_DIRECT_KV,
         ),
         chunk_size_override=CHUNK_SIZE_OVERRIDE, sorting=sorting,
-        linear_acc32=linear_acc32,
+        linear_acc32=linear_acc32, num_cores=num_cores,
+        # (execution, attention, MLP, headless lm_head lanes, physical KV lanes)
+        expected_topology=(num_cores, ATTN_TP, MLP_TP, 4, 8),
     )
     model = None
     try:
@@ -1457,6 +1636,7 @@ def build_wall_oss_llm(
             partial_mrope=partial_mrope,
             execution_config=execution_config,
             prefill_mixed_precision=PREFILL_MIXED_PRECISION,
+            residual_scale=residual_scale,
         )
         return model
     except BaseException as error:

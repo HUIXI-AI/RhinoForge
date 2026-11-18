@@ -52,13 +52,17 @@ def asr_decoder_profile(config):
             or (layers is not None and (len(layers) != 28
                                        or any(kind != "full_attention" for kind in layers)))):
         raise ValueError("ASR text requires its exact reviewed dense decoder geometry and semantics")
-    return DecoderGeometryProfile(*values, 6)
+    return DecoderGeometryProfile(*values, 6, six_core_lm_head_tp=6)
 
 
 def push_asr_lm_head(causal_lm, handle, precision):
     """Bind an explicitly packed speech head without ordinary text recipe markers."""
     import torch
-    from rpu_backend.runtime.topology import execution_core_count, resolve_decoder_topology
+    from rpu_backend.runtime.topology import (
+        decoder_lm_head_vocab_size,
+        execution_core_count,
+        resolve_decoder_topology,
+    )
 
     normalize_audio_precision(precision, None, False)
     if precision == "nvfp4":
@@ -80,8 +84,9 @@ def push_asr_lm_head(causal_lm, handle, precision):
     weight, scale = head.weight.detach(), getattr(head, "weight_scale", None)
     dtype = {"fp16": torch.float16, "w8a16": torch.int8, "w4a16_g32": torch.uint8}[precision]
     from rpu_backend.quant.int4_pgrp_pack import w4_storage_shape
-    shape = (w4_storage_shape(profile.vocab_size, profile.hidden_size, 1, topology.lm_head_tp)
-             if precision == "w4a16_g32" else (profile.vocab_size, profile.hidden_size))
+    padded_vocab = decoder_lm_head_vocab_size(profile.vocab_size, topology.lm_head_tp)
+    shape = (w4_storage_shape(padded_vocab, profile.hidden_size, 1, topology.lm_head_tp)
+             if precision == "w4a16_g32" else (padded_vocab, profile.hidden_size))
     if (weight.dtype != dtype or weight.device.type != "rpu" or tuple(weight.shape) != shape
             or not weight.is_contiguous() or getattr(head, "_rpu_linear_partition", None) != 1
             or getattr(head, "_rpu_linear_num_cores", None) != topology.lm_head_tp):
@@ -91,10 +96,10 @@ def push_asr_lm_head(causal_lm, handle, precision):
             raise ValueError("FP16 ASR head must not carry quantization scales")
     else:
         if precision == "w8a16":
-            scale_shape = (profile.vocab_size,)
+            scale_shape = (padded_vocab,)
         else:
             groups = (profile.hidden_size // 32 + 3) // 4 * 4
-            rows = (profile.vocab_size // topology.lm_head_tp + 63) // 64 * 64
+            rows = (padded_vocab // topology.lm_head_tp + 63) // 64 * 64
             scale_shape = (32, topology.lm_head_tp * groups * rows // 32)
         if (not isinstance(scale, torch.Tensor) or scale.dtype != torch.float16
                 or scale.device != weight.device or not scale.is_contiguous()
@@ -126,17 +131,33 @@ def pack_audio_linear(weight, partition, precision, *, bounded_head=False, num_c
     weight = weight.detach().to(torch.float16).contiguous()
     if not torch.isfinite(weight).all():
         raise ValueError("speech weights must remain finite in FP16")
+    from rpu_backend.runtime.topology import decoder_lm_head_vocab_size
+    padded_n = decoder_lm_head_vocab_size(int(weight.shape[0]), num_cores) if bounded_head else int(weight.shape[0])
     if precision == "fp16":
+        if padded_n != int(weight.shape[0]):
+            padded = weight.new_zeros((padded_n, int(weight.shape[1])))
+            padded[:weight.shape[0]].copy_(weight)
+            weight = padded
         return transform_linear_weight(weight, partition, num_cores), None
     if precision == "w8a16":
         from rpu_backend.quant._common import quantize_linear_per_channel
 
         packed, scale = quantize_linear_per_channel(weight, bits=8)
+        if padded_n != int(packed.shape[0]):
+            padded_packed = packed.new_zeros((padded_n, int(packed.shape[1])))
+            padded_packed[:packed.shape[0]].copy_(packed)
+            padded_scale = scale.new_ones(padded_n)
+            padded_scale[:scale.shape[0]].copy_(scale)
+            packed, scale = padded_packed, padded_scale
         return transform_linear_weight(packed, partition, num_cores), scale.contiguous()
     from rpu_backend.quant.convert_qwen3_w4a16 import pack_linear_int4_
     from rpu_backend.quant.int4_pgrp_pack import quantize_pack_int4_pgrp_col_bounded
 
     if bounded_head:
+        if padded_n != int(weight.shape[0]):
+            padded = weight.new_zeros((padded_n, int(weight.shape[1])))
+            padded[:weight.shape[0]].copy_(weight)
+            weight = padded
         return quantize_pack_int4_pgrp_col_bounded(weight, group_size=32, num_cores=num_cores)
     # A meta shell avoids allocating another full floating-point matrix.
     with torch.device("meta"):

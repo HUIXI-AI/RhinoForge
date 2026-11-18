@@ -46,7 +46,9 @@ from rpu_backend.adapters.qwen3_vl import (
     uninstall_qwen3_vl_runtime,
 )
 from rpu_backend.adapters.qwen3_vl.vision import (
+    _is_qwen3_vl_w4_vision_tower,
     _prepare_qwen3vl_vision_input_for_spm_pipeline,
+    validate_qwen3_vl_vision_core_profile,
 )
 from rpu_backend.runtime.rope_partial import build_interleaved_mrope_cos_sin
 
@@ -80,6 +82,45 @@ _EXECUTION_COMPONENTS = {
     _VL_COMPONENT: {"prefill": ("chunk_size",)},
     _ACTION_COMPONENT: {"action": ("chunk_size",)},
 }
+_MODEL_SCOPE = {"model": ("num_cores",)}
+
+
+def _stage_union(components):
+    union = {}
+    for stages in components.values():
+        for stage, fields in stages.items():
+            known = union.setdefault(stage, [])
+            known.extend(field for field in fields if field not in known)
+    return {stage: tuple(fields) for stage, fields in union.items()}
+
+
+# The public core budget belongs to the composite and is cold-only. At 4/6
+# cores the text prefix uses the Qwen3-VL text template (attention 4 / MLP =
+# budget); Vision, the VL encoder and the DiT have four-lane owners only
+# (Q32 does not split over six lanes), so they run on four cores in both budgets.
+_EXECUTION_SUPPORTED = {**_MODEL_SCOPE, **_stage_union(_EXECUTION_COMPONENTS)}
+_REDUCED_LANES = 4
+
+
+def _gr00t_core_count(execution) -> int:
+    # normalize_rpu_execution already admitted 4, 6 or 8.
+    return (execution or {}).get("model", {}).get("num_cores", 8)
+
+
+def _gr00t_component_cores(budget: int, component: str) -> int:
+    if budget == 8:
+        return 8
+    return budget if component == _TEXT_COMPONENT else _REDUCED_LANES
+
+
+def _with_cores(config, cores: int, component: str, *, entry_point: str):
+    if cores == 8:
+        return config
+    return normalize_rpu_execution(
+        {**config, "model": {"num_cores": cores}},
+        entry_point=entry_point,
+        supported={**_EXECUTION_COMPONENTS[component], **_MODEL_SCOPE},
+    )
 
 
 def _resolve_gr00t_execution(
@@ -90,12 +131,19 @@ def _resolve_gr00t_execution(
     root = normalize_rpu_execution(
         rpu_execution,
         entry_point=entry_point,
+        supported=_EXECUTION_SUPPORTED,
         supported_components=_EXECUTION_COMPONENTS,
     )
+    budget = _gr00t_core_count(root)
+    if budget != 8 and qwen_z1:
+        raise ValueError(
+            f"{entry_point}: RPU_GR00T_QWEN3VL_SPM_Z1 is an eight-core composite; "
+            f"model.num_cores={budget} requires it off")
     text = resolve_component_rpu_execution(
         root,
         _TEXT_COMPONENT,
         entry_point=entry_point,
+        supported=_EXECUTION_SUPPORTED,
         supported_components=_EXECUTION_COMPONENTS,
         profile_auto={"prefill": {"chunk_size": "auto"}},
     )
@@ -103,6 +151,7 @@ def _resolve_gr00t_execution(
         root,
         _VISION_COMPONENT,
         entry_point=entry_point,
+        supported=_EXECUTION_SUPPORTED,
         supported_components=_EXECUTION_COMPONENTS,
         profile_auto={"vision": {"chunk_size": "auto"}},
     )
@@ -110,6 +159,7 @@ def _resolve_gr00t_execution(
         root,
         _VL_COMPONENT,
         entry_point=entry_point,
+        supported=_EXECUTION_SUPPORTED,
         supported_components=_EXECUTION_COMPONENTS,
         profile_auto={"prefill": {"chunk_size": "auto"}},
     )
@@ -117,6 +167,7 @@ def _resolve_gr00t_execution(
         root,
         _ACTION_COMPONENT,
         entry_point=entry_point,
+        supported=_EXECUTION_SUPPORTED,
         supported_components=_EXECUTION_COMPONENTS,
         profile_auto={"action": {"chunk_size": "auto"}},
     )
@@ -138,6 +189,12 @@ def _resolve_gr00t_execution(
             entry_point=entry_point,
             supported=_EXECUTION_COMPONENTS[_VISION_COMPONENT],
         )
+    text, vision, vl, action = (
+        _with_cores(config, _gr00t_component_cores(budget, component), component,
+                    entry_point=entry_point)
+        for config, component in (
+            (text, _TEXT_COMPONENT), (vision, _VISION_COMPONENT),
+            (vl, _VL_COMPONENT), (action, _ACTION_COMPONENT)))
     return root, text, vision, vl, action
 
 
@@ -314,6 +371,51 @@ def _w8a16_on():
     return rpu_env_bool("RPU_GR00T_W8A16")
 
 
+# FP16/W8-only fused DiT owners. Each declines packed W4 weights natively; W4
+# refuses an explicit opt-in so the request cannot silently fall back.
+_GR00T_W4_REFUSED_SELECTORS = ("RPU_GR00T_FF1_RESIDENT_W8", "RPU_GR00T_SELF_QKV_MULTIBASE",
+                               "RPU_GR00T_RING_XOR3")
+
+
+def _w4a16_on():
+    """G32 RTN W4A16 for the text prefix, VL encoder and DiT blocks.
+
+    Requires RPU_GR00T_W8A16=1, which keeps the per-step glue and the AdaLN
+    GEMV in W8, and Vision too unless RPU_GR00T_VISION_W4A16 is set (the
+    merger stays FP16)."""
+    if not rpu_env_bool("RPU_GR00T_W4A16"):
+        return False
+    if not _w8a16_on():
+        raise ValueError("RPU_GR00T_W4A16=1 requires RPU_GR00T_W8A16=1: the per-step glue "
+                         "and AdaLN stay W8A16, and Vision unless RPU_GR00T_VISION_W4A16=1")
+    named = [name for name in _GR00T_W4_REFUSED_SELECTORS
+             if os.environ.get(name, "") not in ("", "0")]
+    if named:
+        raise ValueError(f"RPU_GR00T_W4A16 has no route for {', '.join(named)} "
+                         "(FP16/W8A16 owners only); set them to 0")
+    return True
+
+
+def _vision_w4a16_on():
+    """G32 RTN W4A16 for the 24 Vision blocks as well, on top of RPU_GR00T_W4A16.
+
+    The Qwen3-VL installer packs the exact 2B tower at the Vision lanes; the
+    patch embedding and mergers keep their FP16 path."""
+    if not rpu_env_bool("RPU_GR00T_VISION_W4A16"):
+        return False
+    if not rpu_env_bool("RPU_GR00T_W4A16"):
+        raise ValueError("RPU_GR00T_VISION_W4A16=1 requires RPU_GR00T_W4A16=1: the text "
+                         "prefix, VL encoder and DiT are W4 whenever Vision is")
+    return _w4a16_on()
+
+
+def _gr00t_vision_precision():
+    """The Vision installer's block precision: packed W4, else W8 or FP16 with RPU_GR00T_W8A16."""
+    if _vision_w4a16_on():
+        return {"w4a16": True}
+    return {"w8a16": _w8a16_on()}
+
+
 def _precompute_adaln_on():
     """Cold builder policy; the installed native table owns forward selection."""
     value = os.environ.get("RPU_GR00T_PRECOMPUTE_ADALN", "")
@@ -383,11 +485,60 @@ def _quantize_backbone_inplace(text_model):
             mod.register_buffer("weight_scale", scale.to(torch.float16))
 
 
+def _quantize_backbone_w4_inplace(text_model, topology=None):
+    """G32 RTN W4A16 for the 16-layer text prefix: pack each layer's 7 projections
+    to the pgrp layout of the cold text topology (eight cores: TP8). Every shape is
+    checked before the first projection changes. MUST run BEFORE
+    `convert_linear_weights_inplace`, which skips these leaves (pitfall P1); the
+    2B MLP I6144 is 384-aligned, so no budget pads it."""
+    from rpu_backend.quant.convert_qwen3_w4a16 import (
+        DEFAULT_GROUP_SIZE, _PROJECTIONS, _check_int4_shape, pack_linear_int4_,
+        packed_mlp_padded_size)
+    attn_tp = 8 if topology is None else topology.attn_tp
+    mlp_tp = 8 if topology is None else topology.mlp_tp
+    plan = []
+    for index, layer in enumerate(text_model.layers):
+        for role, partition in _PROJECTIONS:
+            linear = layer.get_submodule(role)
+            cores = mlp_tp if role.startswith("mlp.") else attn_tp
+            padded = packed_mlp_padded_size(role, linear, mlp_tp)
+            n, k = linear.weight.shape
+            if padded is not None:
+                n, k = (padded, k) if partition == 1 else (n, padded)
+            if linear.weight.dtype != torch.float16:
+                raise TypeError(f"GR00T W4 layer{index}.{role} requires its FP16 weight")
+            _check_int4_shape(f"layer{index}.{role}", n, k, partition, cores)
+            plan.append((index, role, linear, partition, cores, padded))
+    for index, role, linear, partition, cores, padded in plan:
+        pack_linear_int4_(linear, partition, name=f"layer{index}.{role}",
+                          group_size=DEFAULT_GROUP_SIZE, num_cores=cores, padded_size=padded)
+
+
+def _mark_backbone_w4_layout(text_model, topology=None):
+    """The generic swizzle records skipped leaves as companion-owned; these carry their pgrp layout."""
+    from rpu_backend.quant.convert_qwen3_w4a16 import _PROJECTIONS
+    for layer in text_model.layers:
+        for role, partition in _PROJECTIONS:
+            linear = layer.get_submodule(role)
+            linear._rpu_linear_partition = partition
+            linear._rpu_linear_num_cores = (8 if topology is None else
+                topology.mlp_tp if role.startswith("mlp.") else topology.attn_tp)
+
+
+def _pack_gr00t_w4(w, partition, cores):
+    """G32 RTN W4 of one VL-encoder or DiT block projection: host packed uint8
+    [N, K/2] in the pgrp layout of CORES lanes plus its controller-striped FP16
+    scale [32, numel/32]. The pgrp packing replaces the TP swizzle."""
+    from rpu_backend.quant.convert_qwen3_w4a16 import DEFAULT_GROUP_SIZE, pack_int4_weight
+    return pack_int4_weight(w.half(), partition, group_size=DEFAULT_GROUP_SIZE, num_cores=cores)
+
+
 def _backbone_scale_lists(text_model):
-    """Gather the 7 per-output-channel fp16 scale lists (q,k,v,o,gate,up,down) from the
-    quantized backbone modules (post `.to('rpu')`). Returns None if not int8-quantized."""
+    """Gather the 7 fp16 scale lists (q,k,v,o,gate,up,down) from the quantized
+    backbone modules (post `.to('rpu')`): per-output-channel for INT8, the
+    controller-striped G32 payload for packed W4. Returns None if not quantized."""
     layers = text_model.layers
-    if getattr(layers[0].self_attn.q_proj.weight, "dtype", None) != torch.int8:
+    if getattr(layers[0].self_attn.q_proj.weight, "dtype", None) not in (torch.int8, torch.uint8):
         return None
     N = len(layers)
     pick = lambda get: [get(layers[i]) for i in range(N)]
@@ -435,19 +586,46 @@ def _cleanup_gr00t_build_failure(error, owner, cleanup):
         error.add_note(f"GR00T cleanup also failed: {cleanup_error}")
 
 
+def _require_gr00t_reduced_ops(prefix):
+    missing = [name for name in (f"{prefix}_set_execution_core_count",
+                                 f"{prefix}_get_execution_topology")
+               if not hasattr(torch.ops.rpu, name)]
+    if missing:
+        raise RuntimeError("GR00T reduced cores need a native build with "
+                           + ", ".join(missing))
+
+
+def _check_gr00t_native_topology(actual, cores, nq, intermediate, label):
+    # (cores, attention TP, MLP TP, physical KV stripes, Q heads, FF width)
+    expected = (cores, cores, cores, 8, nq, intermediate)
+    if tuple(int(v) for v in actual) != expected:
+        raise RuntimeError(
+            f"GR00T {label} native topology differs from its cold weight layout: "
+            f"actual={tuple(actual)}, expected={expected}")
+
+
 def _configure_gr00t_vl_encoder_handle(
-    *, weight_args, scale_args, w8a16: bool
+    *, weight_args, scale_args, w8a16: bool, cores: int = 8
 ):
     from rpu_backend.api._execution import _require_execution_process_safe
     _require_execution_process_safe()
+    if cores != 8:
+        _require_gr00t_reduced_ops("gr00t_vl_encoder")
     handle = torch.ops.rpu.gr00t_vl_encoder_create()
     try:
+        if cores != 8:
+            # Cold: the native owner binds its lanes before any weight.
+            torch.ops.rpu.gr00t_vl_encoder_set_execution_core_count(handle, cores)
         if w8a16:
             torch.ops.rpu.gr00t_vl_encoder_set_weights_w8a16(
                 handle, *weight_args, *scale_args
             )
         else:
             torch.ops.rpu.gr00t_vl_encoder_set_weights(handle, *weight_args)
+        if cores != 8:
+            _check_gr00t_native_topology(
+                torch.ops.rpu.gr00t_vl_encoder_get_execution_topology(handle),
+                cores, _VLH, _VLFF, "VL encoder")
         return handle
     except BaseException as error:
         _cleanup_gr00t_build_failure(error, (handle, weight_args, scale_args),
@@ -456,14 +634,18 @@ def _configure_gr00t_vl_encoder_handle(
 
 
 def _configure_gr00t_denoise_handle(
-    *, dit_args, dit_scale_args, denoise_args, w8a16: bool
+    *, dit_args, dit_scale_args, denoise_args, w8a16: bool, cores: int = 8
 ):
     from rpu_backend.api._execution import _require_execution_process_safe
     _require_execution_process_safe()
-    precompute_adaln = _precompute_adaln_on()
-    precompute_time_glue = _precompute_time_glue_on()
+    precompute_adaln = _precompute_adaln_on() and cores in (4, 8)
+    precompute_time_glue = _precompute_time_glue_on() and cores in (4, 8)
+    if cores != 8:
+        _require_gr00t_reduced_ops("gr00t_dit")
     handle = torch.ops.rpu.gr00t_dit_create()
     try:
+        if cores != 8:
+            torch.ops.rpu.gr00t_dit_set_execution_core_count(handle, cores)
         if w8a16:
             torch.ops.rpu.gr00t_dit_set_weights_w8a16(
                 handle, *dit_args, *dit_scale_args
@@ -471,6 +653,10 @@ def _configure_gr00t_denoise_handle(
         else:
             torch.ops.rpu.gr00t_dit_set_weights(handle, *dit_args)
         torch.ops.rpu.gr00t_denoise_set_weights(handle, *denoise_args)
+        if cores != 8:
+            _check_gr00t_native_topology(
+                torch.ops.rpu.gr00t_dit_get_execution_topology(handle),
+                cores, _NQ, _FF, "DiT")
         if precompute_adaln:
             # The cold native program uses the installed M1 ACC16 weights,
             # ring reduction and FP16 +1, preserving the original arithmetic.
@@ -719,6 +905,9 @@ def _validate_gr00t_num_steps(num_steps):
 class Gr00tN1d7VLA:
     """Image→action runtime (fully on-device glue). Build via `build_gr00t_vla(...)`."""
 
+    # Cold whole-model budget; __init__ binds the resolved value.
+    _num_cores = 8
+
     def __init__(self, *, backbone, cfg, text_model, vision_model,
                  a_handle, a_keep, a_cache, d_handle, d_keep, d_cache, image_token_id,
                  execution_config=None, embodiment_id=20, num_steps=_NSTEPS,
@@ -760,8 +949,10 @@ class Gr00tN1d7VLA:
         }
         self._execution_reconfigure_journal = None
         self._rpu_last_execution_plan = {}
-        self._a_gc = rpu_backend.graph.GraphCache()
-        self._d_gc = rpu_backend.graph.GraphCache()
+        self._num_cores = _gr00t_core_count(resolved_execution[0])
+        lanes = _gr00t_component_cores(self._num_cores, _ACTION_COMPONENT)
+        self._a_gc = self._new_component_graph_cache(lanes)
+        self._d_gc = self._new_component_graph_cache(lanes)
         self._qwen_z1_plan_hash = qwen_z1_plan_hash
         self._qwen_z1_vision_stage_descriptor = tuple(
             int(word) for word in (qwen_z1_vision_stage_descriptor or ())
@@ -787,9 +978,13 @@ class Gr00tN1d7VLA:
         # Opt1: backbone KV-cache hoisted out of the per-action _backbone (single non-incremental
         # prefill → one cache, reused via reset_to_position(0); kills the dominant per-forward
         # 16-layer alloc+zero_ and pins REPLAY KV addresses). Capacity is cold-bound.
+        # The reduced Qwen3-VL text template keeps attention on four lanes at
+        # both budgets; the native decoder re-checks this cache layout.
         self._bb_cache = RPUCache(num_layers=cfg.text_config.num_hidden_layers, batch_size=1,
                                   max_seq_len=self._max_prefix_len, num_kv_heads=cfg.text_config.num_key_value_heads,
-                                  head_dim=cfg.text_config.head_dim)
+                                  head_dim=cfg.text_config.head_dim,
+                                  **({"attn_tp": _REDUCED_LANES}
+                                     if self._num_cores != 8 else {}))
         # Opt2/3: per-prompt memo slots (keyed on input_ids identity). rope = CPU M-RoPE index math;
         # masks = the two cross-attn MASK_2D subsets (cached device tensors also pin denoise REPLAY addrs).
         self._rope_key = self._rope_ids = None
@@ -824,6 +1019,7 @@ class Gr00tN1d7VLA:
             self,
             self._rpu_execution,
             entry_point="Gr00tN1d7VLA",
+            supported=_EXECUTION_SUPPORTED,
             supported_components=_EXECUTION_COMPONENTS,
             validate=self.validate_execution_reconfigure,
             apply=self.apply_execution_reconfigure,
@@ -844,6 +1040,14 @@ class Gr00tN1d7VLA:
             if qwen_z1_plan_hash is not None else None
         )
         self._gc_retirement_enabled = True
+
+    @staticmethod
+    def _new_component_graph_cache(cores):
+        if cores == 8:
+            return rpu_backend.graph.GraphCache()
+        return rpu_backend.graph.GraphCache(
+            runtime_policy=rpu_backend.graph.GraphRuntimePolicy.from_environment(
+                execution_core_count=cores))
 
     def _close_without_session(self) -> None:
         """Release all GR00T/backbone graph and native resources, once."""
@@ -995,6 +1199,10 @@ class Gr00tN1d7VLA:
         resolved = self._resolve_execution(
             execution_config, entry_point="Gr00tN1d7VLA.reconfigure"
         )
+        if _gr00t_core_count(resolved[0]) != self._num_cores:
+            raise ValueError(
+                "GR00T model.num_cores is cold-only: build a fresh runtime "
+                "to change topology")
         if (
             self._qwen_z1_plan_hash is not None
             or resolved[2] == self._vision_execution
@@ -2419,22 +2627,28 @@ def _ckpt_reader(ckpt_path):
     return gw
 
 
-def _build_vl_encoder(gw, w_rms):
+def _build_vl_encoder(gw, w_rms, cores=8):
     """A: swizzle 4 VL blocks + bake vlln + inv_w_rms. Returns (handle, keepalive).
 
     W8A16 (opt-in RPU_GR00T_W8A16): int8 the 6 GEMMs/block (q/k/v/o/ff0/ff2) — same int8-weight/
     fp16-act template as the DiT (the vl encoder is its structural twin). All dims int8-aligned
-    (q/k/v=2048, ff0=8192, K∈{2048,8192}). Default off = fp16 (unchanged)."""
+    (q/k/v=2048, ff0=8192, K∈{2048,8192}). Default off = fp16 (unchanged).
+    W4A16 (RPU_GR00T_W4A16, on top of W8): the same 6 GEMMs as G32 RTN pgrp W4; every
+    shape meets the col N%(16·TP)/K%64 and row N%16/K%(64·TP) rule at 4 and 8 lanes."""
     hr = _half_rpu
     _w8a16 = _w8a16_on()
+    _w4a16 = _w4a16_on()
     if _w8a16:
         from rpu_backend.quant._common import quantize_linear_per_channel
 
-    def _qw(w, swz):  # -> (device weight [int8 dwidth=1 if w8a16 else fp16], device fp16 scale or None)
+    def _qw(w, swz):  # -> (rpu weight [packed W4 / int8 dwidth=1 / fp16], rpu fp16 scale or None)
+        if _w4a16:
+            packed, scale = _pack_gr00t_w4(w, 1 if swz is tp_col_swizzle_mc_weight else 0, cores)
+            return packed.to("rpu"), scale.to("rpu")
         if _w8a16:
             wq, ws = quantize_linear_per_channel(w.half())
-            return swz(wq, _TP, dwidth=1).contiguous().to("rpu"), ws.to(torch.float16).to("rpu").contiguous()
-        return hr(swz(w.half(), _TP)), None
+            return swz(wq, cores, dwidth=1).contiguous().to("rpu"), ws.to(torch.float16).to("rpu").contiguous()
+        return hr(swz(w.half(), cores)), None
 
     L = {k: [] for k in ("n1w", "n1b", "qb", "kb", "vb", "ob", "n3w", "n3b", "f0b", "f2b")}
     GW = {k: [] for k in ("qw", "kw", "vw", "ow", "f0w", "f2w")}        # int8/fp16 weights
@@ -2465,13 +2679,16 @@ def _build_vl_encoder(gw, w_rms):
         SC["qw"], SC["kw"], SC["vw"], SC["ow"], SC["f0w"], SC["f2w"]
     )
     handle = _configure_gr00t_vl_encoder_handle(
-        weight_args=weight_args, scale_args=scale_args, w8a16=_w8a16
+        weight_args=weight_args, scale_args=scale_args, w8a16=_w8a16, cores=cores
     )
     return handle, (L, GW, SC, vlln_w, vlln_b, inv_w_rms)
 
 
-def _build_denoise(gw, emb, num_steps=_NSTEPS):
-    """B/C: 32 DiT blocks (gr00t_dit) + per-step glue (encoders/norm_out/decoder) + baked tables."""
+def _build_denoise(gw, emb, num_steps=_NSTEPS, cores=8):
+    """B/C: 32 DiT blocks (gr00t_dit) + per-step glue (encoders/norm_out/decoder) + baked tables.
+
+    ``cores`` swizzles the 32 blocks (including the AdaLN row GEMV); the
+    per-step glue stays single-core at every budget."""
     num_steps = _validate_gr00t_num_steps(num_steps)
     hr = _half_rpu
 
@@ -2499,18 +2716,24 @@ def _build_denoise(gw, emb, num_steps=_NSTEPS):
     def catB(prefix):  return gw(prefix + ".b")[emb].contiguous()
 
     # --- 32 DiT blocks (col q/k/v/ff1, row to_out/ff2/adaln) ---
-    # W8A16 (opt-in RPU_GR00T_W8A16) quantizes the 6 DiT GEMMs/block (q/k/v/o/ff1/ff2)
-    # with per-output-channel symmetric int8 + fp16 row-scale and int8 swizzle (dwidth=1).
-    # AdaLN GEMV stays fp16; sc() separately quantizes the 8 per-step K%32==0 GEMMs.
-    # Default off = fp16.
+    # W8A16 (opt-in RPU_GR00T_W8A16): int8 the 6 DiT GEMMs/block (q/k/v/o/ff1/ff2) — the dominant
+    # denoise compute (~74% per hw-perf) — and the AdaLN GEMV. Per-output-channel symmetric int8 +
+    # fp16 row-scale, int8 swizzle (dwidth=1). The per-step glue is int8'd separately by sc()
+    # below (the 8 K%32==0 GEMMs). Default off = fp16 (unchanged).
+    # W4A16 (RPU_GR00T_W4A16, on top of W8): the 6 block GEMMs become G32 RTN pgrp W4; AdaLN
+    # and the glue stay W8.
     _w8a16 = _w8a16_on()
+    _w4a16 = _w4a16_on()
     if _w8a16:
         from rpu_backend.quant._common import quantize_linear_per_channel
-    def _qw(w, swz):  # -> (device weight [int8 dwidth=1 if w8a16 else fp16], device fp16 scale or None)
+    def _qw(w, swz, w4=_w4a16):  # -> (rpu weight [packed W4 / int8 dwidth=1 / fp16], rpu fp16 scale or None)
+        if w4:
+            packed, scale = _pack_gr00t_w4(w, 1 if swz is tp_col_swizzle_mc_weight else 0, cores)
+            return packed.to("rpu"), scale.to("rpu")
         if _w8a16:
             wq, ws = quantize_linear_per_channel(w.half())
-            return swz(wq, _TP, dwidth=1).contiguous().to("rpu"), ws.to(torch.float16).to("rpu").contiguous()
-        return hr(swz(w.half(), _TP)), None
+            return swz(wq, cores, dwidth=1).contiguous().to("rpu"), ws.to(torch.float16).to("rpu").contiguous()
+        return hr(swz(w.half(), cores)), None
     DL = {k: [] for k in ("q", "k", "v", "o", "f1", "f2", "aw", "ab", "qb", "kb", "vb", "ob", "f1b", "f2b")}
     SC = {k: [] for k in ("q", "k", "v", "o", "f1", "f2", "aw")}
     is_cross = []
@@ -2525,7 +2748,7 @@ def _build_denoise(gw, emb, num_steps=_NSTEPS):
                                # AdaLN modulation uses the M=1 row GEMV layout;
                                # its optional INT8 weights retain the corresponding scale path.
                                ("aw", "norm1.linear.weight", tp_row_swizzle_mc_weight)):
-            w, s = _qw(gw(p + name), swz); DL[key].append(w); SC[key].append(s)
+            w, s = _qw(gw(p + name), swz, _w4a16 and key != "aw"); DL[key].append(w); SC[key].append(s)
         DL["ab"].append(hr(gw(p + "norm1.linear.bias").half()))
         DL["qb"].append(hr(gw(p + "attn1.to_q.bias").half())); DL["kb"].append(hr(gw(p + "attn1.to_k.bias").half()))
         DL["vb"].append(hr(gw(p + "attn1.to_v.bias").half())); DL["ob"].append(hr(gw(p + "attn1.to_out.0.bias").half()))
@@ -2585,6 +2808,7 @@ def _build_denoise(gw, emb, num_steps=_NSTEPS):
         dit_scale_args=dit_scale_args,
         denoise_args=denoise_args,
         w8a16=_w8a16,
+        cores=cores,
     )
     keep = (DL, SC, se1, se1_b, se2, se2_b, ae1, ae1_b, ae2a, ae2t, ae2_b, ae3, ae3_b,
             dec1, dec1_b, dec2, dec2_b, po1, po1_b, po2, po2_b, cond_t, tau_t, pos_t,
@@ -2621,6 +2845,11 @@ def build_gr00t_vla(
         qwen_z1=qwen_z1_enabled,
         max_prefix_len=max_prefix_len,
     )
+    cores = _gr00t_core_count(execution_config)
+    # W4 needs W8 and refuses the FP16/W8-only fused DiT owners before any weight is read;
+    # Vision W4 needs W4.
+    w4a16 = _w4a16_on()
+    vision_precision = _gr00t_vision_precision()
     if qwen_z1_enabled:
         if _w8a16_on():
             raise ValueError(
@@ -2693,7 +2922,22 @@ def build_gr00t_vla(
     os.environ.setdefault("RPU_DEEP_FAST_REPLAY", "1")
     from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration
     cfg = Qwen3VLConfig.from_pretrained(qwen3vl_local)
+    if vision_precision.get("w4a16") and not _is_qwen3_vl_w4_vision_tower(
+            cfg.vision_config, getattr(cfg.vision_config, "depth", None)):
+        raise ValueError("RPU_GR00T_VISION_W4A16=1 requires the exact Qwen3-VL-2B Vision tower")
     cfg.text_config.num_hidden_layers = _SELECT_LAYER
+    text_topology = None
+    if cores != 8:
+        layer_types = getattr(cfg.text_config, "layer_types", None)
+        if layer_types is not None:
+            cfg.text_config.layer_types = list(layer_types[:_SELECT_LAYER])
+        from rpu_backend.api._execution import qwen3_vl_text_topology
+        try:
+            text_topology = qwen3_vl_text_topology(cfg.text_config, cores)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"build_gr00t_vla: model.num_cores={cores} requires the exact "
+                "Qwen3-VL-2B text prefix") from exc
     model = Qwen3VLForConditionalGeneration(cfg)
     model._rpu_execution = execution_config
     sd = {}
@@ -2742,12 +2986,32 @@ def build_gr00t_vla(
             (owner, "forward" in vars(owner), vars(owner).get("forward"))
             for owner in (model, text_model, vision_model)
         )
-        # Backbone W8A16 quantizes the text decoder's seven projections before
-        # swizzle. INT8 uses dwidth=1, and scale_lists select the native W8A16 setter.
-        # Quantization changes the backbone's numerical path and remains opt-in.
-        if _w8a16_on():
+        # Backbone W8A16 (opt-in RPU_GR00T_W8A16, same switch as the DiT): int8 the 16-layer
+        # Qwen3-VL text decoder's 7 projection GEMMs (~21 ms of the 64 ms backbone is GEMM). The
+        # quant runs BEFORE the swizzle so convert_linear_weights_inplace swizzles int8 at dwidth=1;
+        # scale_lists then route the install to causal_decoder_set_weights_w8a16 (the proven qwen3
+        # decoder W8A16 path). Backbone fp16 drift (vl_embeds cos ~0.9987) is already absorbed by the
+        # denoise → action cos held; int8 adds a touch more, gated by the gr00t.toml cos threshold.
+        # W4A16 (RPU_GR00T_W4A16) packs the same 7 GEMMs as G32 pgrp W4 instead; the swizzle
+        # skips those leaves and the same setter dispatches on their uint8 weights.
+        if text_topology is not None:
+            # Read-only four-core admission before any tower is converted.
+            validate_qwen3_vl_vision_core_profile(
+                vision_model, num_cores=_REDUCED_LANES, vision_config=cfg.vision_config)
+        if w4a16:
+            _quantize_backbone_w4_inplace(text_model, text_topology)
+        elif _w8a16_on():
             _quantize_backbone_inplace(text_model)
-        convert_linear_weights_inplace(text_model, skip_names=set())
+        from rpu_backend.quant.convert_qwen3_w4a16 import SKIP_LINEAR_NAMES
+        convert_linear_weights_inplace(text_model, skip_names=set(SKIP_LINEAR_NAMES) if w4a16 else set(), **(
+            {} if text_topology is None else {
+                "attn_num_cores": text_topology.attn_tp,
+                "mlp_num_cores": text_topology.mlp_tp,
+                "lm_head_num_cores": text_topology.lm_head_tp,
+                "execution_core_count": text_topology.num_cores,
+            }))
+        if w4a16:
+            _mark_backbone_w4_layout(text_model, text_topology)
         text_model.to("rpu")
         bb_scale_lists = (
             _backbone_scale_lists(text_model) if _w8a16_on() else None
@@ -2755,25 +3019,34 @@ def build_gr00t_vla(
         # Vision-ViT W8A16 (gated): int8 the 24-block qwen3vl vision encoder's 6 GEMMs/block. The
         # install w8a16 path is opt-in (default off → qwen3_vl/qwen3-vl E2E byte-identical). The merger
         # GEMMs (enable_..._merger_on_device below) stay fp16. Drift absorbed by the denoise.
+        # RPU_GR00T_VISION_W4A16 packs the same GEMMs G32 W4 instead; packed blocks take the
+        # generic encoder schedule (the resident and raw-grouped batch schedules are FP16/W8).
         install_qwen3_vl_vision_for_rpu(
             vision_model,
             vision_config=cfg.vision_config,
-            w8a16=_w8a16_on(),
+            **vision_precision,
             execution_chunk_size=vision_execution.get(
                 "vision", {}
             ).get("chunk_size", "auto"),
+            **({} if text_topology is None else {"num_cores": _REDUCED_LANES}),
         )
         # Opt4: run the patch-merger + deepstack-merger GEMMs on device (default qwen3_vl keeps them CPU
         # fp32). The merger is the single largest vision stage; the fp16 drift is absorbed by denoise.
-        enable_qwen3_vl_vision_merger_on_device(vision_model)
+        # Reduced budgets run them on the four Vision lanes.
+        enable_qwen3_vl_vision_merger_on_device(
+            vision_model, **({} if text_topology is None else {"cores": _REDUCED_LANES}))
         # ROUND-3 opt #1: the Python cold builder is the only selector
         # authority. Registering merger weights enables the native post_fn;
         # omitting them keeps the eager merger path.
         if rpu_env_bool("RPU_QWEN3VL_VISION_FUSED_MERGER"):
-            register_qwen3vl_vision_fused_merger(vision_model)
-        # RPU_QWEN3VL_VISION_BATCH groups consecutive equal-size images for one
-        # vision forward while preserving per-image attention boundaries.
-        # The vision adapter reads this explicit option; no setup is needed here.
+            register_qwen3vl_vision_fused_merger(
+                vision_model, **({} if text_topology is None else {"cores": _REDUCED_LANES}))
+        # Multi-image batch (per-image minibatch SDPA): env opt-in RPU_QWEN3VL_VISION_BATCH=1 packs
+        # consecutive equal-size images into ONE vision forward (3 REPLAYs→1 + GEMM MFU). Bit-exact
+        # vs the per-image loop (verify_vision_batch_equiv) and single-image (g=1) byte-identical, so
+        # it's purely additive — read in vision.py forward, no setup needed here. Measured −11.7 ms /
+        # −12% backbone at 三图 (768 patches) with the fused merger. Left as an explicit env opt-in
+        # alongside RPU_GR00T_W8A16 / RPU_QWEN3VL_VISION_FUSED_MERGER (not setdefault'd).
         n_ds = len(getattr(cfg.vision_config, "deepstack_visual_indexes", []))
         install_qwen3_vl_text_for_rpu(
             text_model,
@@ -2784,18 +3057,20 @@ def build_gr00t_vla(
             enable_deepstack=True,
             scale_lists=bb_scale_lists,
             execution_config=text_execution,
+            **({} if text_topology is None else {"topology": text_topology}),
         )
 
+        lanes = _gr00t_component_cores(cores, _ACTION_COMPONENT)
         gw = _ckpt_reader(ckpt_path)
-        a_handle, a_keep = _build_vl_encoder(gw, w_rms)
-        d_handle, d_keep = _build_denoise(gw, embodiment_id, num_steps=num_steps)
+        a_handle, a_keep = _build_vl_encoder(gw, w_rms, cores=lanes)
+        d_handle, d_keep = _build_denoise(gw, embodiment_id, num_steps=num_steps, cores=lanes)
 
         a_cache = RPUCache(num_layers=_VL_NL, batch_size=1, max_seq_len=max_prefix_len,
-                           num_kv_heads=_VLH, head_dim=_VLHD, attn_tp=_TP)
+                           num_kv_heads=_VLH, head_dim=_VLHD, attn_tp=lanes)
         # Cross-attn KV holds the whole backbone sequence, not just action rows.
         # Bind both actual owner caches before the first composite preparation.
         d_cache = RPUCache(num_layers=_NL, batch_size=1, max_seq_len=max_prefix_len,
-                           num_kv_heads=_NQ, head_dim=_HD, attn_tp=_TP)
+                           num_kv_heads=_NQ, head_dim=_HD, attn_tp=lanes)
         torch.ops.rpu.gr00t_vl_encoder_set_chunk_envelope(a_handle, int(a_cache.max_seq_len), 0)
         torch.ops.rpu.gr00t_dit_set_chunk_envelope(d_handle, int(d_cache.max_seq_len), 0)
 

@@ -71,7 +71,9 @@ from rpu_backend.runtime.decoder import (
 
 from rpu_backend.api.errors import UnsupportedModelError, RPUBackendError
 from rpu_backend.api.causal_lm import _claim_live_instance
-from rpu_backend.api._execution import _LLAMA_EXECUTION_SUPPORTED, llama_core_profile
+from rpu_backend.api._execution import (
+    _LLAMA_EXECUTION_SUPPORTED, llama_core_profile, llama_dense_quant_profile,
+)
 from rpu_backend.runtime.device import extract_to_device_target, is_rpu_device_target
 from rpu_backend.runtime.chunk_envelope import ChunkEnvelope, make_lookup
 from rpu_backend.runtime.topology import (
@@ -84,6 +86,12 @@ _CHUNK_ENVELOPE = {
 }
 lookup_causal_decoder = make_lookup(
     _CHUNK_ENVELOPE, "rpu_backend/adapters/llama.py::_CHUNK_ENVELOPE")
+
+
+# Cold on-install decoder recipes (registry family `llama`). The seven decoder
+# projections are quantized once from the official FP16 source; the tied output
+# head, embedding and norms stay FP16.
+_ON_INSTALL_QUANTIZATION = ("w8a16", "w4a16", "nvfp4")
 
 
 # Module-level lock serializes swizzle across all Llama models in the process.
@@ -197,6 +205,29 @@ def _validate_reduced_model_structure(model, topology, *, before_swizzle=False) 
         raise UnsupportedModelError(str(exc)) from exc
 
 
+def _validate_quant_source(model, topology) -> None:
+    """Admit the original CPU FP16 tree before an on-install decoder recipe."""
+    from rpu_backend.runtime.weights import validate_decoder_weight_structure
+
+    try:
+        profile = llama_dense_quant_profile(model.config)
+        if resolve_decoder_topology(num_cores=topology.num_cores,
+                                    **profile.geometry()) != topology:
+            raise ValueError("decoder geometry changed its bound cold topology")
+        validate_decoder_weight_structure(model, **profile.weight_geometry(), qk_norm=False)
+        for name, tensor in model.named_parameters():
+            if (tensor.dtype != torch.float16 or tensor.device.type != "cpu"
+                    or not tensor.is_contiguous()):
+                raise ValueError(f"on-install quantization requires original contiguous CPU FP16 weights: {name}")
+        for name, module in model.named_modules():
+            if (hasattr(module, "_rpu_linear_partition") or any(
+                    getattr(module, attr, None) is not None for attr in (
+                        "weight_scale", "weight_scale_inv", "qweight"))):
+                raise ValueError(f"on-install quantization requires original unquantized, unswizzled weights: {name}")
+    except ValueError as exc:
+        raise UnsupportedModelError(str(exc)) from exc
+
+
 class LlamaAdapter:
     """Per-instance adapter for HF `LlamaForCausalLM`.
 
@@ -212,6 +243,33 @@ class LlamaAdapter:
     def preflight(cls, config) -> None:
         """Config-only fail-fast preflight (called by `from_pretrained`)."""
         _check_profile(config)
+
+    @classmethod
+    def preflight_quantization(cls, config, execution_config, quantization):
+        """Admit the exact FP16 source and core budget for an on-install recipe."""
+        _check_profile(config)
+        try:
+            if quantization not in _ON_INSTALL_QUANTIZATION:
+                raise ValueError(f"unknown Llama on-install recipe {quantization!r}")
+            profile = llama_dense_quant_profile(config)
+            resolve_decoder_topology(num_cores=execution_core_count(execution_config),
+                                     **profile.geometry())
+        except ValueError as exc:
+            raise UnsupportedModelError(
+                "on-install W8A16 / G32 W4A16 / NVFP4 requires the exact Llama-3.2-1B "
+                "FP16 source and model.num_cores 4, 6 or 8; output head, embedding "
+                "and norms remain FP16: " + str(exc)
+            ) from exc
+        return profile
+
+    def _bound_topology(self):
+        """Quantized installs always bind their topology, eight cores included."""
+        execution = getattr(self.model, "_rpu_execution", None)
+        if self._quantization is None:
+            return _execution_topology(self.model.config, execution)
+        profile = self.preflight_quantization(self.model.config, execution, self._quantization)
+        return resolve_decoder_topology(num_cores=execution_core_count(execution),
+                                        **profile.geometry())
 
     @classmethod
     def preflight_execution(cls, config, execution_config) -> None:
@@ -230,16 +288,22 @@ class LlamaAdapter:
                 f"chunk ceiling {env.chunk}. Refusing before loading model weights."
             )
 
-    def __init__(self, model: nn.Module) -> None:
+    def __init__(self, model: nn.Module, *, quantization=None) -> None:
         # Belt-and-suspenders: catches direct-instantiation paths that bypass
         # `RPUModelForCausalLM.from_pretrained.preflight`.
         _check_profile(model.config)
+        if (getattr(model.to, "__rpu_wrapped__", False)
+                and getattr(model.to, "__rpu_quantization__", None) != quantization):
+            raise UnsupportedModelError("Llama on-install quantization is cold-only; reload the model to change it")
         self.model = model
+        self._quantization = quantization
         self._all_layers_once_handle: int | None = None
-        self._topology = _execution_topology(
-            model.config, getattr(model, "_rpu_execution", None))
+        self._topology = self._bound_topology()
         if not _causal_lm_runtime_complete(model):
-            _validate_reduced_model_structure(model, self._topology)
+            if quantization is not None:
+                _validate_quant_source(model, self._topology)
+            else:
+                _validate_reduced_model_structure(model, self._topology)
         # Mirror Qwen3Adapter pattern: readiness lives on the model so a second
         # adapter on the same instance does NOT re-swizzle (Pitfall 1).
         self._rpu_is_ready: bool = _causal_lm_runtime_complete(model)
@@ -287,6 +351,7 @@ class LlamaAdapter:
             return original_to(*args, **kwargs)
 
         rpu_aware_to.__rpu_wrapped__ = True
+        rpu_aware_to.__rpu_quantization__ = quantization
         model.to = rpu_aware_to
 
     def to_rpu(self) -> nn.Module:
@@ -332,10 +397,12 @@ class LlamaAdapter:
                 install_hw_attr_validator, validate_postinstall, validate_preinstall,
             )
             validate_preinstall(self.model)
-            if (_execution_topology(self.model.config, getattr(self.model, "_rpu_execution", None))
-                    != self._topology):
+            if self._bound_topology() != self._topology:
                 raise UnsupportedModelError("Llama core budget changed after adapter binding")
-            _validate_reduced_model_structure(self.model, self._topology, before_swizzle=True)
+            if self._quantization is not None:
+                _validate_quant_source(self.model, self._topology)
+            else:
+                _validate_reduced_model_structure(self.model, self._topology, before_swizzle=True)
 
             require_native_backend()
             _claim_live_instance(self.model)
@@ -348,9 +415,13 @@ class LlamaAdapter:
             had_instance_forward = "forward" in inner_state
             original_instance_forward = inner_state.get("forward")
             try:
+                nvfp4_tensor_scales = None
                 # Plain Llama has no specialized Linear leaves, so an empty
                 # skip set is intentional.
-                if self._topology is None:
+                if self._quantization is not None:
+                    nvfp4_tensor_scales = _quantize_decoder_for_rpu(
+                        self.model, self._quantization, self._topology)
+                elif self._topology is None:
                     swizzle_model_inplace(self.model, skip_names=set())
                 else:
                     # MLP6 needs 8192 -> 8256 (8192 % 96 == 32): zero rows/
@@ -369,14 +440,27 @@ class LlamaAdapter:
                     )
                 original_to = type(self.model).to
                 original_to(self.model, "rpu")
+                if nvfp4_tensor_scales is not None:
+                    # Bind each table to its packed weights' device; the installer
+                    # keeps it alive with the other set_weights operands.
+                    device = inner.layers[0].self_attn.q_proj.weight.device
+                    nvfp4_tensor_scales = tuple(table.to(device) for table in nvfp4_tensor_scales)
+                scale_lists = None
+                if self._quantization is not None:
+                    from rpu_backend.quant.convert_qwen3_w4a16 import _PROJECTIONS
+                    scale_lists = tuple(
+                        [layer.get_submodule(role).weight_scale for layer in inner.layers]
+                        for role, _ in _PROJECTIONS)
                 self._all_layers_once_handle = _install_causal_decoder_forward(
-                    inner, arch="llama",
+                    inner, arch="llama", scale_lists=scale_lists,
                     chunk_envelope_for=lookup_causal_decoder,
                     execution_config=getattr(
                         self.model, "_rpu_execution", None
                     ),
                     **({"topology": self._topology}
                        if self._topology is not None else {}),
+                    **({"nvfp4_tensor_scales": nvfp4_tensor_scales}
+                       if nvfp4_tensor_scales is not None else {}),
                 )
                 _enable_causal_decoder_execution_reconfigure(inner)
                 self._execution_session = _bind_causal_decoder_execution_session(
@@ -400,6 +484,49 @@ class LlamaAdapter:
             return self.model
         finally:
             _SWIZZLE_LOCK.release()
+
+
+def _quantize_decoder_for_rpu(model, quantization, topology):
+    """Quantize the seven decoder projections once, then swizzle the rest.
+
+    W8A16 keeps natural int8 storage: the six-lane MLP is zero-padded like FP16
+    (8192 -> 8256, Gate/Up scales 1) before the ordinary byte-width swizzle.
+    G32 W4A16 and NVFP4 pack their own per-core layout (six-lane MLP 8192 ->
+    8448) and are skipped by the generic swizzle (pitfall P1). Returns the
+    seven NVFP4 tensor-scale tables, or None.
+    """
+    from rpu_backend.quant.convert_qwen3_w4a16 import (
+        DEFAULT_GROUP_SIZE, SKIP_LINEAR_NAMES, _PROJECTIONS, convert_qwen3_to_w4a16_,
+    )
+
+    cores = dict(attn_num_cores=topology.attn_tp, mlp_num_cores=topology.mlp_tp,
+                 lm_head_num_cores=topology.lm_head_tp,
+                 execution_core_count=topology.num_cores)
+    if quantization == "w8a16":
+        from rpu_backend.quant.convert_llama import quantize_llama_w8a16_
+        from rpu_backend.runtime.weights import pad_decoder_mlp_weights
+        quantize_llama_w8a16_(model)
+        logical = model.config.intermediate_size
+        pad_decoder_mlp_weights(model, logical_size=logical,
+            physical_size=decoder_mlp_intermediate_size(logical, topology.mlp_tp))
+        swizzle_model_inplace(model, skip_names=set(), **cores)
+        return None
+    tensor_scales = None
+    if quantization == "nvfp4":
+        from rpu_backend.quant.convert_qwen3_nvfp4 import convert_qwen3_to_nvfp4_
+        tensor_scales = convert_qwen3_to_nvfp4_(model, topology=topology)
+    else:
+        convert_qwen3_to_w4a16_(model, group_size=DEFAULT_GROUP_SIZE, topology=topology)
+    swizzle_model_inplace(model, skip_names=set(SKIP_LINEAR_NAMES), **cores)
+    # The generic skip marker describes only that swizzle; these projections
+    # already carry the selected packed layout.
+    for layer in model.model.layers:
+        for role, partition in _PROJECTIONS:
+            projection = layer.get_submodule(role)
+            projection._rpu_linear_partition = partition
+            projection._rpu_linear_num_cores = (
+                topology.mlp_tp if role.startswith("mlp.") else topology.attn_tp)
+    return tensor_scales
 
 
 from rpu_backend.runtime.registry import register_adapter

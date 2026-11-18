@@ -54,12 +54,15 @@ from rpu_backend.adapters.qwen3_vl import (
 )
 from rpu_backend.adapters.qwen3_vl.vision import (
     _prepare_qwen3vl_vision_input_for_spm_pipeline,
+    enable_qwen3_vl_vision_merger_on_device,
+    validate_qwen3_vl_vision_core_profile,
 )
 from rpu_backend.api._execution import (
     bind_execution_session,
     execution_serialized,
     native_execution_reconfigure,
     normalize_rpu_execution,
+    qwen3_vl_text_topology,
     resolve_component_rpu_execution,
 )
 from rpu_backend.runtime.decoder import (
@@ -76,7 +79,8 @@ from rpu_backend.runtime.execution_planner import (
     plan_fixed_component_execution,
 )
 from rpu_backend.runtime.rope_partial import build_interleaved_mrope_cos_sin
-from rpu_backend.runtime.weights import convert_linear_weights_inplace
+from rpu_backend.runtime.topology import decoder_mlp_intermediate_size
+from rpu_backend.runtime.weights import convert_linear_weights_inplace, pad_decoder_mlp_weights
 
 from rpu_backend.adapters.lingbot_vla_v2 import convert as _cv
 from rpu_backend.adapters.lingbot_vla_v2.convert import (
@@ -94,6 +98,7 @@ VLM_LAYERS = 36
 VLM_HID = 2560
 ATTN_TP = 8                     # C++ attn_tp() == min(NUM_CORES, num_kv_heads); 8 for BOTH halves,
                                 # which is exactly why one shared RPUCache serves both.
+                                # At a reduced budget both halves run attention on four lanes.
 DEFAULT_MAX_SEQ = 1024          # rope-table + KV-cache capacity (prefix S + suffix 51 must fit)
 PREFIX_PADDING_MULTIPLE = 16
 PREFIX_POLICY_VERSION = 1
@@ -121,6 +126,80 @@ LINGBOT2_EXECUTION_COMPONENTS = {
     },
     LINGBOT2_ACTION_COMPONENT: {"action": ("chunk_size",)},
 }
+_LINGBOT2_MODEL_SCOPE = {"model": ("num_cores",)}
+# The public core budget belongs to the composite and is cold-only. At 4/6
+# cores the language model runs the reduced Qwen3-VL-4B template (attention 4,
+# MLP = budget; MLP6 pads I9728 to 9792). The Vision tower and the action
+# expert have four-lane owners only (routed I512 does not split over six), so
+# they run on four cores under either reduced budget and share one attn_tp 4
+# RPUCache with the language model.
+_LINGBOT2_REDUCED_LANES = 4
+_LINGBOT2_EXECUTION_SUPPORTED = {
+    **_LINGBOT2_MODEL_SCOPE,
+    **{stage: fields
+       for stages in LINGBOT2_EXECUTION_COMPONENTS.values()
+       for stage, fields in stages.items()},
+}
+# Eight-core owners only: the retained runtime graph and its folded/paired
+# prefill, the Z2 arena, dense grouped/packed or W4 experts, packed Vision
+# batches, the in-graph merger and the direct prefix it feeds, the device
+# patch embed and the AdaRMS broadcast schedules. A reduced build refuses each
+# before any weight moves; its Vision runs the four mergers eagerly on the
+# four Vision lanes and keeps the CPU FP16 patch projection.
+_LINGBOT2_EIGHT_CORE_SELECTORS = (
+    "RPU_LINGBOT2_RUNTIME_GRAPH",
+    "RPU_LINGBOT2_PREFILL_KV_PAIR",
+    "RPU_LINGBOT2_PREFILL_QK_NORM_ROPE",
+    "RPU_LINGBOT2_MULTIVIEW_SPM_Z2",
+    "RPU_LINGBOT2_GROUPED_EXPERTS",
+    "RPU_LINGBOT2_ROUTED_GEMM",
+    "RPU_LINGBOT2_EXPERT_W4A16",
+    "RPU_LINGBOT2_PREFILL_W4A16",
+    "RPU_QWEN3VL_VISION_BATCH",
+    "RPU_QWEN3VL_VISION_FUSED_MERGER",
+    "RPU_QWEN3VL_VISION_PATCH_EMBED_DEVICE",
+    "RPU_LINGBOT2_VISION_DIRECT_PREFIX",
+    "RPU_LINGBOT2_VISION_DIRECT_PREFIX_NO_OUTPUT",
+    "RPU_LINGBOT2_ADARMS_DIRECT_SCHEDULE",
+    "RPU_ADARMS_FUSED_BCAST",
+)
+
+
+def _lingbot2_core_budget(execution) -> int:
+    # normalize_rpu_execution already admitted 4, 6 or 8.
+    return (execution or {}).get("model", {}).get("num_cores", 8)
+
+
+def _lingbot2_component_cores(budget: int, component: str) -> int:
+    if budget == 8:
+        return 8
+    return budget if component == LINGBOT2_TEXT_COMPONENT else _LINGBOT2_REDUCED_LANES
+
+
+def _lingbot2_graph_policy(policy, cores: int):
+    """A reduced child bounds its own native queue/kernel/DMA prefix."""
+    if cores == policy.execution_core_count:
+        return policy
+    return dataclasses.replace(
+        policy, execution_core_count=cores,
+        provenance=policy.provenance + ("owner:execution_core_count",))
+
+
+def _validate_lingbot2_reduced_environment(budget: int) -> None:
+    """Refuse eight-core-only selectors and require sparse experts at 4/6."""
+    if budget == 8:
+        return
+    enabled = [name for name in _LINGBOT2_EIGHT_CORE_SELECTORS
+               if rpu_env_bool(name)]
+    if enabled:
+        raise ValueError(
+            f"LingBot2 model.num_cores={budget} refuses eight-core-only "
+            "selectors: " + ", ".join(enabled))
+    if not _lingbot2_exact_bool("RPU_LINGBOT2_SPARSE_EXPERTS"):
+        raise ValueError(
+            f"LingBot2 model.num_cores={budget} requires "
+            "RPU_LINGBOT2_SPARSE_EXPERTS=1 (the reduced expert has no dense "
+            "per-expert route)")
 
 
 def resolve_lingbot2_execution_components(value, *, entry_point: str):
@@ -128,35 +207,40 @@ def resolve_lingbot2_execution_components(value, *, entry_point: str):
     root = normalize_rpu_execution(
         value,
         entry_point=entry_point,
+        supported=_LINGBOT2_EXECUTION_SUPPORTED,
         supported_components=LINGBOT2_EXECUTION_COMPONENTS,
     )
-    vision = resolve_component_rpu_execution(
-        root,
-        LINGBOT2_VISION_COMPONENT,
-        entry_point=entry_point,
-        supported_components=LINGBOT2_EXECUTION_COMPONENTS,
-        profile_auto={"vision": {"chunk_size": "auto"}},
-    )
-    text = resolve_component_rpu_execution(
-        root,
-        LINGBOT2_TEXT_COMPONENT,
-        entry_point=entry_point,
-        supported_components=LINGBOT2_EXECUTION_COMPONENTS,
-        profile_auto={
+    budget = _lingbot2_core_budget(root)
+    children = []
+    for component, profile_auto in (
+        (LINGBOT2_VISION_COMPONENT, {"vision": {"chunk_size": "auto"}}),
+        (LINGBOT2_TEXT_COMPONENT, {
             "prefill": {
                 "chunk_size": "auto",
                 "padding_rows": "auto",
                 "padding_budget": PREFIX_PADDING_MULTIPLE - 1,
             },
-        },
-    )
-    action = resolve_component_rpu_execution(
-        root,
-        LINGBOT2_ACTION_COMPONENT,
-        entry_point=entry_point,
-        supported_components=LINGBOT2_EXECUTION_COMPONENTS,
-        profile_auto={"action": {"chunk_size": "auto"}},
-    )
+        }),
+        (LINGBOT2_ACTION_COMPONENT, {"action": {"chunk_size": "auto"}}),
+    ):
+        child = resolve_component_rpu_execution(
+            root,
+            component,
+            entry_point=entry_point,
+            supported=_LINGBOT2_EXECUTION_SUPPORTED,
+            supported_components=LINGBOT2_EXECUTION_COMPONENTS,
+            profile_auto=profile_auto,
+        )
+        if budget != 8:
+            child = normalize_rpu_execution(
+                {**child, "model": {
+                    "num_cores": _lingbot2_component_cores(budget, component)}},
+                entry_point=entry_point,
+                supported={**LINGBOT2_EXECUTION_COMPONENTS[component],
+                           **_LINGBOT2_MODEL_SCOPE},
+            )
+        children.append(child)
+    vision, text, action = children
     return root, vision, text, action
 
 
@@ -1320,6 +1404,13 @@ class LingbotVlaV2Policy:
             entry_point="LingbotVlaV2Policy",
         )
         self._rpu_execution = resolved_execution[0]
+        self._core_budget = _lingbot2_core_budget(self._rpu_execution)
+        self._text_graph_policy = _lingbot2_graph_policy(
+            self._graph_runtime_policy,
+            _lingbot2_component_cores(self._core_budget, LINGBOT2_TEXT_COMPONENT))
+        self._action_graph_policy = _lingbot2_graph_policy(
+            self._graph_runtime_policy,
+            _lingbot2_component_cores(self._core_budget, LINGBOT2_ACTION_COMPONENT))
         self._execution_generation = int(execution_generation)
         self._component_generations = (
             {
@@ -1362,16 +1453,18 @@ class LingbotVlaV2Policy:
         # ONE shared RPUCache: the VLM fills [0, S); the expert reads that prefix KV cross-handle
         # and writes only its own suffix [S, S+51). Both halves are 8 KV heads / head_dim 128 /
         # attn_tp 8, so the 7-D swizzle layout is identical — this is what makes sharing legal.
+        # A reduced budget runs both halves' attention on four lanes (physical KV keeps 8 stripes).
         self._cache = RPUCache(num_layers=VLM_LAYERS, batch_size=1, max_seq_len=max_seq,
-                               num_kv_heads=NKV, head_dim=HD, attn_tp=ATTN_TP)
+                               num_kv_heads=NKV, head_dim=HD,
+                               attn_tp=ATTN_TP if self._core_budget == 8 else _LINGBOT2_REDUCED_LANES)
 
         # PER-MODEL graph caches (never get_default_graph_cache() — a shared default would let a
         # sibling model's signature collide with ours).
         self._vgc = rpu_backend.graph.GraphCache(
-            runtime_policy=self._graph_runtime_policy
+            runtime_policy=self._text_graph_policy
         )
         self._egc = rpu_backend.graph.GraphCache(
-            runtime_policy=self._graph_runtime_policy
+            runtime_policy=self._action_graph_policy
         )
         self._prepared_graph_profile = None
         self._graphs_ready = False
@@ -1445,7 +1538,7 @@ class LingbotVlaV2Policy:
         self._dgc = None
         if self._denoise_unroll:
             self._dgc = rpu_backend.graph.GraphCache(
-                runtime_policy=self._graph_runtime_policy
+                runtime_policy=self._action_graph_policy
             )
             self._build_denoise_unroll()
         if self._multiview_spm_z2:
@@ -1633,6 +1726,7 @@ class LingbotVlaV2Policy:
                 self,
                 self._rpu_execution,
                 entry_point="LingbotVlaV2Policy",
+                supported=_LINGBOT2_EXECUTION_SUPPORTED,
                 supported_components=LINGBOT2_EXECUTION_COMPONENTS,
                 validate=self.validate_execution_reconfigure,
                 apply=lambda old, new, generation, *, force_rebuild=False: (
@@ -2490,6 +2584,10 @@ class LingbotVlaV2Policy:
             entry_point="LingbotVlaV2Policy.reconfigure",
         )
         _root, vision, text, action = resolved
+        if _lingbot2_core_budget(_root) != self._core_budget:
+            raise ValueError(
+                "LingBot2 model.num_cores is cold-only: build a fresh runtime "
+                "to change topology")
         action_chunk = action.get("action", {}).get(
             "chunk_size", "auto"
         )
@@ -4541,16 +4639,16 @@ class LingbotVlaV2Policy:
 
         if not self._vlm_replay:
             self._vgc = rpu_backend.graph.GraphCache(
-                runtime_policy=self._graph_runtime_policy
+                runtime_policy=self._text_graph_policy
             )
         if not self._expert_replay:
             if self._denoise_unroll:
                 self._dgc = rpu_backend.graph.GraphCache(
-                    runtime_policy=self._graph_runtime_policy
+                    runtime_policy=self._action_graph_policy
                 )
             else:
                 self._egc = rpu_backend.graph.GraphCache(
-                    runtime_policy=self._graph_runtime_policy
+                    runtime_policy=self._action_graph_policy
                 )
 
         if self._multiview_spm_z2:
@@ -4962,6 +5060,10 @@ def _build_lingbot_vla_v2_impl(
         rpu_execution,
         entry_point="build_lingbot_vla_v2",
     )
+    # build_lingbot_vla_v2 refused eight-core-only selectors before the claim.
+    core_budget = _lingbot2_core_budget(rpu_execution)
+    vision_cores = _lingbot2_component_cores(core_budget, LINGBOT2_VISION_COMPONENT)
+    action_cores = _lingbot2_component_cores(core_budget, LINGBOT2_ACTION_COMPONENT)
 
     from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
     from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
@@ -5056,6 +5158,14 @@ def _build_lingbot_vla_v2_impl(
             "(rpu_backend/qwen3_vl_base/) is used only when neither is given."
         )
     cfg = Qwen3VLConfig.from_pretrained(base)
+    text_topology = None
+    if core_budget != 8:
+        try:
+            text_topology = qwen3_vl_text_topology(cfg.text_config, core_budget)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"build_lingbot_vla_v2: model.num_cores={core_budget} requires the "
+                "exact Qwen3-VL-4B text profile") from exc
     gw, key_to_reader = ckpt_reader(ckpt)
 
     # ---- Qwen3-VL scaffold from the base CONFIG, weights from the V2 checkpoint -------------
@@ -5083,6 +5193,16 @@ def _build_lingbot_vla_v2_impl(
         torch.rpu.set_caching_allocator(True)
 
     text_model, vision_model = vlm.language_model, vlm.visual
+    if text_topology is not None:
+        # ckpt_reader yields CPU FP32 parameters; the eight-core install casts
+        # each one to FP16 itself, the four-core admission takes that FP16 tree.
+        # Rotary buffers keep their dtype.
+        with torch.no_grad():
+            for parameter in vision_model.parameters():
+                parameter.data = parameter.data.half().contiguous()
+        # Read-only four-core admission before either tower is converted.
+        validate_qwen3_vl_vision_core_profile(
+            vision_model, num_cores=vision_cores, vision_config=cfg.vision_config)
     # Publish partial ownership before the first irreversible swizzle/RPU
     # allocation. The outer transaction can then retire any text/vision handle
     # installed before a later stage fails.
@@ -5110,11 +5230,28 @@ def _build_lingbot_vla_v2_impl(
         convert_linear_weights_inplace(text_model, skip_names=set(_TEXT_INT4_NAMES))
         _n4 = _pack_text_w4a16(text_model)
         print(f"LINGBOT2_PREFILL_W4A16 packed {_n4} int4 projections to uint8", flush=True)
-    elif _env_on("RPU_LINGBOT2_PREFILL_W8A16"):
-        _quantize_text_w8a16(text_model)
-        convert_linear_weights_inplace(text_model, skip_names=set())
     else:
-        convert_linear_weights_inplace(text_model, skip_names=set())
+        if _env_on("RPU_LINGBOT2_PREFILL_W8A16"):
+            _quantize_text_w8a16(text_model)
+        text_layout = {}
+        if text_topology is not None:
+            # MLP6 pads I9728 -> 9792 once on the CPU (zero rows/columns,
+            # unit W8 scales); the config keeps the logical width.
+            view = torch.nn.Module()
+            view.model = text_model
+            view.config = cfg.text_config
+            pad_decoder_mlp_weights(
+                view, logical_size=cfg.text_config.intermediate_size,
+                physical_size=decoder_mlp_intermediate_size(
+                    cfg.text_config.intermediate_size, text_topology.mlp_tp))
+            del view
+            text_layout = {
+                "attn_num_cores": text_topology.attn_tp,
+                "mlp_num_cores": text_topology.mlp_tp,
+                "lm_head_num_cores": text_topology.lm_head_tp,
+                "execution_core_count": text_topology.num_cores,
+            }
+        convert_linear_weights_inplace(text_model, skip_names=set(), **text_layout)
     if _env_exact_one("RPU_LINGBOT2_MULTIVIEW_SPM_Z2"):
         # A retained physical arena cannot run an out-of-band RPU embedding
         # lookup between replays.  Keep one host FP16 token table so arbitrary
@@ -5140,9 +5277,17 @@ def _build_lingbot_vla_v2_impl(
         vision_config=cfg.vision_config,
         w8a16=_vis_w8,
         execution_chunk_size="auto" if z2_enabled else vision_chunk,
-        graph_runtime_policy=graph_runtime_policy,
+        graph_runtime_policy=_lingbot2_graph_policy(graph_runtime_policy, vision_cores),
+        **({} if vision_cores == 8 else {"num_cores": vision_cores}),
     )
     _take_lingbot2_component_retirement(policy, vision_model, "vision")
+    if vision_cores != 8:
+        # The in-graph merger and the device patch embed selector are
+        # eight-core only. Keep the generic eight-core profiles' FP16 patch
+        # projection and merger arithmetic on the four Vision lanes instead of
+        # the CPU FP16 patch / FP32 merger defaults. These eager GEMMs suspend
+        # the intra-RPU flush this builder enables above.
+        enable_qwen3_vl_vision_merger_on_device(vision_model, cores=vision_cores)
     # Registering the merger weights is the one native authority: it enables
     # the post_fn that runs LayerNorm -> m0 -> GELU -> m2 -> all-reduce inside
     # the Vision graph.
@@ -5237,6 +5382,7 @@ def _build_lingbot_vla_v2_impl(
         prefill_qk_norm_rope=prefill_qk_norm_rope,
         **({"folded_rmsnorm": True, "prefill_kv_only": True}
            if native_cold.runtime_graph else {}),
+        **({} if text_topology is None else {"topology": text_topology}),
         execution_config=text_execution)
     _take_lingbot2_component_retirement(policy, text_model, "decoder")
     # NOTE: no lm_head. The checkpoint has none and the YAML sets `use_lm_head: false` — the VLM
@@ -5267,11 +5413,22 @@ def _build_lingbot_vla_v2_impl(
         rope_theta=rope_theta,
         geom=geom,
         runtime_config=native_cold,
+        num_cores=action_cores,
         on_handle_created=lambda handle, keep: vars(policy).update(
             _exp=handle, _exp_keep=keep),
     )
     policy._exp = exp_handle
     policy._exp_keep = exp_keep
+    if action_cores != 8:
+        # [num_cores, attn_tp, mlp_tp, lm_head_tp, NUM_CORES]; the headless
+        # reduced expert resolves lm_head TP 4 like every reduced decoder.
+        topology = tuple(int(value) for value in
+                         torch.ops.rpu.lingbot_v2_moe_get_execution_topology(exp_handle))
+        expected = (action_cores, _LINGBOT2_REDUCED_LANES, action_cores, 4, 8)
+        if topology != expected:
+            raise RuntimeError(
+                "LingBot2 action expert native topology differs from its weight layout: "
+                f"actual={topology}, expected={expected}")
 
     LingbotVlaV2Policy.__init__(
         policy,
@@ -5291,8 +5448,35 @@ def _build_lingbot_vla_v2_impl(
         component_generations=component_generations,
         graph_runtime_policy=graph_runtime_policy,
     )
+    if core_budget != 8:
+        _prepare_lingbot2_reduced_persistent_spm(
+            vision_model._rpu_vision_handle,
+            text_model._rpu_decoder_handle,
+            exp_handle,
+        )
     policy._rpu_swizzled = True
     return policy
+
+
+def _prepare_lingbot2_reduced_persistent_spm(
+    vision_handle, text_handle, exp_handle
+) -> None:
+    """Reserve all three reduced-core Persistent SPM banks before cold planning."""
+    names = (
+        "qwen3vl_vision_prepare_persistent_spm",
+        "causal_decoder_prepare_persistent_spm",
+        "lingbot_v2_moe_prepare_resident_spm",
+    )
+    prepare = tuple(getattr(torch.ops.rpu, name, None) for name in names)
+    if all(op is None for op in prepare):
+        return
+    if any(op is None for op in prepare):
+        raise RuntimeError(
+            "LingBot2 native Persistent preparation API is incomplete"
+        )
+    prepare[0](int(vision_handle), 256)
+    prepare[1](int(text_handle), 256, 0, True, 0)
+    prepare[2](int(exp_handle), N_ACTION + 1, 256, False, 256 + N_ACTION + 1)
 
 
 def build_lingbot_vla_v2(
@@ -5327,8 +5511,10 @@ def build_lingbot_vla_v2(
         rpu_execution,
         entry_point="build_lingbot_vla_v2",
         vlm_chunk_size=chunk_size,
+        supported=_LINGBOT2_EXECUTION_SUPPORTED,
         supported_components=LINGBOT2_EXECUTION_COMPONENTS,
     )
+    _validate_lingbot2_reduced_environment(_lingbot2_core_budget(execution_config))
     _validate_lingbot2_cold_execution_config(
         execution_config,
         multiview_spm_z2=_env_exact_one("RPU_LINGBOT2_MULTIVIEW_SPM_Z2"),

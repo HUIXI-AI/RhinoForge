@@ -1,7 +1,8 @@
 """Cold storage preparation for exact large Qwen3.5 text profiles."""
 import torch
 
-from .quant_scope import FP16, W8A16, W4A16_PGRP, W4A16_AWQ, is_full_from_layer_types, resolve_quant_specs
+from .quant_scope import (FP16, W8A16, W4A16_PGRP, W4A16_AWQ, NVFP4,
+                          is_full_from_layer_types, resolve_quant_specs)
 
 
 def validate_modern_27b_cold_weights(inner, config, *, cold_cpu):
@@ -9,14 +10,15 @@ def validate_modern_27b_cold_weights(inner, config, *, cold_cpu):
 
     The same geometry is used by the dense FP16 and uniform quantized
     checkpoints.  Quantized projections carry integer codes plus scales;
-    FP16 projections keep their native floating weights and no scale.
+    FP16 projections, and NVFP4 projections quantized during installation,
+    keep their native floating weights and no scale.
     """
     tc = getattr(config, "text_config", config)
     specs = resolve_quant_specs(
         is_full_from_layer_types(tc.layer_types), getattr(config, "quant_config", None))
     devices = ("cpu",) if cold_cpu else ("cpu", "rpu", "privateuseone")
     quant_weights = {name + ".weight": spec for name, spec in specs.items()
-                     if spec.method != FP16}
+                     if spec.method not in (FP16, NVFP4)}
     quant_zeros = {name + ".weight_zero" for name, spec in specs.items()
                    if spec.method == W4A16_AWQ}
     for name, value in (*inner.named_parameters(), *inner.named_buffers()):
@@ -36,7 +38,7 @@ def validate_modern_27b_cold_weights(inner, config, *, cold_cpu):
                 or tuple(weight.shape) != (projection.out_features, projection.in_features)
                 or hasattr(projection, "_rpu_linear_partition")):
             raise ValueError(f"Qwen3.5-27B projection {name} requires original raw Linear geometry")
-        if spec.method == FP16:
+        if spec.method in (FP16, NVFP4):
             scale = getattr(projection, "weight_scale", None)
             if scale is not None and scale.numel():
                 raise ValueError(f"Qwen3.5-27B FP16 projection {name} must not carry a scale")
@@ -151,13 +153,15 @@ def pad_dense_27b_mlp_scale(scale, *, projection_name):
 
 
 def pad_quant_mlp_projection(weight, *, projection_name, logical_size, physical_size):
-    """Pad raw integer weights before swizzling, leaving logical metadata intact."""
+    """Pad raw integer weights, or the FP16 source of an install-time NVFP4
+    projection, before swizzling, leaving logical metadata intact."""
     if ((logical_size, physical_size) not in
             ((3584, 3648), (3584, 3840), (17408, 17472), (17408, 17664))
             or projection_name not in ("gate_proj", "up_proj", "down_proj")
-            or weight.device.type != "cpu" or weight.dtype not in (torch.int8, torch.uint8)
+            or weight.device.type != "cpu"
+            or weight.dtype not in (torch.int8, torch.uint8, torch.float16)
             or weight.dim() != 2 or not weight.is_contiguous()):
-        raise ValueError("quantized MLP padding requires an admitted raw integer geometry")
+        raise ValueError("quantized MLP padding requires an admitted raw integer or NVFP4 FP16 geometry")
     axis = 1 if projection_name == "down_proj" else 0
     if weight.shape[axis] != logical_size:
         raise ValueError("quantized MLP padding requires the logical projection width")

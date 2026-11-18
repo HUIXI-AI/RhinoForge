@@ -567,8 +567,14 @@ class Qwen3_5MoeAdapter:
             }[topology.num_cores]
             self._graph_cache = state.graph_cache
 
+            head_w_cpu = output.weight.detach().to("cpu").contiguous()
+            if head_w_cpu.ndim == 2:
+                head_align = 16 * int(topology.lm_head_tp)
+                head_rem = int(head_w_cpu.shape[0]) % head_align
+                if head_rem:
+                    head_w_cpu = torch.nn.functional.pad(head_w_cpu, (0, 0, 0, head_align - head_rem))
             model._lm_head_w_rpu_keepalive = transform_linear_weight(
-                output.weight.detach().to("cpu").contiguous(), 1, topology.lm_head_tp
+                head_w_cpu, 1, topology.lm_head_tp
             ).to("rpu")
             inner.embed_tokens.to("rpu")
             model.forward = types.MethodType(_rpu_qwen3_5_moe_forward, model)
@@ -746,8 +752,12 @@ def _rpu_qwen3_5_moe_forward(
     logits = torch.ops.rpu.linear_with_accumulation(
         flat, self._lm_head_w_rpu_keepalive, None, 1,
         state.execution_topology.lm_head_tp, state.linear_acc32)
-    logits = logits.reshape(*head_in.shape[:-1], logits.shape[-1])
-    logits = logits.to("cpu").to(torch.float32)
+    logits = logits.reshape(*head_in.shape[:-1], logits.shape[-1]).to("cpu")
+    tc = getattr(getattr(self, "config", None), "text_config", getattr(self, "config", None))
+    logical_vocab = getattr(tc, "vocab_size", None)
+    if isinstance(logical_vocab, int) and not isinstance(logical_vocab, bool) and logits.shape[-1] > logical_vocab:
+        logits = logits[..., :logical_vocab]
+    logits = logits.to(torch.float32)
     return Qwen3_5MoeCausalLMOutputWithPast(
         loss=None,
         aux_loss=None,

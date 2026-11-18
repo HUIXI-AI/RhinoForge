@@ -25,12 +25,13 @@ FP16 = "fp16"
 W8A16 = "w8a16"
 W4A16_PGRP = "w4a16_pgrp"
 W4A16_AWQ = "w4a16_awq"
+NVFP4 = "nvfp4"
 QUANTTRIO_AWQ_PROFILE = "quanttrio_awq_g128"
 ACTIVATION_AWQ_PROFILE = "activation_awq_g128_v1"
 AWQ_PROFILES = (QUANTTRIO_AWQ_PROFILE, ACTIVATION_AWQ_PROFILE)
 NAMED_MIXED_PROFILES = ("w4_mlp_only", "w4_mlp_w8_attn_gdn",
                         "w4_main_w8_gdn", "w8_main_w8_gdn")
-SUPPORTED_QUANT_METHODS = (FP16, W8A16, W4A16_PGRP, W4A16_AWQ)
+SUPPORTED_QUANT_METHODS = (FP16, W8A16, W4A16_PGRP, W4A16_AWQ, NVFP4)
 PGRP_SUPPORTED_GROUP_SIZES = (32, 64, 128)
 DECLARED_DTYPES = (FP16, W8A16, "w4a16")
 
@@ -41,6 +42,14 @@ DECLARED_DTYPES = (FP16, W8A16, "w4a16")
 # instead of treating it as the v1 uniform-W8 format (which would silently ask
 # for scales on every GDN projection).
 LEGACY_W8A16_PROFILE = "w8_main_fp16_gdn_legacy"
+
+# Dense text NVFP4 is quantized on install from the official FP16 checkpoint
+# (the Qwen3 / Qwen3-VL precedent); no NVFP4 checkpoint format exists, so the
+# loader's storage check refuses this policy on disk. GDN b/a stay FP16: their
+# per-core width (16) is below the smallest NVFP4 tile. Vision, MTP, embedding,
+# lm_head and conv1d are outside the text projection scope and stay FP16.
+NVFP4_TEXT_PROFILE = "nvfp4_main_fp16_ba"
+NVFP4_INSTALL_STORAGE = "fp16_install"
 
 # Emission order matches the historical `_iter_text_projections`: the MLP half
 # first, then the layer's token mixer. Install-path behaviour is unchanged.
@@ -92,6 +101,32 @@ class QuantSpec:
                 f"method={self.method} does not accept group_size, got "
                 f"{self.group_size!r}"
             )
+
+
+def nvfp4_text_quant_config() -> dict:
+    """Return a fresh install-time dense text NVFP4 policy.
+
+    The adapter stamps it on the top-level config of an FP16 model; every
+    consumer that branches on ``quant_config`` then takes its quantized path.
+    """
+    return {
+        "format_version": 2,
+        "architecture": "qwen3_5",
+        "activation_dtype": "float16",
+        "profile": NVFP4_TEXT_PROFILE,
+        "default": {"method": NVFP4},
+        "projection_overrides": {
+            "linear_attn.in_proj_b": {"method": FP16},
+            "linear_attn.in_proj_a": {"method": FP16},
+        },
+        "storage": NVFP4_INSTALL_STORAGE,
+        "scale_dtype": "float8_e4m3fn",
+    }
+
+
+def is_nvfp4_text_policy(quant_config) -> bool:
+    return (isinstance(quant_config, Mapping)
+            and quant_config.get("profile") == NVFP4_TEXT_PROFILE)
 
 
 def is_full_from_layer_types(layer_types):
@@ -537,6 +572,9 @@ def validate_modern_27b_profile(config, *, allow_fp16=False) -> bool:
         if allow_fp16:
             return True
         raise ValueError("official Qwen3.5-27B FP16 requires an explicit runtime admission")
+    if is_nvfp4_text_policy(quant):
+        resolve_quant_specs(is_full_from_layer_types(expected_layers), quant)
+        return True
     specs = set(resolve_quant_specs(is_full_from_layer_types(expected_layers), quant).values())
     if (len(specs) != 1 or next(iter(specs)) not in
             (QuantSpec(W8A16), QuantSpec(W4A16_PGRP, 32))):
@@ -606,6 +644,11 @@ def resolve_quant_specs(is_full, quant_config=None):
             raise ValueError(
                 f"Qwen3.5 profile={LEGACY_W8A16_PROFILE!r} requires the exact "
                 "MLP/full-attention W8A16 and GDN FP16 policy")
+    if (is_nvfp4_text_policy(quant_config)
+            and dict(quant_config) != nvfp4_text_quant_config()):
+        raise ValueError(
+            f"Qwen3.5 profile={NVFP4_TEXT_PROFILE!r} requires the exact install-time "
+            "NVFP4 policy with FP16 GDN b/a")
     architecture = quant_config.get("architecture", "qwen3_5")
     if architecture != "qwen3_5":
         raise ValueError(
@@ -644,6 +687,9 @@ def resolve_quant_specs(is_full, quant_config=None):
         )
         if default.method == W4A16_AWQ:
             raise ValueError("Qwen3.5 AWQ requires the exact version 3 profile")
+        if default.method == NVFP4:
+            raise ValueError(
+                f"Qwen3.5 NVFP4 requires the exact {NVFP4_TEXT_PROFILE!r} profile")
         return {relpath: default for relpath in relpaths}
     if version != 2:
         raise ValueError(
@@ -679,6 +725,10 @@ def resolve_quant_specs(is_full, quant_config=None):
     }
     if any(spec.method == W4A16_AWQ for spec in (default, *override_specs.values())):
         raise ValueError("Qwen3.5 AWQ requires the exact version 3 profile")
+    if (not is_nvfp4_text_policy(quant_config)
+            and any(spec.method == NVFP4 for spec in (default, *override_specs.values()))):
+        raise ValueError(
+            f"Qwen3.5 NVFP4 requires the exact {NVFP4_TEXT_PROFILE!r} profile")
     return {
         relpath: override_specs.get(projection_role(relpath), default)
         for relpath in relpaths
@@ -743,9 +793,10 @@ def validate_declared_dtype(layer_types, quant_config, declared_dtype):
                 "Qwen3.5 quant_config.profile must be a non-empty string when "
                 f"present, got {profile!r}"
             )
-    # Keep the existing metadata contract for FP16/W8/signed-W4 consumers.
-    if counts[W4A16_AWQ] == 0:
-        del counts[W4A16_AWQ]
+    # Keep the existing reporting contract for FP16/W8/signed-W4 consumers.
+    for method in (W4A16_AWQ, NVFP4):
+        if counts[method] == 0:
+            del counts[method]
     return {
         "declared_dtype": dtype,
         "profile": profile,

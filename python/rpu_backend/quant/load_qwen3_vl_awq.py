@@ -24,7 +24,10 @@ from rpu_backend.quant.int4_pgrp_pack import (
     swizzle_pack_int4_pgrp,
     w4_storage_shape,
 )
-from rpu_backend.runtime.topology import decoder_packed_w4_mlp_intermediate_size
+from rpu_backend.runtime.topology import (
+    decoder_lm_head_vocab_size,
+    decoder_packed_w4_mlp_intermediate_size,
+)
 
 _ROLES = (("self_attn.q_proj", 1), ("self_attn.k_proj", 1),
           ("self_attn.v_proj", 1), ("self_attn.o_proj", 0),
@@ -130,8 +133,10 @@ def is_qwen3_vl_awq_config(config, *, allow_padded_8b=False) -> bool:
         return False
 
 
-def packed_projection_geometry(name, n, k, partition, mlp_tp):
-    """Physical [N,K] of one packed Text7 leaf; six-lane MLP widths are padded."""
+def packed_projection_geometry(name, n, k, partition, mlp_tp, lm_head_tp=8):
+    """Physical [N,K] of one packed Text7/head leaf; six-lane widths are padded."""
+    if name == "lm_head":
+        return decoder_lm_head_vocab_size(n, lm_head_tp), k
     if ".mlp." not in name:
         return n, k
     if partition == 1:

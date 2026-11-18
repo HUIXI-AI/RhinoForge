@@ -25,10 +25,19 @@ try:
     from ._common import quantize_linear_per_channel
     from .int4_pgrp_pack import quantize_int4_group_wise
     from .nvfp4_pack import quantize_nvfp4
+    from .precision_recipes import RECORD, produced, write_record
 except ImportError:
     from _common import quantize_linear_per_channel
     from int4_pgrp_pack import quantize_int4_group_wise
     from nvfp4_pack import quantize_nvfp4
+    from precision_recipes import RECORD, produced, write_record
+
+FAMILY = "pi05"
+# Registered precision recipes this converter produces, as the convert_checkpoint arguments
+# that produce them. Prefill W8A8 loads the Action NVFP4 conversion (see the registry's
+# checkpoints field); real W4 keeps K/V INT8 by itself (_REAL_W4_REQUIRED_INT8_SUFFIXES).
+RECIPES = {"w8a16": {}, "w8a16_action_nvfp4": {"action_w4": True},
+           "w4a16_kvint8": {"bits": 4, "real_w4": True}}
 
 
 PI05_EXPERT_ANCHOR = ".paligemma_with_expert.gemma_expert.model.layers."
@@ -102,6 +111,7 @@ def _copy_sidecar_files(src: Path, dst: Path, shards: set[str]) -> None:
         "model_remapped.safetensors",
         "config.json",
         "rpu_quant_config.json",
+        RECORD,
     })
     for path in sorted(src.iterdir()):
         if path.name in skip or not path.is_file():
@@ -223,6 +233,19 @@ def _quant_config(*, bits: int, int8_keep_suffixes: tuple[str, ...] = (),
     raise ValueError(f"expected bits to be 4 or 8, got {bits}")
 
 
+def produced_recipe(*, bits: int = 8, int8_keep_suffixes: tuple[str, ...] = (),
+                    real_w4: bool = False, action_w4: bool = False,
+                    action_w4_format: str = "nvfp4") -> str | None:
+    """The registered recipe these arguments produce; None for fake W4, extra INT8 suffixes and the INT4 Action formats."""
+    if int8_keep_suffixes:
+        return None
+    if action_w4:
+        return "w8a16_action_nvfp4" if action_w4_format == "nvfp4" else None
+    if bits == 4:
+        return "w4a16_kvint8" if real_w4 else None
+    return "w8a16" if not real_w4 else None
+
+
 def convert_checkpoint(
     src: str | Path,
     dst: str | Path,
@@ -232,9 +255,14 @@ def convert_checkpoint(
     real_w4: bool = False,
     action_w4: bool = False,
     action_w4_format: str = "nvfp4",
+    recipe: str | None = None,
 ) -> dict:
+    """RECIPE, when given, must be the registered recipe the other arguments produce."""
     if action_w4_format not in ("nvfp4", "int4_g128", "legacy_int4"):
         raise ValueError("action_w4_format must be nvfp4, int4_g128, or legacy_int4")
+    recipe = produced(FAMILY, produced_recipe(
+        bits=bits, int8_keep_suffixes=tuple(int8_keep_suffixes), real_w4=real_w4,
+        action_w4=action_w4, action_w4_format=action_w4_format), recipe)
     if action_w4:
         bits, real_w4 = 4, True
     src = Path(src).expanduser().resolve()
@@ -258,6 +286,7 @@ def convert_checkpoint(
         raise FileExistsError(f"temporary output already exists: {tmp}")
 
     stats = {
+        "recipe": recipe,
         "n_quantized": 0,
         "n_copied": 0,
         "bytes_in": 0,
@@ -342,6 +371,7 @@ def convert_checkpoint(
             json.dump(quant_config, f, indent=2)
 
         _copy_sidecar_files(src, tmp, set(shards))
+        write_record(tmp, FAMILY, recipe)
         tmp.rename(dst)
     except Exception:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -383,8 +413,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--action-w4", action="store_true",
                         help="Action Q/O/Gate/Up/Down W4 (default NVFP4); K/V and VLM W8")
     parser.add_argument("--action-w4-format", choices=("nvfp4", "int4_g128", "legacy_int4"),
-                        default="nvfp4", help="NVFP4 (default), true K128 INT4, or legacy per-channel INT4")
+                        help="NVFP4 (default), true K128 INT4, or legacy per-channel INT4")
+    parser.add_argument("--recipe", choices=sorted(RECIPES),
+                        help="registered precision recipe; sets the options above")
     args = parser.parse_args(argv)
+    if args.recipe is not None:
+        if (args.fake_w4 or args.keep_int8 or args.real_w4 or args.action_w4
+                or args.action_w4_format is not None):
+            parser.error("--recipe sets the precision options; drop --fake-w4/--keep-int8/"
+                         "--real-w4/--action-w4/--action-w4-format")
+        arguments = RECIPES[args.recipe]
+        args.fake_w4 = arguments.get("bits") == 4
+        args.real_w4 = arguments.get("real_w4", False)
+        args.action_w4 = arguments.get("action_w4", False)
     bits = 4 if args.fake_w4 or args.action_w4 else 8
 
     if args.real_w4 and bits != 4:
@@ -408,7 +449,7 @@ def main(argv: list[str] | None = None) -> int:
         stats = convert_checkpoint(
             args.src, args.dst, bits=bits, int8_keep_suffixes=int8_keep_suffixes,
             real_w4=args.real_w4, action_w4=args.action_w4,
-            action_w4_format=args.action_w4_format,
+            action_w4_format=args.action_w4_format or "nvfp4", recipe=args.recipe,
         )
     except (FileExistsError, FileNotFoundError, TypeError, ValueError) as exc:
         print(f"[convert_pi05] error: {exc}", file=sys.stderr)
@@ -420,6 +461,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  vlm        : {stats['vlm_projection_weights']} projection weights")
     print(f"  expert     : {stats['expert_projection_weights']} projection weights")
     print(f"  method     : {stats['method']} (value_bits={stats['value_bits']})")
+    print(f"  recipe     : {stats['recipe'] or 'none registered (no record written)'}")
     effective_keep = stats["mixed_int8_suffixes"]
     if effective_keep:
         print(f"  keep-int8  : {effective_keep} (INT8; rest INT4)")

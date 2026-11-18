@@ -1427,7 +1427,6 @@ def patch_g05_action_expert_for_rpu(
         if not exact_k1:
             raise ValueError("G0.5 Action NVFP4 requires exact K1 W8A16")
         require_g05_action_nvfp4_native()
-    install_execution = linear_execution_config(None, linear_accumulation)
 
     execution_config = normalize_rpu_execution(
         (
@@ -1435,8 +1434,17 @@ def patch_g05_action_expert_for_rpu(
             if _execution_config is None else _execution_config
         ),
         entry_point="patch_g05_action_expert_for_rpu",
-        supported={"action": ("chunk_size",)},
+        supported={"model": ("num_cores",), "action": ("chunk_size",)},
     )
+    # The composite binds the expert to four lanes at a reduced budget
+    # (I4096 does not split over six); eight cores keep the original owner.
+    lanes = execution_config.get("model", {}).get("num_cores", 8)
+    if lanes not in (4, 8):
+        raise ValueError("the G0.5 action expert runs on four or eight cores")
+    if lanes != 8 and math_precision == "high":
+        raise ValueError("G0.5 HIGH action math is eight-core only")
+    install_execution = linear_execution_config(
+        None if lanes == 8 else {"model": {"num_cores": lanes}}, linear_accumulation)
     requested_chunk = execution_config["action"].get("chunk_size", "auto")
     if isinstance(requested_chunk, int) and requested_chunk != _ACTION_HORIZON:
         raise ValueError(
@@ -1539,7 +1547,7 @@ def patch_g05_action_expert_for_rpu(
         if math_precision == "high":
             quant_kwargs["_g05_math_precision"] = math_precision
         if action_weight_dtype == "nvfp4a16":
-            quant_kwargs["_g05_action_nvfp4"] = prepare_g05_action_nvfp4(expert)
+            quant_kwargs["_g05_action_nvfp4"] = prepare_g05_action_nvfp4(expert, lanes=lanes)
         if weight_dtype == "w8a16":
             quantize_g05_text_weights(expert, action=True)
             quant_kwargs["_g05_w8a16"] = True
@@ -1594,13 +1602,19 @@ def patch_g05_action_expert_for_rpu(
         import rpu_backend as _rb
 
         state = expert._rpu_qwen3_5
-        state.action_graph_cache = _rb.graph.GraphCache(max_entries=1)
-        state.action_trace_graph_cache = _rb.graph.GraphCache(max_entries=1)
+        base_policy = state.graph_cache.runtime_policy
+        state.action_graph_cache = _rb.graph.GraphCache(
+            max_entries=_action_graph_entries, runtime_policy=base_policy)
+        state.action_graph_entries = _action_graph_entries
+        state.action_graph_recent = []
+        policy = base_policy
+        state.action_trace_graph_cache = _rb.graph.GraphCache(
+            max_entries=1, runtime_policy=policy)
         from rpu_backend.adapters.qwen3_5.text import _refresh_qwen35_text_retirement
 
         _refresh_qwen35_text_retirement(state)
         state.action_cache = Qwen3_5Cache.from_config(
-            expert.config, max_seq_len=max_seq_len
+            install_config, max_seq_len=max_seq_len, num_cores=lanes
         )
         state.action_k_caches = state.action_cache.k_caches
         state.action_v_caches = state.action_cache.v_caches

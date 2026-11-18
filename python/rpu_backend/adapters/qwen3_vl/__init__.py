@@ -64,11 +64,13 @@ from rpu_backend.runtime.weights import (
     convert_linear_weights_inplace,
     transform_linear_weight,
     validate_decoder_weight_structure, validate_decoder_mlp_padding,
+    validate_decoder_lm_head_padding, pad_decoder_lm_head_weight,
     pad_decoder_mlp_weights,
 )
 from rpu_backend.runtime.topology import (
     execution_core_count, resolve_decoder_topology, decoder_mlp_intermediate_size,
-    require_same_decoder_topology, validate_decoder_cache_topology,
+    decoder_lm_head_vocab_size, require_same_decoder_topology,
+    validate_decoder_cache_topology,
 )
 
 from . import patches  # noqa: F401 — idempotent class swaps at import time
@@ -253,15 +255,18 @@ def _resolve_qwen3_vl_execution(value, *, entry_point: str):
             supported=_QWEN3_VL_EXECUTION_SUPPORTED)
     return root, text, vision
 _QWEN3_VL_2B_TEXT_PROFILE = (2048, 6144, 28, 8)
+_QWEN3_VL_NVFP4_TEXT_PROFILES = (
+    _QWEN3_VL_2B_TEXT_PROFILE, _QWEN3_VL_4B_TEXT_PROFILE, _QWEN3_VL_8B_TEXT_PROFILE,
+)
 
 
 def _quantize_pack_lm_head_w4_groupwise(
-    weight: torch.Tensor, group_size: int = 32,
+    weight: torch.Tensor, group_size: int = 32, *, num_cores: int = 8,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pack the VL head with the shared bounded TP8/G32 physical ABI."""
     from rpu_backend.quant.int4_pgrp_pack import quantize_pack_int4_pgrp_col_bounded
 
-    return quantize_pack_int4_pgrp_col_bounded(weight, group_size)
+    return quantize_pack_int4_pgrp_col_bounded(weight, group_size, num_cores=num_cores)
 
 
 _QWEN3_VL_DELIVERY_PROFILE = "three-frame-hybrid-w8-w4-top2-v1"
@@ -725,6 +730,8 @@ def _validate_qwen3_vl_reduced_weights(model, topology):
     validate_qwen3_vl_text_semantics(model.model.language_model)
     validate_decoder_mlp_padding(view, logical_size=profile.intermediate_size,
         physical_size=decoder_mlp_intermediate_size(profile.intermediate_size, topology.mlp_tp))
+    validate_decoder_lm_head_padding(view, logical_size=profile.vocab_size,
+        physical_size=decoder_lm_head_vocab_size(profile.vocab_size, topology.lm_head_tp))
     for name, parameter in model.named_parameters():
         if (parameter.device.type != "cpu" or parameter.dtype != torch.float16
                 or not parameter.is_contiguous()):
@@ -917,11 +924,16 @@ def _apply_prefill_lm_head(model, hidden, slice_indices):
     scale = getattr(head, "weight_scale", None) if weight.dtype in (torch.int8, torch.uint8) else None
     logical_shape = ({"logical_out_features": head.out_features}
                      if weight.dtype == torch.uint8 else {})
-    return torch.ops.rpu.linear_with_accumulation(
+    out = torch.ops.rpu.linear_with_accumulation(
         head_input.contiguous(), weight, getattr(head, "bias", None), 1, cores,
         getattr(text, "_rpu_execution", {}).get("prefill", {}).get("linear_acc32", False), scale,
         **logical_shape,
     )
+    text_cfg = getattr(getattr(model, "config", None), "text_config", None)
+    vocab_size = getattr(text_cfg, "vocab_size", None)
+    if isinstance(vocab_size, int) and not isinstance(vocab_size, bool) and out.shape[-1] > vocab_size:
+        out = out[..., :vocab_size]
+    return out
 
 
 def _validate_qwen3_vl_4b_w8a16_model(model) -> bool:
@@ -1244,6 +1256,52 @@ class Qwen3VLAdapter:
         return qwen3_vl_vision_capacity(image_grid_thw)
 
     @classmethod
+    def preflight_quantization(cls, config, execution_config, quantization) -> None:
+        """Admit an exact official FP16 source for the on-install text NVFP4 recipe
+        (``vision_nvfp4``: 2B/4B only, the Vision blocks too), or an exact runtime
+        W4A16 checkpoint for on-install packed W4 Vision (2B/4B and 8B/32B at
+        4/6/8 cores; the 8B/32B Vision runs on 4 cores at every budget)."""
+        cores = execution_core_count(execution_config)
+        if quantization == "vision_w4a16":
+            quant_config = getattr(config, "quant_config", None)
+            hidden = config.text_config.hidden_size
+            # The padded 8B/32B o (K1280) and fc2 (K4352) rows split into 64-aligned
+            # pgrp lanes at 4 cores, not 8; that Vision uses 4 cores at every budget.
+            if not (_is_qwen3_vl_runtime_quant_config(config)
+                    and isinstance(quant_config, dict) and quant_config.get("method") == "w4a16"
+                    and hidden in (2048, 2560, 4096, 5120) and cores in (4, 6, 8)):
+                raise UnsupportedModelError(
+                    "on-install packed W4 Vision requires an exact Qwen3-VL runtime W4A16 "
+                    "checkpoint at model.num_cores 4, 6 or 8: 2B/4B Vision on 8 cores at 8 and "
+                    "on 4 cores at 4 or 6; 8B/32B Vision on 4 cores at every budget (the padded "
+                    "o/fc2 rows do not split into eight 64-aligned pgrp lanes)")
+            return
+        try:
+            profile = _text_config_profile(config.text_config)
+            if quantization not in ("nvfp4", "vision_nvfp4"):
+                raise ValueError(f"unknown recipe {quantization!r}")
+            if _qwen3_vl_has_quant_metadata(config) or profile not in _QWEN3_VL_NVFP4_TEXT_PROFILES:
+                raise ValueError("the source is not an official dense 2B/4B/8B checkpoint")
+            if quantization == "vision_nvfp4":
+                # NVFP4 rows need K%(64c) like packed W4: only the exact 2B/4B
+                # tower splits at 4 and 8 cores without padding.
+                from .vision import _is_qwen3_vl_w4_vision_tower
+                vision = config.vision_config
+                if (profile is _QWEN3_VL_8B_TEXT_PROFILE
+                        or not _is_qwen3_vl_w4_vision_tower(vision, getattr(vision, "depth", None))
+                        or vision.out_hidden_size != config.text_config.hidden_size):
+                    raise ValueError("NVFP4 Vision admits only the exact 2B/4B tower")
+            # 2B/4B/8B run at 4/6/8; the 4B six-lane MLP is zero-padded like packed W4.
+            if qwen3_vl_text_core_profile(config.text_config, cores) is None:
+                raise ValueError("the text semantics differ from the dense profile")
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise UnsupportedModelError(
+                "on-install text NVFP4 requires exact dense Qwen3-VL-2B/4B/8B FP16 source weights "
+                "(2B/4B for NVFP4 Vision), model.num_cores 4, 6 or 8; output head, embedding "
+                "and norms remain FP16, and Vision unless NVFP4 Vision is requested: " + str(exc)
+            ) from exc
+
+    @classmethod
     def preflight_execution(cls, config, execution_config) -> None:
         _root, text_execution, vision_execution = _resolve_qwen3_vl_execution(
             execution_config,
@@ -1299,11 +1357,12 @@ class Qwen3VLAdapter:
                 f"domain: got {vision_chunk}."
             )
 
-    def __init__(self, model) -> None:
+    def __init__(self, model, *, quantization=None) -> None:
         self._gc_retirement_enabled = False
         self._closed = False
         _check_profile(model.config)
         self.model = model
+        self._quantization = quantization
         self._rpu_execution = bind_rpu_execution(
             model,
             getattr(model, "_rpu_execution", None),
@@ -1312,6 +1371,8 @@ class Qwen3VLAdapter:
             supported=_QWEN3_VL_EXECUTION_SUPPORTED,
         )
         self.preflight_execution(model.config, self._rpu_execution)
+        if quantization is not None:
+            self.preflight_quantization(model.config, self._rpu_execution, quantization)
         self._topology = _qwen3_vl_core_topology(model.config, self._rpu_execution)
         self._linear_acc32_defaults = None
         self._linear_acc32_policy = None
@@ -1823,6 +1884,14 @@ class Qwen3VLAdapter:
                 "Qwen3VLAdapter.to_rpu(): config or quantized tensor inventory "
                 "changed after adapter construction; reload from_pretrained."
             )
+        # vision_nvfp4 = the same text conversion plus NVFP4 Vision blocks.
+        text_nvfp4 = self._quantization in ("nvfp4", "vision_nvfp4")
+        vision_nvfp4 = self._quantization == "vision_nvfp4"
+        if text_nvfp4:
+            self.preflight_quantization(self.model.config, self._rpu_execution, self._quantization)
+        vision_w4 = self._quantization == "vision_w4a16"
+        if vision_w4:
+            self.preflight_quantization(self.model.config, self._rpu_execution, "vision_w4a16")
         text_w8_2b = _validate_qwen3_vl_2b_w8a16_model(self.model)
         if text_w8_2b != getattr(self, "_is_text_w8a16_2b", False):
             raise RPUBackendError("Qwen3-VL-2B W8A16 config changed after adapter construction; reload")
@@ -1832,6 +1901,8 @@ class Qwen3VLAdapter:
             raise RPUBackendError("Qwen3-VL runtime quantized config changed after adapter construction; reload")
         runtime_align_quantized = is_runtime_align_4b_w8a16 or runtime_quant
         runtime_w4 = runtime_quant and self.model.lm_head.weight.dtype == torch.uint8
+        if vision_w4 and not runtime_w4:
+            raise RPUBackendError("packed W4 Vision requires the loaded runtime W4A16 model")
         from rpu_backend.quant.load import _validate_qwen3_vl_awq_model
         text_awq = _validate_qwen3_vl_awq_model(self.model)
         if text_awq != getattr(self, "_is_text_awq", False):
@@ -1894,12 +1965,17 @@ class Qwen3VLAdapter:
                     qwen3_vl_text_core_profile(text_cfg, topology.num_cores) != self._core_profile):
                 raise ValueError("Qwen3-VL geometry changed its bound cold topology")
             _validate_qwen3_vl_reduced_weights(self.model, topology)
+            # Reduced budgets put Vision on 4 cores; the padded 8B/32B W4 blocks
+            # need 4 lanes at budget 8 too (their o/fc2 rows split by 64 only there).
+            vision_four_cores = topology is not None or (vision_w4 and runtime_quant_large)
             if _validate_qwen3_vl_2b_w8a16_model(self.model) != text_w8_2b:
                 raise RPUBackendError("Qwen3-VL-2B W8A16 config changed before ownership")
             if _validate_qwen3_vl_runtime_model(self.model) != runtime_quant:
                 raise RPUBackendError("Qwen3-VL runtime quantized config changed before ownership")
             if _validate_qwen3_vl_awq_model(self.model) != text_awq:
                 raise RPUBackendError("Qwen3-VL AWQ config changed before ownership")
+            # Text NVFP4 owns its projection storage below; Vision keeps its FP16
+            # schedule unless its blocks are NVFP4 too (no FP16 Vision banks).
             use_2b_weight_banks = (
                 topology is None and not delivery_w8_text and not lm_head_w4a16
                 and getattr(self.model, "_qwen3_vl_delivery_profile", None) is None
@@ -1922,7 +1998,7 @@ class Qwen3VLAdapter:
                 and getattr(self.model, "_qwen3_vl_delivery_profile", None) is None
                 and _qwen3_vl_text_projection_weights_are_fp16(text_model)
             )
-            use_fp16_vision_weight_banks = (
+            use_fp16_vision_weight_banks = not vision_nvfp4 and (
                 use_2b_weight_banks or use_4b_fp16_weight_banks or (
                     text_awq and topology is None and not delivery_w8_text
                     and not lm_head_w4a16
@@ -1960,7 +2036,25 @@ class Qwen3VLAdapter:
             mutation_started = True
 
             # ---------- Step A: stream text decoder layers ------------------
-            if runtime_quant:
+            nvfp4_tensor_scales = None
+            if text_nvfp4:
+                from rpu_backend.quant.convert_qwen3_nvfp4 import convert_qwen3_to_nvfp4_
+
+                # The converter checks every shape before replacing the first projection.
+                layout = topology if topology is not None else qwen3_vl_text_topology(text_cfg, 8)
+                nvfp4_tensor_scales = convert_qwen3_to_nvfp4_(
+                    _qwen3_vl_decoder_weight_view(self.model), topology=layout)
+                for layer in text_model.layers:
+                    for name in _QWEN3_VL_TEXT_PROJECTIONS:
+                        projection = layer.get_submodule(name)
+                        projection._rpu_linear_partition = 0 if name.endswith(("o_proj", "down_proj")) else 1
+                        projection._rpu_linear_num_cores = (
+                            layout.mlp_tp if name.startswith("mlp.") else layout.attn_tp)
+                    layer.to("rpu")
+                    gc.collect()
+                device = text_model.layers[0].self_attn.q_proj.weight.device
+                nvfp4_tensor_scales = tuple(table.to(device) for table in nvfp4_tensor_scales)
+            elif runtime_quant:
                 from rpu_backend.quant.load_qwen3_vl_runtime import _move_materialized_runtime_decoder_for_rpu
 
                 _move_materialized_runtime_decoder_for_rpu(self.model,
@@ -1989,6 +2083,7 @@ class Qwen3VLAdapter:
                 _move_materialized_w8a16_decoder_for_rpu(self.model,
                     **({"topology": topology} if topology is not None else {}))
             elif use_2b_weight_banks or use_4b_fp16_weight_banks or use_8b_fp16_weight_banks:
+                # FP16 storage banks; NVFP4 took the first branch with the same flags set.
                 from rpu_backend.quant.load import _move_materialized_decoder_for_rpu
 
                 _move_materialized_decoder_for_rpu(
@@ -2021,6 +2116,14 @@ class Qwen3VLAdapter:
                     gc.collect()
 
             # ---------- Step B: lm_head untie + col-swizzle (CPU) ------------
+            if topology is not None and not runtime_w4:
+                head_logical = int(getattr(
+                    self.model.lm_head, "out_features",
+                    self.model.lm_head.weight.shape[0]))
+                pad_decoder_lm_head_weight(
+                    self.model, logical_size=head_logical,
+                    physical_size=decoder_lm_head_vocab_size(
+                        head_logical, topology.lm_head_tp))
             # If lm_head.weight is tied with text_model.embed_tokens, clone
             # first so the embedding row layout stays raw.
             embed_w_ptr = text_model.embed_tokens.weight.data_ptr()
@@ -2042,6 +2145,7 @@ class Qwen3VLAdapter:
                 lm_head_w4_packed, lm_head_w4_scale = (
                     _quantize_pack_lm_head_w4_groupwise(
                         lm_head_cpu, group_size=lm_head_w4_group_size,
+                        num_cores=(topology.lm_head_tp if topology is not None else 8),
                     )
                 )
             if runtime_w4:
@@ -2089,11 +2193,15 @@ class Qwen3VLAdapter:
                 _allow_graph_blocked_32b=is_graph_blocked_32b_w8a16,
                 _allow_padded_8b=is_padded_8b and not runtime_quant_large,
                 **({"_allow_runtime_quantized_large": True} if runtime_quant_large else {}),
-                **({"w8a16": True} if runtime_align_quantized else {}),
+                # The runtime W4 checkpoint keeps Vision FP16; its recipe packs
+                # the blocks W4 or quantizes them W8 here.
+                **({"w4a16": True} if vision_w4
+                   else {"nvfp4": True} if vision_nvfp4
+                   else {"w8a16": True} if runtime_align_quantized else {}),
                 **({"_pack_fp16_block_weights": True}
                    if topology is None and (use_fp16_vision_weight_banks or use_8b_fp16_weight_banks
                                             or is_graph_blocked_32b_w8a16) else {}),
-                **({"num_cores": 4} if topology is not None else {}),
+                **({"num_cores": 4} if vision_four_cores else {}),
                 **({"_graph_cache_max_entries": graph_cache_max_entries}
                    if graph_cache_max_entries is not None else {}),
             )
@@ -2127,8 +2235,10 @@ class Qwen3VLAdapter:
                 **({"topology": topology} if topology is not None else {}),
                 scale_lists=(
                     _qwen3_vl_text_scale_lists(text_model)
-                    if is_graph_blocked_32b_w8a16 or text_w8_2b or text_awq or delivery_w8_text or runtime_align_quantized else None
+                    if is_graph_blocked_32b_w8a16 or text_w8_2b or text_awq or delivery_w8_text or runtime_align_quantized
+                    or text_nvfp4 else None
                 ),
+                **({"nvfp4_tensor_scales": nvfp4_tensor_scales} if text_nvfp4 else {}),
             )
             _take_component_retirement(self, text_model, "_rpu_decoder_handle_finalizer")
             # Exact-profile fast replay also skips ordinary position-register
@@ -2195,9 +2305,13 @@ class Qwen3VLAdapter:
                         vision_model._rpu_vision_handle, True,
                     )
                 if runtime_align_quantized:
+                    # Patch embedding and mergers stay W8 under packed W4 blocks too.
                     enable_qwen3_vl_vision_merger_on_device(vision_model, w8a16=True,
-                        **({"cores": 4} if topology is not None else {}))
-                    if topology is None and not runtime_quant_large and not vision_linear_acc32:
+                        **({"cores": 4} if vision_four_cores else {}))
+                    # The fused/chunked merger, N1200 Tm160 and compact encoder
+                    # kernels exist for W8 blocks only.
+                    if (topology is None and not runtime_quant_large and not vision_linear_acc32
+                            and not vision_w4):
                         register_qwen3vl_vision_fused_merger(vision_model, w8a16=True)
                         vision_model._rpu_vision_chunked_merger_w8a16 = True
                         torch.ops.rpu.qwen3vl_vision_set_n1200_tm160(
@@ -2224,8 +2338,8 @@ class Qwen3VLAdapter:
                     torch.ops.rpu.causal_decoder_set_preload_replay_skip(handle, True)
                     text_model._rpu_text_fast_replay = True
                 elif (
-                    topology is None and (
-                        text_w8_2b or text_awq
+                    (
+                        text_w8_2b or text_awq or text_nvfp4
                         or (
                             ((is_padded_8b and _is_qwen3_vl_8b_vision_config(vision_cfg))
                              or _is_qwen3_vl_dense_eager_profile(self.model))
@@ -2236,10 +2350,21 @@ class Qwen3VLAdapter:
                     and not getattr(vision_model, "_rpu_vision_host_fp32_patch", False)
                 ):
                     # Dense profiles, exact 2B Text-W8 and Text-AWQ retain FP16 Vision.
-                    # Install eager auxiliaries for general grids. Ordinary
-                    # 2B/4B additionally admit the N1200 chunked device merger;
+                    # Install eager auxiliaries for general grids, on the four
+                    # Vision lanes at reduced budgets. Ordinary 2B/4B at eight
+                    # cores additionally admit the N1200 chunked device merger;
                     # an explicit CPU FP32 patch profile remains unchanged.
-                    enable_qwen3_vl_vision_merger_on_device(vision_model)
+                    # NVFP4 Vision keeps the FP16 device mergers; its blocks
+                    # replay like the FP16 banks (the weight dtype does not matter).
+                    enable_qwen3_vl_vision_merger_on_device(
+                        vision_model, **({"cores": 4} if vision_four_cores else {}))
+                    if vision_nvfp4 and topology is None:
+                        torch.ops.rpu.qwen3vl_vision_set_fast_replay(
+                            vision_model._rpu_vision_handle, True,
+                        )
+                        torch.ops.rpu.qwen3vl_vision_set_preload_replay_skip(
+                            vision_model._rpu_vision_handle, True,
+                        )
                     if (use_fp16_vision_weight_banks and vision_linear_acc32
                             and _is_qwen3_vl_dense_eager_profile(self.model)
                             and _qwen3_vl_text_projection_weights_are_fp16(text_model)):
@@ -2253,18 +2378,24 @@ class Qwen3VLAdapter:
                         )
                         vision_model._rpu_vision_compact_encoder_fp16 = True
             if runtime_align_quantized:
+                from rpu_backend.runtime.weights import align_w4_pgrp_scale_for_rpu
                 lm_w = self.model.lm_head.weight.detach().contiguous()
                 lm_scale = self.model.lm_head.weight_scale.detach().contiguous()
+                if lm_w.dtype == torch.uint8:
+                    lm_scale = align_w4_pgrp_scale_for_rpu(lm_w, lm_scale)
+                    self.model.lm_head.weight_scale = lm_scale
                 self.model._rpu_lm_head_w_keepalive = lm_w
                 self.model._rpu_lm_head_scale_keepalive = lm_scale
                 torch.ops.rpu.causal_decoder_set_lm_head(handle, lm_w, lm_scale)
             elif lm_head_w4a16:
+                from rpu_backend.runtime.weights import align_w4_pgrp_scale_for_rpu
                 assert lm_head_w4_packed is not None
                 assert lm_head_w4_scale is not None
                 lm_w = lm_head_w4_packed.to("rpu").contiguous()
-                lm_scale = lm_head_w4_scale.to(
-                    device="rpu", dtype=torch.float16,
-                ).contiguous()
+                lm_scale = align_w4_pgrp_scale_for_rpu(
+                    lm_w,
+                    lm_head_w4_scale.to(device="rpu", dtype=torch.float16).contiguous(),
+                )
                 self.model._rpu_lm_head_w_keepalive = lm_w
                 self.model._rpu_lm_head_scale_keepalive = lm_scale
                 torch.ops.rpu.causal_decoder_set_lm_head(
@@ -2297,6 +2428,16 @@ class Qwen3VLAdapter:
                     text_model, handle,
                     graph_cache=text_model._rpu_text_graph_cache,
                 )
+            if (vision_four_cores
+                    or not getattr(vision_model, "_rpu_vision_fused_merger", False)
+                    or getattr(vision_model, "_rpu_vision_chunked_merger_fp16", False)):
+                # Four-core Vision, and eight-core Vision whenever it runs
+                # without the fused merger, takes the largest chunk the live
+                # SPM fits and replays that cached plan. Reserve Text's fixed
+                # Persistent slots (norms, biases, scales; no length term)
+                # while both owners are cold, so the first Vision plan sees
+                # the SPM every later request sees.
+                torch.ops.rpu.causal_decoder_prepare_persistent_spm(handle, 16, 0, True)
 
             # ---------- Step G: top-level forward replacement ---------------
             self.model.forward = types.MethodType(_rpu_qwen3vl_forward, self.model)
@@ -2661,6 +2802,9 @@ def _rpu_qwen3vl_forward(
         if (getattr(self.lm_head, "_rpu_linear_partition", None),
                 getattr(self.lm_head, "_rpu_linear_num_cores", None)) != (1, topology.lm_head_tp):
             raise ValueError("Qwen3-VL lm_head weight layout differs from its cold topology")
+    elif pixel_values_videos is not None and getattr(vision_model, "_rpu_vision_num_cores", 8) != 8:
+        # 8B/32B packed W4 Vision runs on 4 cores at budget 8 too.
+        raise NotImplementedError("four-core Qwen3-VL Vision admits still images and text only")
     hidden_size = text_cfg.hidden_size
     spatial_merge_size = vision_cfg_or(self).spatial_merge_size
 

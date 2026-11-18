@@ -31,9 +31,11 @@ from safetensors.torch import load_file, save_file
 try:
     from ._common import quantize_linear_per_channel
     from .int4_pgrp_pack import quantize_int4_group_wise
+    from .precision_recipes import RECORD, produced, write_record
 except ImportError:  # standalone `python .../quant/convert_qwen3_5.py`
     from _common import quantize_linear_per_channel
     from int4_pgrp_pack import quantize_int4_group_wise
+    from precision_recipes import RECORD, produced, write_record
 
 try:
     from rpu_backend.adapters.qwen3_5.quant_scope import (
@@ -61,6 +63,15 @@ METHODS = ("fp16", "w8a16", "w4a16_pgrp")
 PROFILES = ("w4_main_w8_gdn", "w8_main_w8_gdn", "w4_mlp_only",
             "w4_mlp_w8_attn_gdn", LEGACY_W8A16_PROFILE)
 DEFAULT_GROUP_SIZE = 32
+FAMILY = "qwen3_5"
+# Registered precision recipes this converter produces, as the arguments that produce them.
+RECIPES = {
+    "fp16": {"method": FP16},
+    "w8a16_text": {"method": W8A16},
+    "w4a16_text_rtn_g32": {"method": W4A16_PGRP, "group_size": 32},
+    "w4a16_mlp_rtn_g32": {"profile": "w4_mlp_only"},
+    "w4a16_mlp_rtn_g32_attn_gdn_w8a16": {"profile": "w4_mlp_w8_attn_gdn"},
+}
 SKIP_MODULES = ["lm_head", "embed_tokens", "visual", "mtp", "conv1d"]
 
 
@@ -118,7 +129,7 @@ def _checkpoint_layout(src: Path) -> tuple[bool, list[str], dict[str, str], dict
 def _copy_sidecar_files(src: Path, dst: Path, shards: set[str]) -> list[str]:
     skip = set(shards)
     skip.update({"model.safetensors", "model.safetensors.index.json", "config.json",
-                 "SHA256SUMS"})
+                 "SHA256SUMS", RECORD})
     copied = []
     for path in sorted(src.iterdir()):
         if (path.name in skip or not path.is_file()
@@ -211,10 +222,23 @@ def _quant_config(is_full, method: str | None, group_size: int,
     return config
 
 
+def produced_recipe(method: str | None = None, profile: str | None = None,
+                    group_size: int = DEFAULT_GROUP_SIZE) -> str | None:
+    """The registered recipe these arguments produce; None for the other profiles and W4 groups."""
+    if method is None and profile is None:
+        method = W8A16
+    arguments = {"profile": profile} if profile is not None else {"method": method}
+    if method == W4A16_PGRP:
+        arguments["group_size"] = group_size
+    return next((name for name, row in RECIPES.items() if row == arguments), None)
+
+
 def convert_checkpoint(src: str | Path, dst: str | Path, *,
                        method: str | None = None,
                        profile: str | None = None,
-                       group_size: int = DEFAULT_GROUP_SIZE) -> dict:
+                       group_size: int = DEFAULT_GROUP_SIZE,
+                       recipe: str | None = None) -> dict:
+    """RECIPE, when given, must be the registered recipe the other arguments produce."""
     src = Path(src).expanduser().resolve()
     dst = Path(dst).expanduser().resolve()
     if method is not None and profile is not None:
@@ -230,6 +254,7 @@ def convert_checkpoint(src: str | Path, dst: str | Path, *,
         raise ValueError(
             "--group-size must be one of "
             f"{PGRP_SUPPORTED_GROUP_SIZES} for w4a16_pgrp, got {group_size}")
+    recipe = produced(FAMILY, produced_recipe(method, profile, group_size), recipe)
     if not src.is_dir():
         raise FileNotFoundError(f"--src is not a directory: {src}")
     if dst.exists():
@@ -271,6 +296,7 @@ def convert_checkpoint(src: str | Path, dst: str | Path, *,
         raise FileExistsError(f"temporary output already exists: {tmp}")
 
     stats = {
+        "recipe": recipe,
         "n_quantized": 0,
         "n_copied": 0,
         "bytes_in": 0,
@@ -412,6 +438,7 @@ def convert_checkpoint(src: str | Path, dst: str | Path, *,
 
         if not fp16_export:
             _copy_sidecar_files(src, tmp, set(shards))
+        write_record(tmp, FAMILY, recipe)
         tmp.rename(dst)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -432,14 +459,20 @@ def main(argv: list[str] | None = None) -> int:
                                 "(default: w8a16)")
     precision.add_argument("--profile", choices=PROFILES,
                            help="configuration-driven mixed-precision profile")
-    parser.add_argument("--group-size", type=int, default=DEFAULT_GROUP_SIZE,
-                        help="K-group size for w4a16_pgrp (default 32)")
+    precision.add_argument("--recipe", choices=sorted(RECIPES),
+                           help="registered precision recipe; sets method/profile and group size")
+    parser.add_argument("--group-size", type=int,
+                        help=f"K-group size for w4a16_pgrp (default {DEFAULT_GROUP_SIZE})")
     args = parser.parse_args(argv)
+    if args.recipe is not None and args.group_size is not None:
+        parser.error("--recipe fixes the group size; drop --group-size")
+    arguments = (dict(RECIPES[args.recipe]) if args.recipe is not None else
+                 {"method": args.method, "profile": args.profile,
+                  "group_size": DEFAULT_GROUP_SIZE if args.group_size is None else args.group_size})
+    arguments.setdefault("group_size", DEFAULT_GROUP_SIZE)
 
     try:
-        stats = convert_checkpoint(args.src, args.dst, method=args.method,
-                                   profile=args.profile,
-                                   group_size=args.group_size)
+        stats = convert_checkpoint(args.src, args.dst, recipe=args.recipe, **arguments)
     except (FileExistsError, FileNotFoundError, KeyError, TypeError, ValueError) as exc:
         print(f"[convert_qwen3_5] error: {exc}", file=sys.stderr)
         return 1
@@ -447,12 +480,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[convert_qwen3_5] {Path(args.src).resolve()}")
     print(f"              -> {Path(args.dst).resolve()}")
     print(f"  shards    : {stats['n_shards']}")
-    selected = (f"profile={args.profile}" if args.profile
-                else f"method={args.method or W8A16}")
-    uses_w4 = (args.profile in ("w4_main_w8_gdn", "w4_mlp_only", "w4_mlp_w8_attn_gdn")
-               or args.method == W4A16_PGRP)
+    profile, method = arguments.get("profile"), arguments.get("method")
+    selected = f"profile={profile}" if profile else f"method={method or W8A16}"
+    uses_w4 = (profile in ("w4_main_w8_gdn", "w4_mlp_only", "w4_mlp_w8_attn_gdn")
+               or method == W4A16_PGRP)
     print(f"  precision : {selected}"
-          + (f" (group_size={args.group_size})" if uses_w4 else ""))
+          + (f" (group_size={arguments['group_size']})" if uses_w4 else ""))
+    print(f"  recipe    : {stats['recipe'] or 'none registered (no record written)'}")
     print(f"  quantized : {stats['n_quantized']} weights")
     print(f"  projections: {stats['projection_counts']}")
     print(f"  copied    : {stats['n_copied']} tensors")

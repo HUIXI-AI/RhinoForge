@@ -25,7 +25,11 @@ import torch
 import torch.nn as nn
 
 from rpu_backend.runtime.log import _LOG
-from rpu_backend.runtime.topology import PHYSICAL_CORE_COUNT, decoder_mlp_intermediate_size
+from rpu_backend.runtime.topology import (
+    PHYSICAL_CORE_COUNT,
+    decoder_lm_head_vocab_size,
+    decoder_mlp_intermediate_size,
+)
 
 
 NUM_CORES = PHYSICAL_CORE_COUNT
@@ -454,7 +458,8 @@ def _record_linear_layout(
 
 def validate_decoder_weight_structure(model, *, num_layers, hidden_size,
         intermediate_size, num_q_heads, num_kv_heads, head_dim, vocab_size,
-        projection_dtype=torch.float16, lm_head_dtype=torch.float16, qk_norm=True):
+        projection_dtype=torch.float16, lm_head_dtype=torch.float16, qk_norm=True,
+        lm_head_vocab_size=None):
     """Validate the actual plain decoder before irreversible weight conversion.
 
     HF config describes intended geometry; modules may have been replaced after
@@ -485,7 +490,9 @@ def validate_decoder_weight_structure(model, *, num_layers, hidden_size,
     if not isinstance(getattr(model, "lm_head", None), nn.Linear):
         raise ValueError("decoder lm_head must be a Linear")
     weight(getattr(decoder, "embed_tokens", None), "embedding", (vocab_size, hidden_size))
-    weight(getattr(model, "lm_head", None), "lm_head", (vocab_size, hidden_size), lm_head_dtype)
+    weight(getattr(model, "lm_head", None), "lm_head",
+           (vocab_size if lm_head_vocab_size is None else lm_head_vocab_size, hidden_size),
+           lm_head_dtype)
     weight(getattr(decoder, "norm", None), "final norm", (hidden_size,))
     shapes = {"q_proj": (num_q_heads * head_dim, hidden_size),
         "k_proj": (num_kv_heads * head_dim, hidden_size),
@@ -533,7 +540,8 @@ def pad_decoder_mlp_projection(weight, *, projection_name: str,
     fused adapters can retain logical HF metadata and discard each raw leaf.
     """
     if (logical_size, physical_size) not in (
-            (3584, 3648), (8192, 8256), (9728, 9792), (17408, 17472), (25600, 25728)):
+            (3584, 3648), (8192, 8256), (9728, 9792), (17408, 17472), (25600, 25728),
+            (18944, 19008), (11008, 11136)):
         raise ValueError("no admitted decoder MLP padding geometry")
     if projection_name not in ("gate_proj", "up_proj", "down_proj"):
         raise ValueError("MLP padding requires a known projection role")
@@ -555,7 +563,8 @@ def validate_decoder_mlp_padding(model, *, logical_size: int, physical_size: int
     if physical_size == logical_size:
         return
     if (logical_size, physical_size) not in (
-            (3584, 3648), (8192, 8256), (9728, 9792), (17408, 17472), (25600, 25728)):
+            (3584, 3648), (8192, 8256), (9728, 9792), (17408, 17472), (25600, 25728),
+            (18944, 19008), (11008, 11136)):
         raise ValueError("no admitted decoder MLP padding geometry")
     layers = model.model.layers
     hidden = model.config.hidden_size
@@ -605,6 +614,62 @@ def pad_decoder_mlp_weights(model, *, logical_size: int, physical_size: int):
                 projection.weight = nn.Parameter(padded, requires_grad=w.requires_grad)
                 projection.out_features, projection.in_features = padded.shape
     _release_cpu_weight_pages()
+
+
+def validate_decoder_lm_head_padding(model, *, logical_size: int, physical_size: int):
+    """Check the original CPU FP16/INT8 lm_head before claiming or mutating a model."""
+    if physical_size == logical_size:
+        return
+    if (logical_size, physical_size) != (151936, 151968):
+        raise ValueError("no admitted decoder lm_head padding geometry")
+    head = getattr(model, "lm_head", None)
+    if not isinstance(head, nn.Linear):
+        raise ValueError("lm_head padding requires a Linear module")
+    w = head.weight
+    hidden = head.in_features
+    if (w.device.type != "cpu" or w.dtype not in (torch.float16, torch.int8)
+            or w.ndim != 2 or not w.is_contiguous()
+            or tuple(w.shape) != (logical_size, hidden)
+            or head.out_features != logical_size
+            or head.bias is not None
+            or hasattr(head, "_rpu_linear_partition")):
+        raise ValueError("lm_head padding requires original contiguous CPU FP16 or INT8 weights")
+    if w.dtype == torch.int8:
+        scale = getattr(head, "weight_scale", None)
+        if (not isinstance(scale, torch.Tensor) or scale.dtype != torch.float16
+                or scale.device.type != "cpu" or not scale.is_contiguous()
+                or tuple(scale.shape) != (logical_size,)):
+            raise ValueError("lm_head padding requires the original contiguous CPU FP16 channel scales")
+
+
+def pad_decoder_lm_head_weight(model, *, logical_size: int, physical_size: int):
+    """Zero-pad CPU lm_head rows once before swizzle; unties from embed_tokens."""
+    validate_decoder_lm_head_padding(model, logical_size=logical_size, physical_size=physical_size)
+    if physical_size == logical_size:
+        return
+    head = model.lm_head
+    w = head.weight
+    with torch.no_grad():
+        padded = w.new_zeros((physical_size, w.shape[1]))
+        padded[:logical_size].copy_(w)
+        if w.dtype == torch.int8:
+            scale = head.weight_scale
+            padded_scale = scale.new_ones(physical_size)
+            padded_scale[:logical_size].copy_(scale)
+            head.weight_scale = padded_scale
+        head.weight = nn.Parameter(padded, requires_grad=w.requires_grad)
+        head.out_features, head.in_features = padded.shape
+
+
+def align_w4_pgrp_scale_for_rpu(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Align a packed W4 G32 scale to lcm(4096, 3072)=12288 bytes once on RPU."""
+    if (not isinstance(weight, torch.Tensor) or not isinstance(scale, torch.Tensor)
+            or weight.dtype != torch.uint8 or scale.dtype != torch.float16
+            or weight.device.type != "rpu" or scale.device != weight.device
+            or type(weight) is not torch.Tensor or type(scale) is not torch.Tensor):
+        return scale
+    prepare = getattr(getattr(torch.ops, "rpu", None), "w4_pgrp_prepare_metadata", None)
+    return prepare(weight, scale, 6) if callable(prepare) else scale
 
 
 def _linear_conversion_layout(linear, name, force_col_partition,
@@ -664,6 +729,9 @@ def _validate_bounded_linear_move(module, force_col_partition, attn_num_cores,
             else:
                 physical_n = decoder_mlp_intermediate_size(n, cores)
                 partition = 1
+        elif pending_mlp_padding and name == "lm_head":
+            physical_n = decoder_lm_head_vocab_size(n, cores)
+            partition = 1
         if ((partition == 0 and (physical_n % 16 or physical_k % (elements_per_word * cores)))
                 or (partition == 1 and (physical_n % (16 * cores) or physical_k % elements_per_word))
                 or partition < 0):

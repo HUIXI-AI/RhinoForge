@@ -18,8 +18,10 @@ from safetensors.torch import load_file, save_file
 
 try:
     from ._common import dequantize_linear_per_channel, quantize_linear_per_channel
+    from .precision_recipes import RECORD, produced, write_record
 except ImportError:
     from _common import dequantize_linear_per_channel, quantize_linear_per_channel
+    from precision_recipes import RECORD, produced, write_record
 
 
 QUANT_PROJ_SUFFIXES = (
@@ -32,8 +34,28 @@ QUANT_PROJ_SUFFIXES = (
     "down_proj.weight",
 )
 
+# Registered precision recipes this converter produces: the source family they need
+# and the arguments that produce them. Qwen3-VL Vision has no matching projection
+# suffix, so its text-only W8 is the same with or without a model.visual skip.
+RECIPES = {
+    "w8a16_text_head": ("qwen3", {"skip_modules": ["lm_head"], "quant_lm_head": True}),
+    "w8a16_text": ("qwen3_vl", {"skip_modules": ["lm_head"]}),
+}
+DEFAULT_SKIP_MODULES = ["lm_head"]
+
 LM_HEAD_WEIGHT_NAME = "lm_head.weight"
 EMBED_TOKENS_WEIGHT_NAME = "model.embed_tokens.weight"
+
+
+def produced_recipe(model_type, skip_modules, *, quant_lm_head=False,
+                    quant_embed_tokens=False) -> tuple[str, str] | None:
+    """The (family, recipe) these arguments produce from a MODEL_TYPE source; None for other mixes."""
+    if quant_embed_tokens or not set(skip_modules) <= {"lm_head", "model.visual"}:
+        return None
+    for name, (family, row) in RECIPES.items():
+        if family == model_type and bool(row.get("quant_lm_head")) == bool(quant_lm_head):
+            return family, name
+    return None
 
 
 def _should_quantize(name: str, skip_modules: list[str]) -> bool:
@@ -102,7 +124,7 @@ def _convert_tensor(
 
 def _copy_sidecar_files(src: Path, dst: Path, shards: set[str]) -> None:
     skip = set(shards)
-    skip.update({"model.safetensors", "model.safetensors.index.json", "config.json"})
+    skip.update({"model.safetensors", "model.safetensors.index.json", "config.json", RECORD})
     for path in sorted(src.iterdir()):
         if path.name in skip or not path.is_file():
             continue
@@ -116,13 +138,19 @@ def convert_checkpoint(
     *,
     quant_lm_head: bool = False,
     quant_embed_tokens: bool = False,
+    recipe: str | None = None,
 ) -> dict:
+    """RECIPE, when given, must be the registered recipe the other arguments produce from SRC."""
     src = Path(src).expanduser().resolve()
     dst = Path(dst).expanduser().resolve()
     if not src.is_dir():
         raise FileNotFoundError(f"--src is not a directory: {src}")
     if dst.exists():
         raise FileExistsError(f"--dst already exists, refusing to overwrite: {dst}")
+    model_type = json.loads((src / "config.json").read_text()).get("model_type")
+    family, name = produced_recipe(model_type, skip_modules, quant_lm_head=quant_lm_head,
+                                   quant_embed_tokens=quant_embed_tokens) or (model_type, None)
+    recipe = produced(family, name, recipe)
 
     is_sharded, shards, weight_map, index = _checkpoint_layout(src)
     tmp = dst.with_name(f".{dst.name}.tmp-{os.getpid()}")
@@ -130,6 +158,7 @@ def convert_checkpoint(
         raise FileExistsError(f"temporary output already exists: {tmp}")
 
     stats = {
+        "recipe": recipe and f"{family}/{recipe}",
         "n_quantized": 0,
         "n_copied": 0,
         "bytes_in": 0,
@@ -227,6 +256,7 @@ def convert_checkpoint(
             json.dump(config, f, indent=2)
 
         _copy_sidecar_files(src, tmp, set(shards))
+        write_record(tmp, family, recipe)
         tmp.rename(dst)
     except Exception:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -242,8 +272,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--skip-modules",
         nargs="+",
-        default=["lm_head"],
-        help="module-name substrings never quantized",
+        help="module-name substrings never quantized (default: lm_head)",
     )
     parser.add_argument(
         "--quant-lm-head",
@@ -263,7 +292,19 @@ def main(argv: list[str] | None = None) -> int:
             "int8 embeddings cannot share one Parameter safely."
         ),
     )
+    parser.add_argument(
+        "--recipe",
+        choices=sorted(RECIPES),
+        help=("registered precision recipe: w8a16_text_head for Qwen3, w8a16_text "
+              "for Qwen3-VL; sets the options above"),
+    )
     args = parser.parse_args(argv)
+    if args.recipe is not None:
+        if args.skip_modules is not None or args.quant_lm_head or args.quant_embed_tokens:
+            parser.error("--recipe sets --skip-modules/--quant-lm-head/--quant-embed-tokens")
+        vars(args).update(RECIPES[args.recipe][1])
+    if args.skip_modules is None:
+        args.skip_modules = list(DEFAULT_SKIP_MODULES)
     if args.quant_embed_tokens and not args.quant_lm_head:
         print(
             "[convert_qwen3] error: --quant-embed-tokens requires --quant-lm-head",
@@ -278,6 +319,7 @@ def main(argv: list[str] | None = None) -> int:
             args.skip_modules,
             quant_lm_head=args.quant_lm_head,
             quant_embed_tokens=args.quant_embed_tokens,
+            recipe=args.recipe,
         )
     except (FileExistsError, FileNotFoundError, TypeError, ValueError) as exc:
         print(f"[convert_qwen3] error: {exc}", file=sys.stderr)
@@ -288,6 +330,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  shards    : {stats['n_shards']}")
     print(f"  quantized : {stats['n_quantized']} weights")
     print(f"  copied    : {stats['n_copied']} tensors")
+    print(f"  recipe    : {stats['recipe'] or 'none registered (no record written)'}")
     print(f"  lm_head   : {'quantized' if args.quant_lm_head else 'fp16'}")
     print(f"  embed     : {'quantized' if args.quant_embed_tokens else 'fp16'}")
     print(

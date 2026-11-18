@@ -83,7 +83,7 @@ QWEN3_5_MOE_35B_TP6_VISION_PROFILE = "qwen3_5_moe_35b_multimodal_tp6"
 _QWEN3_5_MOE_35B_VISION_PROFILE_LAYOUTS = MappingProxyType({
     QWEN3_5_MOE_35B_VISION_PROFILE: ((8, 8, 8, 8, 8), 8),
     QWEN3_5_MOE_35B_TP4_VISION_PROFILE: ((4, 4, 4, 4, 8), 4),
-    QWEN3_5_MOE_35B_TP6_VISION_PROFILE: ((6, 4, 6, 4, 8), 4),
+    QWEN3_5_MOE_35B_TP6_VISION_PROFILE: ((6, 4, 6, 6, 8), 4),
 })
 _VISION_INSTALL_LOCK = threading.RLock()
 _QWEN3_5_VISION_MODEL_TP = 8
@@ -778,8 +778,9 @@ def _convert_vision_block_weights_for_rpu(
                 )
 
         if _g05_w8a16:
-            if num_cores != 8 or num_heads != 16 or hidden_size != 1024 or intermediate_size != 4096:
-                raise ValueError("G05 W8 Vision requires the exact TP8 K1 block")
+            # Four lanes use the generic scaled launches; the fused K1 kernels stay TP8.
+            if num_cores not in (4, 8) or num_heads != 16 or hidden_size != 1024 or intermediate_size != 4096:
+                raise ValueError("G05 W8 Vision requires the exact TP8/TP4 K1 block")
             for weight in (qkv_w, o_w, fc1_w, fc2_w):
                 if (weight.device.type != "cpu" or weight.dtype != torch.float16
                         or not bool(torch.isfinite(weight).all())):
@@ -1733,7 +1734,7 @@ def install_qwen3_5_vision_for_rpu(
                 != (24, 16, 1024, 4096)):
             raise ValueError("HIGH Vision math is private to the exact G05 K1 profile")
         require_g05_high_math_native(vision=True)
-    if _g05_w8a16 and (not _allow_certified_g05_k1 or num_cores != 8 or
+    if _g05_w8a16 and (not _allow_certified_g05_k1 or num_cores not in (4, 8) or
             tuple(getattr(config, key, None) for key in
                   ("depth", "num_heads", "hidden_size", "intermediate_size"))
             != (24, 16, 1024, 4096)):
@@ -2802,7 +2803,7 @@ def _lazy_vision_graph_options(text_state, *, prepared_profile=None):
         if getattr(policy, "qwen35_dense_27b_sdk_budget", False):
             expected_topology = (
                 root_cores, 8 if root_cores == 8 else 4,
-                root_cores, 8 if root_cores == 8 else 4, 8,
+                root_cores, root_cores, 8,
             )
             actual_topology = tuple(getattr(topology, name, None) for name in (
                 "num_cores", "attn_tp", "mlp_tp", "lm_head_tp", "physical_kv_cores"))

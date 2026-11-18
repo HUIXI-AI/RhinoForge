@@ -3,8 +3,8 @@
 Like the dense Qwen3.5 loader, this adapter-local module owns the model-specific
 quant declaration and tensor contract. Quantized checkpoints are built on
 meta, populated from safetensors with ``assign=True``, and keep their file-backed
-storage. Raw FP8 Parameters and scales are installed only after ``model.half``
-so Hugging Face never casts the byte codes.
+storage. Raw FP8 / INT8 Parameters and scales are installed only after
+``model.half`` so Hugging Face never casts the byte codes.
 """
 from __future__ import annotations
 
@@ -21,8 +21,11 @@ from transformers import AutoConfig, AutoModelForImageTextToText, GenerationConf
 from rpu_backend.adapters.qwen3_5_moe.quant_scope import (
     EXACT_PROFILE_ID,
     GPTQ_METHOD,
+    INT8_METHOD,
+    INT8_PROFILE_ID,
     RTN_METHOD,
     expected_fp8_weight_names,
+    expected_int8_weight_names,
     scale_name,
     validate_exact_profile,
     validate_layer_types,
@@ -141,8 +144,8 @@ def _materialize_meta_buffers(model) -> None:
         )
 
 
-def _pop_fp8_tensors(state_dict, expected, parameters):
-    """Pop raw-FP8 tensors for post-``half`` installation without cloning."""
+def _pop_fp8_tensors(state_dict, expected, parameters, storage=torch.uint8):
+    """Pop raw-FP8 (or routed INT8) tensors for post-``half`` installation without cloning."""
     consumed: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     seen: set[str] = set()
     for weight_name in sorted(name for name in state_dict if name in expected):
@@ -154,9 +157,9 @@ def _pop_fp8_tensors(state_dict, expected, parameters):
                 f"{sname}"
             )
         scale = state_dict.pop(sname)
-        if weight.dtype != torch.uint8:
+        if weight.dtype != storage:
             raise RPUBackendError(
-                f"Qwen3.5-MoE FP8 tensor {weight_name} must be raw uint8, got "
+                f"Qwen3.5-MoE quantized tensor {weight_name} must be {storage}, got "
                 f"{weight.dtype}"
             )
         expected_scale_shape = tuple(weight.shape[:-1])
@@ -187,12 +190,12 @@ def _pop_fp8_tensors(state_dict, expected, parameters):
     if stray:
         raise RPUBackendError(
             f"Qwen3.5-MoE checkpoint carries {len(stray)} scale tensor(s) "
-            f"outside the mixed-FP8 scope: {stray[:5]}"
+            f"outside the quantized scope: {stray[:5]}"
         )
     return consumed, seen
 
 
-def _install_fp8_tensors(consumed, model) -> None:
+def _install_fp8_tensors(consumed, model, profile=EXACT_PROFILE_ID) -> None:
     for weight_name, (weight, scale) in consumed.items():
         module_name, parameter_name = weight_name.rsplit(".", 1)
         module = model.get_submodule(module_name)
@@ -204,6 +207,11 @@ def _install_fp8_tensors(consumed, model) -> None:
             module._buffers[scale_attr] = scale
         else:
             module.register_buffer(scale_attr, scale)
+        if profile == INT8_PROFILE_ID:
+            module.rpu_weight_mode = 1
+            module.rpu_int8_scale_axis = -1
+            module.rpu_quant_profile = INT8_PROFILE_ID
+            continue
         module.rpu_fp8_format = "fp8_e4m3"
         module.rpu_weight_mode = 5
         module.rpu_fp8_scale_axis = -1
@@ -361,7 +369,11 @@ def load_qwen3_5_moe_model(
         return _load_int4_checkpoint_model(ckpt_dir, config, quant)
 
     layer_types = _layer_types(config)
-    expected = set(expected_fp8_weight_names(layer_types))
+    routed_int8 = quant.get("method") == INT8_METHOD
+    profile = INT8_PROFILE_ID if routed_int8 else EXACT_PROFILE_ID
+    expected = set((expected_int8_weight_names if routed_int8
+                    else expected_fp8_weight_names)(layer_types))
+    storage = torch.int8 if routed_int8 else torch.uint8
     with torch.device("meta"):
         model = AutoModelForImageTextToText.from_config(config)
     # from_config only derives defaults from the model/text config. The exact
@@ -377,7 +389,7 @@ def load_qwen3_5_moe_model(
     absent_from_model = sorted(expected - set(parameters))
     if absent_from_model:
         raise RPUBackendError(
-            "Qwen3.5-MoE skeleton is missing mixed-FP8 Parameter(s): "
+            "Qwen3.5-MoE skeleton is missing quantized Parameter(s): "
             f"{absent_from_model[:8]}"
         )
 
@@ -387,7 +399,7 @@ def load_qwen3_5_moe_model(
     for shard in _shard_paths(ckpt_dir):
         state_dict = load_file(str(shard))
         shard_consumed, shard_seen = _pop_fp8_tensors(
-            state_dict, expected, parameters
+            state_dict, expected, parameters, storage
         )
         duplicate = sorted(seen & shard_seen)
         if duplicate:
@@ -403,7 +415,7 @@ def load_qwen3_5_moe_model(
     not_consumed = sorted(expected - seen)
     if not_consumed:
         raise RPUBackendError(
-            "Qwen3.5-MoE checkpoint declares mixed FP8 but "
+            f"Qwen3.5-MoE checkpoint declares {profile} but "
             f"{len(not_consumed)} scope tensor(s) were not consumed: "
             f"{not_consumed[:8]}"
         )
@@ -412,7 +424,7 @@ def load_qwen3_5_moe_model(
     model.tie_weights()
     _materialize_meta_buffers(model)
     model.half()
-    _install_fp8_tensors(consumed, model)
+    _install_fp8_tensors(consumed, model, profile)
 
     meta_params = [
         name for name, parameter in model.named_parameters()
@@ -429,9 +441,9 @@ def load_qwen3_5_moe_model(
         )
 
     model._qwen3_5_moe_quant_config = dict(quant)
-    model._qwen3_5_moe_profile = EXACT_PROFILE_ID
+    model._qwen3_5_moe_profile = profile
     _LOG.info(
-        "Qwen3.5-MoE %s checkpoint loaded (%d FP8 tensors)",
+        "Qwen3.5-MoE %s checkpoint loaded (%d quantized tensors)",
         quant["profile"],
         len(consumed),
     )

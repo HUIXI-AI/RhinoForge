@@ -20,13 +20,17 @@ _MISSING = object()
 
 def _normalize_execution(value, *, entry_point):
     from rpu_backend.adapters.rhinovla.runtime import (
+        _RHINOVLA_EXECUTION_SUPPORTED,
         RHINOVLA_EXECUTION_COMPONENTS,
     )
     from rpu_backend.api._execution import normalize_rpu_execution
 
+    # The composite budget model.num_cores is admitted here; the runtime
+    # derives each child layout from it.
     return normalize_rpu_execution(
         value,
         entry_point=entry_point,
+        supported=_RHINOVLA_EXECUTION_SUPPORTED,
         supported_components=RHINOVLA_EXECUTION_COMPONENTS,
     )
 

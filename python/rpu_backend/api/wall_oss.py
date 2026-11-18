@@ -332,6 +332,7 @@ class WallOssPolicy:
                 "prefill": ("chunk_size", "padding_rows", "padding_budget", "linear_acc32"),
                 "vision": ("chunk_size", "linear_acc32"),
                 "action": ("chunk_size", "linear_acc32"),
+                "model": ("num_cores",),
             },
         )
         delta_action = _strict_bool("delta_action", delta_action)
@@ -433,8 +434,11 @@ class WallOssPolicy:
         inst._nvfp4a16 = nvfp4a16
         inst._rtc = rtc
         inst._rtc_max_delay = 10 if rtc else 0
+        # Below eight cores RTC W8 is uniform: the FP16 boundary projections
+        # are eight-lane kernels, replaced there by a residual scale.
+        reduced = execution_config.get("model", {}).get("num_cores", 8) != 8
         inst._precision = (
-            "w8a16-hybrid" if rtc and w8a16 else (
+            "w8a16-hybrid" if rtc and w8a16 and not reduced else (
                 "w8a16" if w8a16 else (
                     "w4a16" if w4a16 else (
                         "nvfp4a16" if nvfp4a16 else "fp16"
@@ -449,7 +453,21 @@ class WallOssPolicy:
         inst._runtime_env = _runtime_environment(runtime_env)
         inst._rpu_execution = execution_config
         inst._graph_runtime_policy = graph_runtime_policy
-        if rtc:
+        if rtc and reduced:
+            # Four/six cores: fused denoiser + four-lane fused Vision merger;
+            # eight-lane TP8, mixed-precision and Vision schedule routes stay off.
+            inst._runtime_env.update({
+                "RPU_WALL_OSS_ACTION_FP32_TAIL": "0",
+                "RPU_WALL_OSS_FUSED_DENOISE": "1",
+                "RPU_WALL_OSS_DENOISE_UNROLL": "1",
+                "RPU_WALL_OSS_ATTN_TP8": "0",
+                "RPU_WALL_OSS_VISION_FUSED_MERGER": "1",
+                "RPU_WALL_OSS_VISION_LAYER_GROUP": "0",
+                "RPU_WALL_OSS_VISION_WEIGHT_OUTER": "0",
+                "RPU_WALL_OSS_VISION_MIXED_PRECISION": "0",
+                "RPU_WALL_OSS_PREFILL_MIXED_PRECISION": "0",
+            })
+        elif rtc:
             # v728 uses the standard automatic residual ring and keeps its
             # checked mixed-precision boundaries.
             # W8 leaves the Vision selector caller-configurable; the builder

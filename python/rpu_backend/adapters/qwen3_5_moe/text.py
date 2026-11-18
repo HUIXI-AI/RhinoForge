@@ -320,14 +320,14 @@ def _text_config(config):
 
 def _validate_qwen3_5_moe_linear_accumulation(profile_id, execution_config):
     """Bind Text accumulation before weight loading or native installation."""
-    from .quant_scope import GPTQ_PROFILE_ID, RTN_PROFILE_ID
+    from .quant_scope import GPTQ_PROFILE_ID, INT8_PROFILE_ID, RTN_PROFILE_ID
 
     linear_acc32 = execution_config.get("prefill", {}).get("linear_acc32", False)
     if type(linear_acc32) is not bool:
         raise TypeError("Qwen3.5-MoE prefill.linear_acc32 must be bool")
-    if profile_id in (RTN_PROFILE_ID, GPTQ_PROFILE_ID) and linear_acc32:
+    if profile_id in (RTN_PROFILE_ID, GPTQ_PROFILE_ID, INT8_PROFILE_ID) and linear_acc32:
         raise UnsupportedModelError(
-            "Qwen3.5-MoE routed UINT4 currently supports Text ACC16 only; "
+            "Qwen3.5-MoE routed UINT4 / INT8 currently supports Text ACC16 only; "
             "prefill.linear_acc32 must be false. Vision linear_acc32 is independent."
         )
     if execution_config.get("prefill", {}).get("moe_resident_prefill", False):
@@ -912,7 +912,7 @@ def _install_qwen3_5_moe_text_for_rpu_impl(
                 scale is not None and scale.numel() != 0
             ):
                 raise UnsupportedModelError(
-                    f"{fq_name}: routed-only INT4 requires FP16 mixers with empty scales"
+                    f"{fq_name}: routed-only INT4 / INT8 requires FP16 mixers with empty scales"
                 )
             return empty
         if weight.dtype != torch.uint8:

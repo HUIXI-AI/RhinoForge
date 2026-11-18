@@ -262,10 +262,11 @@ def prefix_masks(n_images: int, grid: int, lang_masks: torch.Tensor):
     pad_masks = torch.cat(pad_parts, dim=1)
     att_masks = torch.tensor(att, dtype=torch.bool)[None]
     modality_mask = torch.tensor(modality, dtype=torch.bool)[None]
-    if n_images == 2:
+    if n_images != 3:
         # Keep 64 language slots; only the physical tail is padded. It must
         # remain invisible to both prefix and suffix attention, with no extra
-        # valid tokens or camera segment. Three-camera fixtures stay unchanged.
+        # valid tokens or camera segment. Three cameras fill exactly 240 rows
+        # and stay unchanged; one camera's 124 rows pad to 128.
         padding = (-pad_masks.shape[1]) % 16
         pad_masks = F.pad(pad_masks, (0, padding), value=False)
         att_masks = F.pad(att_masks, (0, padding), value=False)

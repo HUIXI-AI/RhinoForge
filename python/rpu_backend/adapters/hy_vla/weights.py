@@ -32,7 +32,10 @@ from rpu_backend.adapters.hy_vla.nvfp4 import (
     quantize_expert_nvfp4_cpu,
 )
 from rpu_backend.quant._common import quantize_linear_per_channel
-from rpu_backend.quant.int4_pgrp_pack import pack_int4_per_channel_as_pgrp, w4_storage_shape
+from rpu_backend.quant.int4_pgrp_pack import (quantize_int4_group_wise,
+                                              swizzle_int4_pgrp_scale,
+                                              swizzle_pack_int4_pgrp,
+                                              w4_storage_shape)
 from rpu_backend.quant.hyvla_nvfp4_resident_scales import pack_hyvla_nvfp4_resident_scales
 from rpu_backend.runtime.weights import (tp_col_swizzle_mc_weight,
                                          tp_row_swizzle_mc_weight,
@@ -115,8 +118,8 @@ class HyVlaConfig:
         `RPU_HY_VLA_ATTN_TP8` 打开后把 4 个 KV head **各复制一份**成 8 个槽位
         （槽 c = 原 head `floor(c/2)`），于是 `attn_tp = min(8, 8) = 8`，
         q/k/v/o 四个投影从 4 核变 8 核 —— 那是本模型 device 侧最后一块结构性余量：
-        `attn_tp=4` 只用到 4 个 DMA 通道，被"每核 24 GB/s"压在 96 GB/s，
-        而 MLP 那三个走 8 核能吃到聚合的 136.6（结论 23）。
+        `attn_tp=4` 只用 4 个核读权重，DDR 读上限约 84–95 GB/s（R1 DDR benchmark
+        4 核），而 MLP 那三个走 8 核能吃到 ~142（结论 23）。
 
         **为什么复制正好对得上**：q 按 `_col(·,8)` 落成核 c ↔ q head 2c,2c+1；
         原始 gqa 分组是 q head h ↔ kv head `h//4` ⇒ 核 c 要的是 `floor(2c/4)`
@@ -359,6 +362,16 @@ def _row(w: torch.Tensor, nc: int) -> torch.Tensor:
     return _rpu16(tp_row_swizzle_mc_weight(w.half().contiguous(), nc))
 
 
+# Under a 4/6-core budget the ViT, patch-embed, merger and action expert have
+# four-lane owners only; the VLM MLP takes the whole budget. Packed W4 Vision
+# also runs on four lanes under the eight-core budget (see vision_lanes).
+_HY_VLA_REDUCED_LANES = 4
+
+
+def _hy_vla_fixed_lanes(num_cores: int) -> int:
+    return 8 if num_cores == 8 else _HY_VLA_REDUCED_LANES
+
+
 def _attn_tp8() -> bool:
     """Legacy config-view helper; loader execution uses its frozen cold plan."""
     return os.environ.get("RPU_HY_VLA_ATTN_TP8", "0").strip() in (
@@ -463,12 +476,29 @@ class _HyVlaWeightColdPlan:
     o_resident_layers: int = 0
     expert_nvfp4: bool = False
     resident_fp8_scale_layers: int = 0
+    num_cores: int = 8
+
+    @property
+    def vision_lanes(self) -> int:
+        """ViT, patch-embed and merger lanes for this budget and Vision precision.
+
+        Packed W4 Vision takes four lanes under every budget: at eight the
+        padded o_proj (K1280) and fc2 (K4352) rows split into 160 and 544 per
+        core, which the pgrp W4 kernels do not accept (320/1088 at four).
+        """
+        return (_HY_VLA_REDUCED_LANES if self.vit_bits == 4
+                else _hy_vla_fixed_lanes(self.num_cores))
 
     @classmethod
     def from_environment(
         cls,
         environment: Mapping[str, str] | None = None,
+        *,
+        num_cores: int = 8,
     ) -> "_HyVlaWeightColdPlan":
+        if type(num_cores) is not int or num_cores not in (4, 6, 8):
+            raise ValueError(f"HyVLA model.num_cores must be one of 4, 6 or 8, got {num_cores!r}")
+        lanes = _hy_vla_fixed_lanes(num_cores)
         source = os.environ if environment is None else environment
         w4_tokens = _quant_tokens("RPU_HY_VLA_W4A16", source)
         w8_tokens = _quant_tokens("RPU_HY_VLA_W8A16", source)
@@ -484,6 +514,22 @@ class _HyVlaWeightColdPlan:
         if nv_value not in ("", "0", "off", "false", "1", "on", "true"):
             raise ValueError(f"{nv_key} requires a strict boolean, got {nv_value!r}")
         expert_nvfp4 = nv_value in ("1", "on", "true")
+        if num_cores != 8:
+            # Eight-core layouts only: refuse them before any residency or
+            # precision combination is interpreted.
+            selected = [name for name, active in (
+                ("RPU_HY_VLA_ATTN_TP8", _environment_value(
+                    source, "RPU_HY_VLA_ATTN_TP8").lower() in ("1", "true", "on")),
+                (key, gateup_resident),
+                ("RPU_HY_VLA_EXPERT_O_RESIDENT_LAYERS", _environment_value(
+                    source, "RPU_HY_VLA_EXPERT_O_RESIDENT_LAYERS") not in ("", "0")),
+                ("RPU_HY_VLA_EXPERT_RESIDENT_FP8_SCALE_LAYERS", _environment_value(
+                    source, "RPU_HY_VLA_EXPERT_RESIDENT_FP8_SCALE_LAYERS") not in ("", "0")),
+            ) if active]
+            if selected:
+                raise ValueError(
+                    f"HyVLA model.num_cores={num_cores} has no route for "
+                    f"{', '.join(selected)}; turn them off or use eight cores")
         vlm_text_bits = _qbits_from_tokens("vlm", "text", w4_tokens, w8_tokens)
         vlm_vision_bits = _qbits_from_tokens("vlm", "vision", w4_tokens, w8_tokens)
         if expert_nvfp4 and ("expert" in w4_tokens or "expert" in w8_tokens):
@@ -511,9 +557,12 @@ class _HyVlaWeightColdPlan:
         attn_tp8 = _environment_value(source, "RPU_HY_VLA_ATTN_TP8").lower() in (
             "1", "true", "on")
         action_mlp_cores = 1 if _environment_value(
-            source, "RPU_HY_VLA_ACTION_MLP_MC").lower() in ("0", "off", "false") else 8
-        if expert_nvfp4 and (not attn_tp8 or action_mlp_cores != 8 or o_layers):
+            source, "RPU_HY_VLA_ACTION_MLP_MC").lower() in ("0", "off", "false") else lanes
+        if num_cores == 8 and expert_nvfp4 and (
+                not attn_tp8 or action_mlp_cores != 8 or o_layers):
             raise ValueError(f"{nv_key} requires attention TP8, action MLP TP8 and no W8 O residency")
+        if num_cores != 8 and expert_nvfp4 and action_mlp_cores != lanes:
+            raise ValueError(f"{nv_key} at model.num_cores={num_cores} requires the four-core action MLP")
         scale_key = "RPU_HY_VLA_EXPERT_RESIDENT_FP8_SCALE_LAYERS"
         scale_value = _environment_value(source, scale_key) or "0"
         if scale_value not in ("0", "4", "8"):
@@ -523,17 +572,15 @@ class _HyVlaWeightColdPlan:
             raise ValueError(f"{scale_key}={scale_layers} requires NVFP4 expert, enabled GU24 residency and no O residency")
         if gateup_resident and (expert_bits not in (8, 16) or not attn_tp8 or action_mlp_cores != 8):
             raise ValueError(f"{key} requires FP16/W8A16 expert, attention TP8 and action MLP TP8")
-        if vit_bits == 4:
-            raise ValueError(
-                "RPU_HY_VLA_W4A16 cannot select vit: the certified ViT "
-                "o_proj/fc2 layouts are not divisible by the int4 row-partition "
-                "contract"
-            )
+        # pgrp row stripes need K % (64 x TP): o_proj K1280 and fc2 K4352 fit
+        # four lanes but not eight, so W4 Vision (with its patch embed) is
+        # laid out for four lanes under every budget.
+        vision_lanes = _HY_VLA_REDUCED_LANES if vit_bits == 4 else lanes
         return cls(
             patch_embed_cores=(
                 1 if _environment_value(
                     source, "RPU_HY_VLA_PATCH_EMBED_MC"
-                ).lower() in ("0", "false") else 8
+                ).lower() in ("0", "false") else vision_lanes
             ),
             action_mlp_cores=action_mlp_cores,
             attn_tp8=attn_tp8,
@@ -546,6 +593,7 @@ class _HyVlaWeightColdPlan:
             o_resident_layers=o_layers,
             expert_nvfp4=expert_nvfp4,
             resident_fp8_scale_layers=scale_layers,
+            num_cores=num_cores,
         )
 
 
@@ -575,18 +623,27 @@ def _q8(w: torch.Tensor, partition: int, nc: int) -> Tuple[torch.Tensor, torch.T
             sc.to(torch.float16).to("rpu").contiguous())
 
 
-def _q4(w: torch.Tensor, partition: int, nc: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """FP16 ``[N,K]`` -> pgrp-packed W4 plus striped FP16 scale.
+_W4_GROUP_SIZE = 32
 
-    Quantization remains per output channel for numerical compatibility. Its
-    scale is repeated across K/32 groups before packing the generated pgrp ABI.
+
+def _pack_w4_g32(w: torch.Tensor, partition: int, nc: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """FP16 ``[N,K]`` -> host pgrp-packed W4 ``[N,K/2]`` plus striped FP16 scale.
+
+    Symmetric G32 RTN, one FP16 scale per (output channel, 32 K): the pgrp
+    ABI stores a scale per group anyway, so this costs the same bytes as the
+    former per-channel W4 (its scale repeated over K/32). Quantize before the
+    swizzle, as for W8; ``_dup_kv`` rows quantize identically.
     """
-    v4, sc = quantize_linear_per_channel(w.half().contiguous(), bits=4)
+    v4, scale_gn, _ = quantize_int4_group_wise(w.half().contiguous(), _W4_GROUP_SIZE)
     n, k = v4.shape
-    packed, packed_scale = pack_int4_per_channel_as_pgrp(
-        v4, sc.to(torch.float16), partition, nc
-    )
-    packed = packed.view(w4_storage_shape(n, k, partition, nc))
+    packed = swizzle_pack_int4_pgrp(v4, partition, nc).view(
+        w4_storage_shape(n, k, partition, nc))
+    return packed, swizzle_int4_pgrp_scale(scale_gn, _W4_GROUP_SIZE, partition, nc)
+
+
+def _q4(w: torch.Tensor, partition: int, nc: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """FP16 ``[N,K]`` -> (RPU pgrp W4 weight, RPU striped G32 scale)."""
+    packed, packed_scale = _pack_w4_g32(w, partition, nc)
     return (packed.to("rpu").contiguous(),
             packed_scale.to("rpu").contiguous())
 
@@ -633,6 +690,8 @@ class HyVlaWeights:
     host: Dict[str, torch.Tensor]               # host fp32：boundary 投影
     expert_o_resident_layers: int = 0            # cold physical resident bundle authority
     expert_nvfp4: HyVlaExpertNvfp4Metadata | None = None
+    num_cores: int = 8                            # cold model.num_cores layout authority
+    vision_lanes: int = 8                         # cold ViT/patch-embed/merger layout authority
 
 
 def _build_vit(
@@ -660,6 +719,7 @@ def _build_vit(
                            "qb kb vb ob f1b f2b "
                            "qws kws vws ows f1ws f2ws").split()}
     bits = cold.vit_bits
+    lanes = cold.vision_lanes
     for li in range(cfg.vit_layers):
         b = f"blocks.{li}."
         # Keep the existing RPU upload order (q/k/v/o/fc1/fc2, then biases and
@@ -671,7 +731,7 @@ def _build_vit(
         padded_biases = {}
         for n, i in (("qw", 0), ("kw", 1), ("vw", 2)):
             linear, bias = split_pad(qkv_w, qkv_b, i)
-            q, sc = _quant(linear, 1, 8, bits)
+            q, sc = _quant(linear, 1, lanes, bits)
             out[n].append(q)
             if sc is not None:
                 out[n + "s"].append(sc)
@@ -680,7 +740,7 @@ def _build_vit(
 
         ow = w[b + "attn.proj.weight"].view(Hid, H, D)
         ow = torch.cat([ow, ow.new_zeros(Hid, H, Dp - D)], 2).reshape(Hid, H * Dp)
-        q, sc = _quant(ow.contiguous(), 0, 8, bits)
+        q, sc = _quant(ow.contiguous(), 0, lanes, bits)
         out["ow"].append(q)
         if sc is not None:
             out["ows"].append(sc)
@@ -688,7 +748,7 @@ def _build_vit(
 
         f1_src = w[b + "mlp.fc1.weight"]
         f1w = torch.cat([f1_src, f1_src.new_zeros(Ip - I, Hid)], 0)
-        q, sc = _quant(f1w, 1, 8, bits)
+        q, sc = _quant(f1w, 1, lanes, bits)
         out["f1w"].append(q)
         if sc is not None:
             out["f1ws"].append(sc)
@@ -700,7 +760,7 @@ def _build_vit(
 
         f2_src = w[b + "mlp.fc2.weight"]
         f2w = torch.cat([f2_src, f2_src.new_zeros(Hid, Ip - I)], 1)
-        q, sc = _quant(f2w, 0, 8, bits)
+        q, sc = _quant(f2w, 0, lanes, bits)
         out["f2w"].append(q)
         if sc is not None:
             out["f2ws"].append(sc)
@@ -733,7 +793,7 @@ def _build_mot_branch(
     d = {k: [] for k in ("q_w k_w v_w o_w q_norm k_norm input_norm post_norm "
                          "gate_w up_w down_w "
                          "q_ws k_ws v_ws o_ws gate_ws up_ws down_ws").split()}
-    tp, mc = (8 if cold.attn_tp8 else min(8, cfg.num_kv_heads)), 8
+    tp, mc = (8 if cold.attn_tp8 else min(8, cfg.num_kv_heads)), cold.num_cores
     # ⚠️ MoT 两条孪生**各量各的 scale** —— text 与 `_v` 是两组不同的权重。
     # R42：位宽也可以逐孪生选（`RPU_HY_VLA_W8A16=vlm_vision`），因为两条走的是
     # 两个独立的 C++ setter。每条孪生 3.22 GB/帧 ⇒ 单量一条约值 −10 ms。
@@ -807,7 +867,8 @@ def _build_expert(
     d = {k: [] for k in ("q_w k_w v_w o_w q_norm k_norm input_norm post_norm "
                          "gate_w up_w down_w "
                          "q_ws k_ws v_ws o_ws gate_ws up_ws down_ws").split()}
-    tp, mc = (8 if cold.attn_tp8 else min(8, cfg.num_kv_heads)), 8
+    tp, mc = ((8 if cold.attn_tp8 else min(8, cfg.num_kv_heads)),
+              _hy_vla_fixed_lanes(cold.num_cores))
     bits = cold.expert_bits
     nvfp4 = cold.expert_nvfp4
     scale_layers = cold.resident_fp8_scale_layers
@@ -975,6 +1036,7 @@ def load_hy_vla_weights(
         # was opened. No environment parsing may occur after tensor access starts.
         patch_embed_cores = cold.patch_embed_cores
         action_mlp_cores = cold.action_mlp_cores
+        vision_lanes = cold.vision_lanes
 
         # patch_embed：Conv2d(k16,s16) ≡ im2col + GEMM。cin 3→16 补零满足对齐；
         # conv.bias 预融合进 pos_embedding（C++ 用一次 all_reduce_sum_residual 加上）。
@@ -998,7 +1060,7 @@ def load_hy_vla_weights(
                 continue
             value = merger_w[key]
             merger_rest[key] = (
-                _col(value, 8) if key.endswith(".weight") else _rpu16(value))
+                _col(value, vision_lanes) if key.endswith(".weight") else _rpu16(value))
             del value
         # `RPU_HY_VLA_FUSED_MERGER` 路径用的 predictor.0 **K 拆分**两半。
         # 原式是 `cat([nxc, pooled], -1) @ W0^T`（K=4096），拆成
@@ -1008,14 +1070,14 @@ def load_hy_vla_weights(
         # fp16 里乘 0.25 是精确的 2 的幂缩放（Wb 量级 ~1e-2，缩放后远离非规格化）。
         _p0 = merger_w["pooler.predictor.0.weight"]
         _k = _p0.shape[1] // 2
-        merger_rest["pooler.predictor.0.weight_a"] = _col(_p0[:, :_k], 8)
-        merger_rest["pooler.predictor.0.weight_b"] = _col(_p0[:, _k:] * 0.25, 8)
+        merger_rest["pooler.predictor.0.weight_a"] = _col(_p0[:, :_k], vision_lanes)
+        merger_rest["pooler.predictor.0.weight_b"] = _col(_p0[:, _k:] * 0.25, vision_lanes)
         del _p0
 
         # Preserve the established device upload order.  Only the CPU source
         # lifetime changes; all builders still finish before any forward.
         vit = _build_vit(vit_w, cfg, cold)
-        vit_proj1_w = _col(merger_w["proj1.weight"], 8)
+        vit_proj1_w = _col(merger_w["proj1.weight"], vision_lanes)
         vit_proj1_b = _rpu16(merger_w["proj1.bias"])
         vlm_text = _build_mot_branch(vlm_w, cfg, "", cold)
         vlm_vision = _build_mot_branch(vlm_w, cfg, "_v", cold)
@@ -1055,6 +1117,8 @@ def load_hy_vla_weights(
             expert_final_norm=expert_final_norm,
             tok_emb=tok_emb,
             host=host,
+            num_cores=cold.num_cores,
+            vision_lanes=cold.vision_lanes,
         )
 
 
@@ -1127,7 +1191,7 @@ def build_unroll_weights(cfg: HyVlaConfig, host: Dict[str, torch.Tensor],
     B_in = host["action_in_proj.bias"]                    # [D]
     time_all = torch.stack([(F.linear(B_in[None], W1a) + tb).reshape(-1)
                             for tb in _time_bias_list(cfg, host)])
-    # mo 是这 6 个里唯一的大件（[D,D] = 2 MB fp16），单核跑满 24.5 GB/s = 85.5 µs/步
+    # mo 是这 6 个里唯一的大件（[D,D] = 2 MB fp16），单核跑满 24.5 GB/s（单核 DDR 读上限 ~24）= 85.5 µs/步
     # ⇒ 默认切 8 核。⚠️ **wc 与 mo 要一起改**：C++ 侧接的是
     # 「A4 列并行 → A6 行(K)并行」这一对（层体里 gate/up→down 的同一套 TP 模式），
     # 只改一个 = 另一个读到别的核的段 ⇒ 静默算错。核数随权重显式绑定到 native。

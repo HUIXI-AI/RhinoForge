@@ -30,6 +30,7 @@ from rpu_backend.api._execution import (
 )
 from rpu_backend.api.cache import RPUCache
 from rpu_backend.adapters.hy_vla.weights import (HyVlaConfig, HyVlaWeights,
+                                                 _HY_VLA_REDUCED_LANES,
                                                  _HyVlaWeightColdPlan,
                                                  build_rope_tables,
                                                  build_time_embed,
@@ -61,25 +62,66 @@ _HY_VLA_SUB_NAME = {
 _RMSNORM_CAP_BASE = 1
 _RMSNORM_CAP_V16 = 2
 _RMSNORM_CAP_V32 = 4
+_HY_VLA_MODEL_SCOPE = {"model": ("num_cores",)}
+# The public core budget belongs to the composite and is cold-only. At 4/6
+# cores the VLM runs its template (attention 4 / MLP = budget); the ViT, its
+# merger and the action expert have four-lane owners only, so they run on four
+# cores under either reduced budget. Packed W4 Vision is laid out for four
+# lanes under every budget (weights `vision_lanes`), the eight-core one too.
+_HY_VLA_EXECUTION_SUPPORTED = {
+    **_HY_VLA_MODEL_SCOPE,
+    **{stage: fields
+       for stages in HY_VLA_EXECUTION_COMPONENTS.values()
+       for stage, fields in stages.items()},
+}
 
 
-def resolve_hy_vla_execution(value, *, entry_point: str):
+def _hy_vla_core_budget(execution) -> int:
+    # normalize_rpu_execution already admitted 4, 6 or 8.
+    return (execution or {}).get("model", {}).get("num_cores", 8)
+
+
+def _hy_vla_component_cores(
+    budget: int, component: str, vision_lanes: int | None = None,
+) -> int:
+    # VISION_LANES (default None: the budget rule) is the installed weights'
+    # Vision layout; only W4 Vision differs from the rule, at budget 8.
+    if component == HY_VLA_VISION_COMPONENT and vision_lanes is not None:
+        return vision_lanes
+    if budget == 8:
+        return 8
+    return budget if component == HY_VLA_LANGUAGE_COMPONENT else _HY_VLA_REDUCED_LANES
+
+
+def resolve_hy_vla_execution(value, *, entry_point: str,
+                             vision_lanes: int | None = None):
     """Resolve the one public mapping into three stable physical children."""
     root = normalize_rpu_execution(
         value,
         entry_point=entry_point,
+        supported=_HY_VLA_EXECUTION_SUPPORTED,
         supported_components=HY_VLA_EXECUTION_COMPONENTS,
     )
-    children = {
-        component: resolve_component_rpu_execution(
+    budget = _hy_vla_core_budget(root)
+    children = {}
+    for component in HY_VLA_EXECUTION_COMPONENTS:
+        child = resolve_component_rpu_execution(
             root,
             component,
             entry_point=entry_point,
+            supported=_HY_VLA_EXECUTION_SUPPORTED,
             supported_components=HY_VLA_EXECUTION_COMPONENTS,
             profile_auto=_HY_VLA_COMPONENT_AUTO[component],
         )
-        for component in HY_VLA_EXECUTION_COMPONENTS
-    }
+        cores = _hy_vla_component_cores(budget, component, vision_lanes)
+        if budget != 8 or cores != 8:
+            child = normalize_rpu_execution(
+                {**child, "model": {"num_cores": cores}},
+                entry_point=entry_point,
+                supported={**HY_VLA_EXECUTION_COMPONENTS[component],
+                           **_HY_VLA_MODEL_SCOPE},
+            )
+        children[component] = child
     return root, children
 
 
@@ -146,6 +188,13 @@ _HY_VLA_ENV_DEFAULTS = {
     "RPU_SKIP_IDLE_RECORD_FUNCTION": "1",
     "RPU_HY_VLA_PARTIAL_ROPE": "expert,vlm",
     "RPU_FASTREPLAY_SKIP_SYNC": "1",
+}
+# At 4/6 cores KV4 attention is native (no TP8 duplication) and the VLM keeps
+# the BASE RMSNorm: the vector payloads launch an eight-core grid.
+_HY_VLA_REDUCED_ENV_DEFAULTS = {
+    **_HY_VLA_ENV_DEFAULTS,
+    "RPU_HY_VLA_ATTN_TP8": "0",
+    "RPU_RMSNORM_VWARP": "0",
 }
 _HY_VLA_COMPONENTS = frozenset(("vit", "vlm", "expert"))
 
@@ -434,20 +483,55 @@ class _HyVlaColdPlan:
     runner: _HyVlaRunnerColdSnapshot
     caching_allocator: bool
     default_environment: tuple[tuple[str, str], ...]
+    num_cores: int = 8
 
 
 def prepare_hy_vla_cold_plan(
     overrides: Mapping[str, str] | None = None,
+    *,
+    num_cores: int = 8,
 ) -> _HyVlaColdPlan:
-    """Resolve every HyVLA cold/layout/quant selector without global mutation."""
+    """Resolve every HyVLA cold/layout/quant selector without global mutation.
+
+    ``num_cores`` is the composite's ``model.num_cores`` budget (4, 6 or 8);
+    the weight layout and every native owner are bound to it.
+    """
+    if type(num_cores) is not int or num_cores not in (4, 6, 8):
+        raise ValueError(f"HyVLA model.num_cores must be one of 4, 6 or 8, got {num_cores!r}")
     effective = dict(os.environ)
     if overrides is not None:
         effective.update({str(key): str(value) for key, value in overrides.items()})
-    for key, value in _HY_VLA_ENV_DEFAULTS.items():
+    defaults = _HY_VLA_ENV_DEFAULTS if num_cores == 8 else _HY_VLA_REDUCED_ENV_DEFAULTS
+    for key, value in defaults.items():
         effective.setdefault(key, value)
     native = _HyVlaNativeColdSnapshot.from_environment(effective)
-    weights = _HyVlaWeightColdPlan.from_environment(effective)
+    weights = _HyVlaWeightColdPlan.from_environment(effective, num_cores=num_cores)
     runner = _HyVlaRunnerColdSnapshot.from_environment(effective)
+    # The four-lane Vision owner runs the packed DDR-KV schedule with the fused
+    # merger only.
+    four_lane_vision = [name for name, active in (
+        ("RPU_HY_VLA_VISION_KV_SPM_ONLY", native.vit.kv_spm_only),
+        ("RPU_HY_VLA_VIT_PACKED=0", not runner.vit_packed),
+        ("RPU_HY_VLA_FUSED_MERGER=0", not runner.fused_merger),
+        ("RPU_HY_VLA_MERGER_IN_GRAPH=0", not runner.merger_in_graph),
+        ("RPU_HY_VLA_PROJ1_IN_MERGER=0", not runner.proj1_in_merger),
+    ) if active]
+    if num_cores != 8:
+        # These selectors and layouts have eight-core owners only; refuse them
+        # before any weight is read or process selector is pinned.
+        selected = [name for name, active in (
+            ("RPU_RMSNORM_VWARP",
+             native.vlm.rmsnorm_capability != _RMSNORM_CAP_BASE),
+            ("RPU_HY_VLA_RMSNORM_PAD16", native.expert.rmsnorm_pad16),
+        ) if active] + four_lane_vision
+        if selected:
+            raise ValueError(
+                f"HyVLA model.num_cores={num_cores} has no route for "
+                f"{', '.join(selected)}; turn them off or use eight cores")
+    elif weights.vision_lanes != 8 and four_lane_vision:
+        raise ValueError(
+            "HyVLA W4 Vision runs on four lanes and has no route for "
+            f"{', '.join(four_lane_vision)}; turn them off or use W8/FP16 Vision")
     if weights.gateup_resident and (not runner.unroll or not native.expert.silu_mul):
         raise ValueError("RPU_HY_VLA_EXPERT_GATEUP_RESIDENT requires ten-step unroll and expert SILU_MUL")
     return _HyVlaColdPlan(
@@ -460,7 +544,16 @@ def prepare_hy_vla_cold_plan(
         default_environment=tuple(
             (key, effective[key]) for key in _HY_VLA_ENV_DEFAULTS
         ),
+        num_cores=num_cores,
     )
+
+
+def _require_native_topology(name: str, actual, expected) -> None:
+    actual = tuple(int(value) for value in actual)
+    if actual != tuple(expected):
+        raise RuntimeError(
+            f"Hy-VLA {name} native topology differs from its weight layout: "
+            f"actual={actual}, expected={tuple(expected)}")
 
 
 class _DirectHyVlaOwner:
@@ -501,9 +594,10 @@ class _Sub:
 
     def __init__(self, name: str, create, destroy, bind: Callable[[int], None],
                  sig: "rpu_backend.graph.GraphSignature", persist: bool = False,
-                 variant=None, owner=None):
+                 variant=None, owner=None, runtime_policy=None):
         self._name, self._create, self._destroy, self._bind = name, create, destroy, bind
         self.sig = sig
+        self._runtime_policy = runtime_policy  # None keeps the eight-core default
         self.persist = persist        # True ⇒ 出作用域不 destroy，跨帧存活
         self.variant = variant        # bind 闭包的语义指纹；变了就必须重建
         self.handle: Optional[int] = None
@@ -527,7 +621,9 @@ class _Sub:
         try:
             self.handle = int(self._create())
             self._bind(self.handle)     # ← 与 create 绑成一步：不留空 handle
-            self.gc = rpu_backend.graph.GraphCache()
+            self.gc = rpu_backend.graph.GraphCache(
+                **({"runtime_policy": self._runtime_policy}
+                   if self._runtime_policy is not None else {}))
         except BaseException:
             try:
                 self.close()
@@ -613,10 +709,13 @@ class HyVlaRunner:
     _utraj: torch.Tensor = dataclasses.field(repr=False, default=None)
     _closed: bool = dataclasses.field(repr=False, default=False, init=False)
     _retirement_failed: bool = dataclasses.field(repr=False, default=False, init=False)
+    # Cold model.num_cores (not a dataclass field); __post_init__ binds it.
+    _core_budget = 8
 
     def __post_init__(self, rpu_execution):
         root, children = resolve_hy_vla_execution(
-            rpu_execution, entry_point="build_hy_vla"
+            rpu_execution, entry_point="build_hy_vla",
+            vision_lanes=self._installed_vision_lanes,
         )
         _validate_hy_vla_execution_geometry(
             children,
@@ -625,6 +724,12 @@ class HyVlaRunner:
             packed_vision=self._vit_packed,
             entry_point="build_hy_vla",
         )
+        budget = _hy_vla_core_budget(root)
+        if int(getattr(self.w, "num_cores", 8)) != budget:
+            raise ValueError(
+                f"build_hy_vla: weights were laid out for model.num_cores="
+                f"{getattr(self.w, 'num_cores', 8)}, but rpu_execution requests {budget}")
+        self._core_budget = budget
         self._rpu_execution = root
         self._rpu_execution_components = children
         self._rpu_execution_component_generations = {
@@ -658,7 +763,8 @@ class HyVlaRunner:
         self._vit_cache = RPUCache(
             num_layers=c.vit_layers, batch_size=1,
             max_seq_len=c.vit_seq * (c.num_cameras if self._vit_packed else 1),
-            num_kv_heads=c.vit_heads, head_dim=c.vit_head_dim_padded, attn_tp=8)
+            num_kv_heads=c.vit_heads, head_dim=c.vit_head_dim_padded,
+            attn_tp=self._vision_lanes)
         # ⚠️ VLM 与 expert **共享这一个 cache**（expert 把 suffix KV 追加在
         # prefix 之后）⇒ 候选 G 的 KV 槽位复制必须**两座一起做**，不能只改一座。
         self._cache = RPUCache(
@@ -669,6 +775,7 @@ class HyVlaRunner:
             self,
             root,
             entry_point="HyVlaRunner",
+            supported=_HY_VLA_EXECUTION_SUPPORTED,
             supported_components=HY_VLA_EXECUTION_COMPONENTS,
             validate=self.validate_execution_reconfigure,
             apply=self.apply_execution_reconfigure,
@@ -677,6 +784,21 @@ class HyVlaRunner:
         )
         for component in HY_VLA_EXECUTION_COMPONENTS:
             self._execution_session._bind_planner_owner(self, component)
+
+    def _component_cores(self, component: str) -> int:
+        # The budget is cold (reconfigure refuses a change), so this is stable.
+        return _hy_vla_component_cores(
+            self._core_budget, component, self._installed_vision_lanes)
+
+    @property
+    def _installed_vision_lanes(self) -> int | None:
+        """The weights' cold Vision layout; None (the budget rule) without weights."""
+        return getattr(getattr(self, "w", None), "vision_lanes", None)
+
+    @property
+    def _vision_lanes(self) -> int:
+        """ViT, patch-embed and merger lanes: eight, or four under 4/6 cores or W4."""
+        return self._component_cores(HY_VLA_VISION_COMPONENT)
 
     @property
     def last_rpu_execution_plan(self) -> dict[str, dict[str, Any]]:
@@ -859,9 +981,14 @@ class HyVlaRunner:
     def validate_execution_reconfigure(self, execution_config) -> None:
         if self._closed:
             raise RuntimeError("HyVlaRunner is closed")
-        _root, children = resolve_hy_vla_execution(
-            execution_config, entry_point="HyVlaRunner.reconfigure"
+        root, children = resolve_hy_vla_execution(
+            execution_config, entry_point="HyVlaRunner.reconfigure",
+            vision_lanes=self._installed_vision_lanes,
         )
+        if _hy_vla_core_budget(root) != self._core_budget:
+            raise ValueError(
+                "Hy-VLA model.num_cores is cold-only: build a fresh runtime "
+                "to change topology")
         _validate_hy_vla_execution_geometry(
             children,
             cfg=self.w.cfg,
@@ -916,10 +1043,12 @@ class HyVlaRunner:
         self._execution_reconfigure_journal = None
         self.validate_execution_reconfigure(new_config)
         _old_root, old_children = resolve_hy_vla_execution(
-            old_config, entry_point="HyVlaRunner.reconfigure"
+            old_config, entry_point="HyVlaRunner.reconfigure",
+            vision_lanes=self._installed_vision_lanes,
         )
         new_root, new_children = resolve_hy_vla_execution(
-            new_config, entry_point="HyVlaRunner.reconfigure"
+            new_config, entry_point="HyVlaRunner.reconfigure",
+            vision_lanes=self._installed_vision_lanes,
         )
         changed = {
             component for component in HY_VLA_EXECUTION_COMPONENTS
@@ -957,7 +1086,8 @@ class HyVlaRunner:
             return
         if journal["mutation_started"]:
             _root, old_children = resolve_hy_vla_execution(
-                old_config, entry_point="HyVlaRunner.rollback"
+                old_config, entry_point="HyVlaRunner.rollback",
+                vision_lanes=self._installed_vision_lanes,
             )
             self._stage_changed_native_chunks(journal["changed"], old_children)
         for component in journal["changed"]:
@@ -1001,10 +1131,16 @@ class HyVlaRunner:
             bind(handle)
             self._initialize_native_execution(component, handle)
 
+        cores = self._component_cores(component)
+        # A reduced child bounds its own native queue/kernel/DMA prefix.
+        policy = (None if cores == 8 else
+                  rpu_backend.graph.GraphRuntimePolicy.from_environment(
+                      execution_core_count=cores))
         if name not in self._persist:
             if name in self._psubs:
                 self._drop_psubs()
-            return _Sub(name, create, destroy, bind_and_guard, sig, owner=self)
+            return _Sub(name, create, destroy, bind_and_guard, sig, owner=self,
+                        runtime_policy=policy)
         s = self._psubs.get(name)
         if s is not None and s.variant != variant:
             # bind 的语义变了（例如 expert 的 unroll 开关被翻转）⇒ 缓存的 handle 绑的是
@@ -1015,6 +1151,7 @@ class HyVlaRunner:
             s = _Sub(
                 name, create, destroy, bind_and_guard, sig,
                 persist=True, variant=variant, owner=self,
+                runtime_policy=policy,
             )
             self._psubs[name] = s
         return s
@@ -1226,8 +1363,12 @@ class HyVlaRunner:
         c, w = self.w.cfg, self.w
         cache = self._vit_cache
 
+        lanes = self._vision_lanes
+
         def bind(h):
             cold = self._native_cold.vit
+            if lanes != 8:
+                torch.ops.rpu.hyvit2_set_execution_core_count(h, lanes)
             torch.ops.rpu.hyvit2_set_runtime_config(
                 h,
                 cold.fast_replay,
@@ -1239,6 +1380,8 @@ class HyVlaRunner:
             # W8A16 与 fp16 走**同一个** C++ set_weights，只是多传 6 条 scale 列表
             # （`rpu_hyvit2_set_weights` 自己就是拿空列表调它）。scale 非空 ⇒
             # `check_hyvit2_w8a16_scale_lists` 强制权重必须是 int8。
+            # packed W4（uint8）走声明模式的 `hyvit2_set_weights_w4a16`，
+            # scale 是 G32 pgrp 载荷，只接受 4 核。
             args = (h, w.vit["qw"], w.vit["kw"], w.vit["vw"], w.vit["ow"],
                     w.vit["f1w"], w.vit["f2w"], w.vit["n1w"], w.vit["n1b"],
                     w.vit["n2w"], w.vit["n2b"], w.vit["qb"], w.vit["kb"], w.vit["vb"],
@@ -1249,11 +1392,18 @@ class HyVlaRunner:
                     self._fused_merger, self._proj1_in_merger,
                     w.patch_embed_cores)
             if w.vit["qws"]:
-                torch.ops.rpu.hyvit2_set_weights_w8a16(
-                    *args, w.vit["qws"], w.vit["kws"], w.vit["vws"],
-                    w.vit["ows"], w.vit["f1ws"], w.vit["f2ws"])
+                scales = (w.vit["qws"], w.vit["kws"], w.vit["vws"],
+                          w.vit["ows"], w.vit["f1ws"], w.vit["f2ws"])
+                if w.vit["qw"][0].dtype == torch.uint8:
+                    torch.ops.rpu.hyvit2_set_weights_w4a16(*args, *scales)
+                else:
+                    torch.ops.rpu.hyvit2_set_weights_w8a16(*args, *scales)
             else:
                 torch.ops.rpu.hyvit2_set_weights(*args)
+            if lanes != 8:
+                _require_native_topology(
+                    "Vision", torch.ops.rpu.hyvit2_get_execution_topology(h),
+                    (1, lanes, lanes, lanes, 1, 8, c.vit_inter, c.vit_inter_padded))
             torch.ops.rpu.hyvit2_set_chunk_envelope(h, int(cache.max_seq_len), 0)
             torch.ops.rpu.hyvit2_model_set_patch_emb(
                 h, w.vit_patch_gemm_w, w.vit_pos_fused, 16, 16)
@@ -1267,7 +1417,7 @@ class HyVlaRunner:
                         rpu_backend.graph.GraphSignature(
                        op_id="hyvit2_vision_compute",
                        shapes=[vit_seq, c.vit_layers, c.vit_head_dim_padded],
-                       dyn_dims=[c.vit_heads, 8, n_img if self._vit_packed else 1, 0],
+                       dyn_dims=[c.vit_heads, lanes, n_img if self._vit_packed else 1, 0],
                        dtypes=[torch.float16]))
 
     def _plan_vision_execution(self, sub: _Sub, image_count: int):
@@ -1321,7 +1471,7 @@ class HyVlaRunner:
                 op_id="hyvit2_vision_compute",
                 shapes=[logical_len, c.vit_layers, c.vit_head_dim_padded],
                 dyn_dims=[
-                    c.vit_heads, 8, image_count,
+                    c.vit_heads, self._vision_lanes, image_count,
                     self._component_generation(HY_VLA_VISION_COMPONENT),
                     *vision_plan.graph_key_words(),
                 ],
@@ -1404,7 +1554,7 @@ class HyVlaRunner:
             #    否则切开关时会命中上一档的缓存图。
             shapes=[n_img * c.vit_seq // 4, self._vit_out_dim(), 4],
             dyn_dims=[
-                8, n_img,
+                self._vision_lanes, n_img,
                 self._component_generation(HY_VLA_VISION_COMPONENT), 0,
             ],
             dtypes=[torch.float16])
@@ -1426,6 +1576,7 @@ class HyVlaRunner:
             # proj1 进图 ⇒ 输入是 [4,G,vit_hidden]，权重/偏置多传两条；
             # 关掉时传 None，走与落地前逐位相同的老链路。
             p1 = self._proj1_in_merger
+            lanes = self._vision_lanes
             return torch.ops.rpu.hyvla_merger_fused(
                 proj1_out.reshape(4, -1, self._vit_out_dim()),
                 M["pooler.predictor.0.weight_a"], M["pooler.predictor.0.bias"],
@@ -1433,7 +1584,9 @@ class HyVlaRunner:
                 M["pooler.predictor.2.weight"], M["pooler.predictor.2.bias"],
                 M["proj2.weight"], M["proj2.bias"],
                 self.w.vit_proj1_w if p1 else None,
-                self.w.vit_proj1_b if p1 else None).reshape(B0, -1, D)
+                self.w.vit_proj1_b if p1 else None,
+                # Merger weights carry the ViT's lane swizzle.
+                **({} if lanes == 8 else {"num_cores": lanes})).reshape(B0, -1, D)
         # ⚠️ 下面全是 host 回退路径。C++ 的 ViT 尾部只看 PROJ1_IN_MERGER +
         #    member-major，**不看 MERGER_IN_GRAPH** ⇒ 关掉图内 merger 却留着
         #    PROJ1_IN_MERGER，host 侧会拿到没 proj1 过的 [S,1152]，**静默算错**。
@@ -1467,6 +1620,41 @@ class HyVlaRunner:
         out = _rpu16((nxc * F.softmax(sc.cpu(), dim=-2)).sum(-2))
         return lin(F.gelu(out), "proj2").reshape(B0, -1, D)
 
+    def _open_cold_children(self, n_img, prefill_pos, prefill_mask,
+                            modality_mask, suffix_pos, denoise_mask):
+        """Bind all three persistent children and fix their Persistent floor.
+
+        Super-persistent SPM is released only when every child retires, so a
+        child searched before a sibling's first forward keeps a capacity that
+        stops fitting once that sibling becomes resident. Constants come first:
+        a replaced set retires the old children before any is reopened.
+        """
+        self._prefill_constants(prefill_pos, prefill_mask, modality_mask)
+        self._denoise_constants(self._total, prefill_pos, suffix_pos, denoise_mask)
+        vit = self._prepare_vit(n_img)
+        vlm, _ = self._prepare_vlm(prefill_pos, prefill_mask, modality_mask)
+        expert, _ = self._prepare_expert(
+            self._total, prefill_pos, suffix_pos, denoise_mask)
+        for sub in (vit, vlm, expert):
+            if sub.handle is None:
+                sub.open()
+        names = ("hyvit2_prepare_persistent_spm",
+                 "hyvla_vlm_prepare_persistent_spm",
+                 "hyvla_expert_prepare_persistent_spm")
+        prepare = tuple(getattr(torch.ops.rpu, name, None) for name in names)
+        # Binaries built before this barrier keep their previous child order;
+        # a partially installed barrier fails before reserving any child.
+        if any(op is not None for op in prepare):
+            if any(op is None for op in prepare):
+                raise RuntimeError("Hy-VLA native Persistent preparation API is incomplete")
+            S, L = self.prefix_len, self.w.cfg.suffix_len
+            image_count = n_img if self._vit_packed else 1
+            prepare[0](vit.handle, self.w.cfg.vit_seq * image_count, image_count,
+                       bool(self._vit_packed and self._pe_in_graph))
+            prepare[1](vlm.handle, S, 0, S)
+            prepare[2](expert.handle, L, S, S + L)
+        return vit, vlm, expert
+
     # ── 对外接口 ──────────────────────────────────────────────────────────
     @torch.no_grad()
     def prepare_execution(self, *, images, prefill_pos, prefill_mask,
@@ -1487,18 +1675,9 @@ class HyVlaRunner:
                    for sub in self._psubs.values()):
                 raise RuntimeError("Hy-VLA cold planning must precede all child forwards")
             try:
-                # Retire any replaced constant set before retaining child refs.
-                # Both regular forwards use these same cached constants.
-                self._prefill_constants(prefill_pos, prefill_mask, modality_mask)
-                self._denoise_constants(
-                    self._total, prefill_pos, suffix_pos, denoise_mask)
-                vit = self._prepare_vit(len(images))
-                vlm, _ = self._prepare_vlm(prefill_pos, prefill_mask, modality_mask)
-                expert, _ = self._prepare_expert(
-                    self._total, prefill_pos, suffix_pos, denoise_mask)
-                for sub in (vit, vlm, expert):
-                    if sub.handle is None:
-                        sub.open()
+                vit, vlm, expert = self._open_cold_children(
+                    len(images), prefill_pos, prefill_mask, modality_mask,
+                    suffix_pos, denoise_mask)
                 return {
                     HY_VLA_VISION_COMPONENT: self._plan_vision_execution(
                         vit, len(images) if self._vit_packed else 1),
@@ -1574,6 +1753,15 @@ class HyVlaRunner:
                   and not w.expert["q_ws"] and w.expert_nvfp4 is None)
                  or quantized_prefix))
 
+        if self._persist == frozenset(("vit", "vlm", "expert")):
+            # Constants first: a replaced prompt layout retires every child
+            # here, and children without a handle are reserved together.
+            self._prefill_constants(prefill_pos, prefill_mask, modality_mask)
+            self._denoise_constants(self._total, prefill_pos, suffix_pos, denoise_mask)
+            if not any(sub.handle is not None for sub in self._psubs.values()):
+                self._open_cold_children(len(images), prefill_pos, prefill_mask,
+                                         modality_mask, suffix_pos, denoise_mask)
+
         # ── 1) ViT ────────────────────────────────────────────────────────
         img_embs = (self._run_vit(images, return_device=True) if device_prefix
                     else self._run_vit(images))
@@ -1636,8 +1824,12 @@ class HyVlaRunner:
               "input_norm", "post_norm", "gate_w", "up_w", "down_w")
         _S = ("q_ws", "k_ws", "v_ws", "o_ws", "gate_ws", "up_ws", "down_ws")
 
+        cores = self._component_cores(HY_VLA_LANGUAGE_COMPONENT)
+
         def bind_vlm(h):
             cold = self._native_cold.vlm
+            if cores != 8:
+                torch.ops.rpu.hyvla_vlm_set_execution_core_count(h, cores)
             torch.ops.rpu.hyvla_vlm_set_runtime_config(
                 h,
                 cold.fast_replay,
@@ -1669,6 +1861,11 @@ class HyVlaRunner:
                     *margs, *[w.vlm_vision[k] for k in _S])
             else:
                 torch.ops.rpu.hyvla_vlm_set_moe_weights(*margs)
+            if cores != 8:
+                # {cores, attention 4, MLP cores, headless lm_head 4, 8 stripes}
+                _require_native_topology(
+                    "VLM", torch.ops.rpu.hyvla_vlm_get_execution_topology(h),
+                    (cores, w.attn_tp, cores, _HY_VLA_REDUCED_LANES, 8))
 
         create_vlm = (torch.ops.rpu.hyvla_vlm_create_kv_only
                       if self._native_cold.vlm.prefill_kv_only
@@ -1773,8 +1970,12 @@ class HyVlaRunner:
         ecos, esin, emask = self._denoise_constants(
             total, prefill_pos, suffix_pos, denoise_mask)
 
+        cores = self._component_cores(HY_VLA_ACTION_COMPONENT)
+
         def bind_exp(h):
             cold = self._native_cold.expert
+            if cores != 8:
+                torch.ops.rpu.hyvla_expert_set_execution_core_count(h, cores)
             torch.ops.rpu.hyvla_expert_set_runtime_config(
                 h,
                 cold.fast_replay,
@@ -1806,6 +2007,11 @@ class HyVlaRunner:
                                                     "down_ws")])
             else:
                 torch.ops.rpu.hyvla_expert_set_weights(*eargs)
+            if cores != 8:
+                _require_native_topology(
+                    "action expert",
+                    torch.ops.rpu.hyvla_expert_get_execution_topology(h),
+                    (cores, w.attn_tp, cores, cores, 8))
             if self._unroll:
                 torch.ops.rpu.hyvla_expert_set_action_weights(
                     h, *self._uw, c.action_dim, c.num_steps)
@@ -1989,15 +2195,20 @@ def build_hy_vla(
         ⚠️ 这是低层入口，但不是生命周期逃生口。一旦开始原生权重物化，
         该 Python 进程同样不能再构建另一个 device runner/model；需要重启进程。
     """
+    execution_root, execution_children = resolve_hy_vla_execution(
+        rpu_execution, entry_point="build_hy_vla"
+    )
+    budget = _hy_vla_core_budget(execution_root)
     cold_plan = (
-        prepare_hy_vla_cold_plan()
+        prepare_hy_vla_cold_plan(num_cores=budget)
         if _cold_plan is None else _cold_plan
     )
     if not isinstance(cold_plan, _HyVlaColdPlan):
         raise TypeError("_cold_plan must be a _HyVlaColdPlan")
-    execution_root, execution_children = resolve_hy_vla_execution(
-        rpu_execution, entry_point="build_hy_vla"
-    )
+    if cold_plan.num_cores != budget or cold_plan.weights.num_cores != budget:
+        raise ValueError(
+            f"build_hy_vla: the cold plan was prepared for model.num_cores="
+            f"{cold_plan.num_cores}, but rpu_execution requests {budget}")
     if prefix_len % 16 or not 16 <= prefix_len <= 240:
         raise ValueError(f"prefix_len 必须是 16 的倍数且在 [16,240]，得到 {prefix_len}")
     packed_vision = cold_plan.runner.vit_packed

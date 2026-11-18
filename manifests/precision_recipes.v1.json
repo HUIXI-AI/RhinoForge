@@ -1,0 +1,2149 @@
+{
+  "schema": "rpu.precision_recipes.v1",
+  "description": "One registered name per TOML precision. Each recipe gives the runner selector, the catalog label, per-module rules (default fp16; the most specific component/role/layer rule wins), the profiles that realize it, the profile limits it implies and the cold switches it sets. A bound profile's group_size limit must equal the W4 rule groups. Norms, embeddings and caches are outside the rules. A new mix is added here only together with the owner that runs it.",
+  "families": {
+    "qwen3": {
+      "targets": [
+        "qwen3"
+      ],
+      "components": {
+        "text": {
+          "label": "文本层"
+        },
+        "lm_head": {
+          "label": "输出头"
+        }
+      },
+      "recipes": {
+        "fp16": {
+          "label": "fp16",
+          "selector": "fp16",
+          "profiles": [
+            "qwen3-*.fp16.text"
+          ]
+        },
+        "nvfp4_text": {
+          "label": "nvfp4",
+          "selector": "nvfp4",
+          "rules": [
+            {
+              "component": "text",
+              "spec": "nvfp4"
+            }
+          ],
+          "profiles": [
+            "qwen3-*.nvfp4.text"
+          ],
+          "limits": {
+            "on_install_quantization": "nvfp4"
+          }
+        },
+        "w4a16_text_rtn_g32": {
+          "label": "w4a16",
+          "selector": "w4a16",
+          "rules": [
+            {
+              "component": "text",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            }
+          ],
+          "profiles": [
+            "qwen3-*.w4a16-g32.text"
+          ],
+          "limits": {
+            "on_install_quantization": "w4a16"
+          }
+        },
+        "w4a16_text_head_rtn_g32": {
+          "label": "w4a16",
+          "selector": "w4a16",
+          "rules": [
+            {
+              "component": "text",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            },
+            {
+              "component": "lm_head",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            }
+          ],
+          "profiles": [
+            "qwen3-*.w4a16-g32-lm-head.text"
+          ],
+          "limits": {
+            "on_install_quantization": "w4a16_lm_head"
+          }
+        },
+        "w8a16_text_head": {
+          "label": "w8a16",
+          "selector": "w8a16",
+          "rules": [
+            {
+              "component": "text",
+              "spec": "w8a16"
+            },
+            {
+              "component": "lm_head",
+              "spec": "w8a16"
+            }
+          ],
+          "profiles": [
+            "qwen3-*-w8a16-lmhead-int8.w8a16.text"
+          ]
+        }
+      }
+    },
+    "qwen3_5": {
+      "targets": [
+        "qwen3_5",
+        "qwen3_5_vision"
+      ],
+      "components": {
+        "attention": {
+          "label": "Attention"
+        },
+        "gdn": {
+          "label": "GDN",
+          "roles": [
+            "in_proj_a",
+            "in_proj_b"
+          ]
+        },
+        "mlp": {
+          "label": "MLP"
+        },
+        "experts": {
+          "label": "路由专家"
+        }
+      },
+      "recipes": {
+        "fp16": {
+          "label": "fp16",
+          "selector": "fp16",
+          "profiles": [
+            "qwen3_5-*.fp16.*"
+          ]
+        },
+        "w8a16_text": {
+          "label": "w8a16",
+          "selector": "w8a16",
+          "rules": [
+            {
+              "component": "attention",
+              "spec": "w8a16"
+            },
+            {
+              "component": "gdn",
+              "spec": "w8a16"
+            },
+            {
+              "component": "mlp",
+              "spec": "w8a16"
+            }
+          ],
+          "profiles": [
+            "qwen3_5-*.w8a16.*"
+          ]
+        },
+        "w4a16_text_rtn_g32": {
+          "label": "w4a16",
+          "selector": "w4a16",
+          "rules": [
+            {
+              "component": "attention",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            },
+            {
+              "component": "gdn",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            },
+            {
+              "component": "mlp",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            }
+          ],
+          "profiles": [
+            "qwen3_5-*.w4a16.*"
+          ]
+        },
+        "nvfp4_text": {
+          "label": "nvfp4",
+          "selector": "nvfp4",
+          "rules": [
+            {
+              "component": "attention",
+              "spec": "nvfp4"
+            },
+            {
+              "component": "gdn",
+              "spec": "nvfp4"
+            },
+            {
+              "component": "gdn",
+              "roles": [
+                "in_proj_a",
+                "in_proj_b"
+              ],
+              "spec": "fp16"
+            },
+            {
+              "component": "mlp",
+              "spec": "nvfp4"
+            }
+          ],
+          "profiles": [
+            "qwen3_5-*.nvfp4.*"
+          ],
+          "limits": {
+            "on_install_quantization": "nvfp4"
+          }
+        },
+        "w4a16_mlp_rtn_g32": {
+          "label": "w4a16",
+          "selector": "w4a16",
+          "rules": [
+            {
+              "component": "mlp",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            }
+          ],
+          "profiles": [
+            "qwen3_5-*.w4-mlp-only-g32.*"
+          ]
+        },
+        "w4a16_mlp_rtn_g32_attn_gdn_w8a16": {
+          "label": "w4a16",
+          "selector": "w4a16",
+          "rules": [
+            {
+              "component": "mlp",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            },
+            {
+              "component": "attention",
+              "spec": "w8a16"
+            },
+            {
+              "component": "gdn",
+              "spec": "w8a16"
+            }
+          ],
+          "profiles": [
+            "qwen3_5-*.w4-mlp-w8-attn-gdn-g32.*"
+          ]
+        },
+        "w4a16_mlp_awq_g128": {
+          "label": "w4a16",
+          "selector": "w4a16",
+          "rules": [
+            {
+              "component": "mlp",
+              "spec": {
+                "format": "w4a16",
+                "group": 128,
+                "method": "awq"
+              }
+            },
+            {
+              "component": "mlp",
+              "layers": [
+                0,
+                0
+              ],
+              "spec": "fp16"
+            }
+          ],
+          "profiles": [
+            "qwen3_5-*.quanttrio-awq-g128.*"
+          ]
+        },
+        "w4a16_mlp_activation_awq_g128": {
+          "label": "w4a16",
+          "selector": "w4a16",
+          "rules": [
+            {
+              "component": "mlp",
+              "spec": {
+                "format": "w4a16",
+                "group": 128,
+                "method": "activation_awq"
+              }
+            },
+            {
+              "component": "mlp",
+              "layers": [
+                0,
+                0
+              ],
+              "spec": "fp16"
+            }
+          ],
+          "profiles": [
+            "qwen3_5-*.activation-awq-g128.*"
+          ]
+        },
+        "fp8_e4m3_experts_attn_gdn": {
+          "label": "fp8_e4m3",
+          "selector": "mixed-e4m3",
+          "rules": [
+            {
+              "component": "experts",
+              "spec": "fp8_e4m3"
+            },
+            {
+              "component": "attention",
+              "spec": "fp8_e4m3"
+            },
+            {
+              "component": "gdn",
+              "spec": "fp8_e4m3"
+            }
+          ],
+          "profiles": [
+            "qwen3_5-*.mixed-e4m3.*"
+          ]
+        },
+        "w4a16_experts_gptq_g128": {
+          "label": "w4a16",
+          "selector": "w4a16",
+          "rules": [
+            {
+              "component": "experts",
+              "spec": {
+                "format": "w4a16",
+                "group": 128,
+                "method": "gptq"
+              }
+            }
+          ],
+          "profiles": [
+            "qwen3_5-*.gptq-w4a16-g128.*"
+          ]
+        },
+        "w4a16_experts_rtn_g128": {
+          "label": "w4a16",
+          "selector": "w4a16",
+          "rules": [
+            {
+              "component": "experts",
+              "spec": {
+                "format": "w4a16",
+                "group": 128,
+                "method": "rtn"
+              }
+            }
+          ],
+          "profiles": [
+            "qwen3_5-*.rtn-w4a16-g128.*"
+          ]
+        },
+        "w8a16_experts": {
+          "label": "w8a16",
+          "selector": "w8a16",
+          "rules": [
+            {
+              "component": "experts",
+              "spec": "w8a16"
+            }
+          ],
+          "profiles": [
+            "qwen3_5-*.rtn-w8a16.*"
+          ]
+        }
+      }
+    },
+    "qwen3_vl": {
+      "targets": [
+        "qwen3_vl"
+      ],
+      "components": {
+        "text": {
+          "label": "文本层"
+        },
+        "lm_head": {
+          "label": "输出头"
+        },
+        "vision": {
+          "label": "Vision",
+          "roles": [
+            "patch_embed",
+            "merger"
+          ]
+        }
+      },
+      "recipes": {
+        "fp16": {
+          "label": "fp16",
+          "selector": "fp16",
+          "profiles": [
+            "qwen3-vl-*.fp16.*"
+          ]
+        },
+        "nvfp4_text": {
+          "label": "nvfp4",
+          "selector": "nvfp4",
+          "rules": [
+            {
+              "component": "text",
+              "spec": "nvfp4"
+            }
+          ],
+          "profiles": [
+            "qwen3-vl-*.nvfp4.text"
+          ],
+          "limits": {
+            "on_install_quantization": "nvfp4"
+          }
+        },
+        "nvfp4_text_vision": {
+          "label": "nvfp4",
+          "selector": "nvfp4",
+          "rules": [
+            {
+              "component": "text",
+              "spec": "nvfp4"
+            },
+            {
+              "component": "vision",
+              "spec": "nvfp4"
+            },
+            {
+              "component": "vision",
+              "roles": [
+                "patch_embed",
+                "merger"
+              ],
+              "spec": "fp16"
+            }
+          ],
+          "profiles": [
+            "qwen3-vl-2b.nvfp4-vision.*",
+            "qwen3-vl-4b.nvfp4-vision.*"
+          ],
+          "limits": {
+            "on_install_quantization": "nvfp4",
+            "vision_on_install_quantization": "nvfp4"
+          }
+        },
+        "w8a16_text": {
+          "label": "w8a16",
+          "selector": "w8a16",
+          "rules": [
+            {
+              "component": "text",
+              "spec": "w8a16"
+            }
+          ],
+          "profiles": [
+            "qwen3-vl-*-text-w8a16.w8a16.*",
+            "qwen3-vl-*.w8a16.multimodal-controlled"
+          ]
+        },
+        "w8a16_text_head_vision": {
+          "label": "w8a16",
+          "selector": "w8a16",
+          "rules": [
+            {
+              "component": "text",
+              "spec": "w8a16"
+            },
+            {
+              "component": "lm_head",
+              "spec": "w8a16"
+            },
+            {
+              "component": "vision",
+              "spec": "w8a16"
+            }
+          ],
+          "profiles": [
+            "qwen3-vl-*-runtime-w8a16.w8a16.*"
+          ]
+        },
+        "w4a16_text_awq_g32": {
+          "label": "w4a16",
+          "selector": "w4a16",
+          "rules": [
+            {
+              "component": "text",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "awq"
+              }
+            }
+          ],
+          "profiles": [
+            "qwen3-vl-*-text-awq-w4a16.w4a16.*"
+          ],
+          "limits": {
+            "checkpoint_format": "qwen3_vl_text_awq"
+          }
+        },
+        "w4a16_text_awq_head_rtn_g32_vision_w8a16": {
+          "label": "w4a16",
+          "selector": "w4a16",
+          "rules": [
+            {
+              "component": "text",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "awq"
+              }
+            },
+            {
+              "component": "lm_head",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            },
+            {
+              "component": "vision",
+              "spec": "w8a16"
+            }
+          ],
+          "profiles": [
+            "qwen3-vl-2b-runtime-w4a16.w4a16.*",
+            "qwen3-vl-4b-runtime-w4a16.w4a16.*",
+            "qwen3-vl-8b-runtime-w4a16.w4a16.*"
+          ]
+        },
+        "w4a16_text_awq_head_vision_rtn_g32": {
+          "label": "w4a16",
+          "selector": "w4a16",
+          "rules": [
+            {
+              "component": "text",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "awq"
+              }
+            },
+            {
+              "component": "lm_head",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            },
+            {
+              "component": "vision",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            },
+            {
+              "component": "vision",
+              "roles": [
+                "patch_embed",
+                "merger"
+              ],
+              "spec": "w8a16"
+            }
+          ],
+          "profiles": [
+            "qwen3-vl-2b-runtime-w4a16.w4a16-vision-g32.*",
+            "qwen3-vl-4b-runtime-w4a16.w4a16-vision-g32.*",
+            "qwen3-vl-8b-runtime-w4a16.w4a16-vision-g32.*"
+          ],
+          "limits": {
+            "vision_on_install_quantization": "w4a16"
+          },
+          "checkpoints": {
+            "checkpoint": "w4a16_text_awq_head_rtn_g32_vision_w8a16"
+          }
+        },
+        "w4a16_text_head_rtn_g32_vision_w8a16": {
+          "label": "w4a16",
+          "selector": "w4a16",
+          "rules": [
+            {
+              "component": "text",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            },
+            {
+              "component": "lm_head",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            },
+            {
+              "component": "vision",
+              "spec": "w8a16"
+            }
+          ],
+          "profiles": [
+            "qwen3-vl-32b-runtime-w4a16.w4a16.*"
+          ]
+        },
+        "w4a16_text_head_vision_rtn_g32": {
+          "label": "w4a16",
+          "selector": "w4a16",
+          "rules": [
+            {
+              "component": "text",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            },
+            {
+              "component": "lm_head",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            },
+            {
+              "component": "vision",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            },
+            {
+              "component": "vision",
+              "roles": [
+                "patch_embed",
+                "merger"
+              ],
+              "spec": "w8a16"
+            }
+          ],
+          "profiles": [
+            "qwen3-vl-32b-runtime-w4a16.w4a16-vision-g32.*"
+          ],
+          "limits": {
+            "vision_on_install_quantization": "w4a16"
+          },
+          "checkpoints": {
+            "checkpoint": "w4a16_text_head_rtn_g32_vision_w8a16"
+          }
+        }
+      }
+    },
+    "qwen3_asr": {
+      "targets": [
+        "qwen3_asr"
+      ],
+      "components": {
+        "decoder": {
+          "label": "文本解码器"
+        },
+        "lm_head": {
+          "label": "输出头"
+        },
+        "audio_encoder": {
+          "label": "音频编码器"
+        }
+      },
+      "recipes": {
+        "fp16": {
+          "label": "fp16",
+          "selector": "fp16"
+        },
+        "w8a16": {
+          "label": "w8a16",
+          "selector": "w8a16",
+          "rules": [
+            {
+              "component": "decoder",
+              "spec": "w8a16"
+            },
+            {
+              "component": "lm_head",
+              "spec": "w8a16"
+            },
+            {
+              "component": "audio_encoder",
+              "spec": "fp16"
+            }
+          ]
+        },
+        "w4a16_g32": {
+          "label": "w4a16",
+          "selector": "w4a16_g32",
+          "rules": [
+            {
+              "component": "decoder",
+              "spec": {
+                "format": "w4a16",
+                "group": 32
+              }
+            },
+            {
+              "component": "lm_head",
+              "spec": {
+                "format": "w4a16",
+                "group": 32
+              }
+            },
+            {
+              "component": "audio_encoder",
+              "spec": "fp16"
+            }
+          ]
+        },
+        "nvfp4": {
+          "label": "nvfp4",
+          "selector": "nvfp4",
+          "rules": [
+            {
+              "component": "decoder",
+              "spec": "nvfp4"
+            },
+            {
+              "component": "lm_head",
+              "spec": "fp16"
+            },
+            {
+              "component": "audio_encoder",
+              "spec": "fp16"
+            }
+          ]
+        }
+      }
+    },
+    "qwen3_tts": {
+      "targets": [
+        "qwen3_tts"
+      ],
+      "components": {
+        "talker": {
+          "label": "Talker"
+        },
+        "predictor": {
+          "label": "Predictor"
+        },
+        "lm_head": {
+          "label": "输出头"
+        }
+      },
+      "recipes": {
+        "fp16": {
+          "label": "fp16",
+          "selector": "fp16"
+        },
+        "w8a16": {
+          "label": "w8a16",
+          "selector": "w8a16",
+          "rules": [
+            {
+              "component": "talker",
+              "spec": "w8a16"
+            },
+            {
+              "component": "predictor",
+              "spec": "w8a16"
+            },
+            {
+              "component": "lm_head",
+              "spec": "w8a16"
+            }
+          ]
+        },
+        "w4a16_g32": {
+          "label": "w4a16",
+          "selector": "w4a16_g32",
+          "rules": [
+            {
+              "component": "talker",
+              "spec": {
+                "format": "w4a16",
+                "group": 32
+              }
+            },
+            {
+              "component": "predictor",
+              "spec": {
+                "format": "w4a16",
+                "group": 32
+              }
+            },
+            {
+              "component": "lm_head",
+              "spec": {
+                "format": "w4a16",
+                "group": 32
+              }
+            }
+          ]
+        },
+        "nvfp4": {
+          "label": "nvfp4",
+          "selector": "nvfp4",
+          "rules": [
+            {
+              "component": "talker",
+              "spec": "nvfp4"
+            },
+            {
+              "component": "predictor",
+              "spec": "nvfp4"
+            },
+            {
+              "component": "lm_head",
+              "spec": "fp16"
+            }
+          ]
+        }
+      }
+    },
+    "pi05": {
+      "targets": [
+        "pi05"
+      ],
+      "components": {
+        "vision": {
+          "label": "Vision"
+        },
+        "prefill": {
+          "label": "Prefill",
+          "roles": [
+            "K",
+            "V",
+            "Gate",
+            "Up"
+          ]
+        },
+        "action": {
+          "label": "Action",
+          "roles": [
+            "Q",
+            "K",
+            "V",
+            "O",
+            "Gate",
+            "Up",
+            "Down",
+            "AdaRMS"
+          ]
+        }
+      },
+      "recipes": {
+        "fp16": {
+          "label": "fp16",
+          "selector": "fp16"
+        },
+        "w8a16": {
+          "label": "w8a16",
+          "selector": "w8a16",
+          "rules": [
+            {
+              "component": "vision",
+              "spec": "w8a16"
+            },
+            {
+              "component": "prefill",
+              "spec": "w8a16"
+            },
+            {
+              "component": "action",
+              "spec": "w8a16"
+            }
+          ]
+        },
+        "w8a16_action_nvfp4": {
+          "label": "w8a16_action_nvfp4",
+          "selector": "w8a16_action_nvfp4",
+          "rules": [
+            {
+              "component": "vision",
+              "spec": "w8a16"
+            },
+            {
+              "component": "prefill",
+              "spec": "w8a16"
+            },
+            {
+              "component": "action",
+              "spec": "nvfp4"
+            },
+            {
+              "component": "action",
+              "roles": [
+                "K",
+                "V",
+                "AdaRMS"
+              ],
+              "spec": "w8a16"
+            }
+          ]
+        },
+        "w8a16_prefill_w8a8_action_nvfp4": {
+          "label": "w8a16_prefill_w8a8_action_nvfp4",
+          "selector": "w8a16_prefill_w8a8_action_nvfp4",
+          "checkpoints": {
+            "checkpoint": "w8a16_action_nvfp4"
+          },
+          "rules": [
+            {
+              "component": "vision",
+              "spec": "w8a16"
+            },
+            {
+              "component": "prefill",
+              "spec": "w8a16"
+            },
+            {
+              "component": "prefill",
+              "roles": [
+                "Gate",
+                "Up"
+              ],
+              "layers": [
+                0,
+                16
+              ],
+              "spec": "w8a8"
+            },
+            {
+              "component": "action",
+              "spec": "nvfp4"
+            },
+            {
+              "component": "action",
+              "roles": [
+                "K",
+                "V",
+                "AdaRMS"
+              ],
+              "spec": "w8a16"
+            }
+          ]
+        },
+        "w8a16_vision_w4a16_action_nvfp4": {
+          "label": "w8a16_vision_w4a16_action_nvfp4",
+          "selector": "w8a16_vision_w4a16_action_nvfp4",
+          "checkpoints": {
+            "checkpoint": "w8a16_action_nvfp4"
+          },
+          "limits": {
+            "vision_on_install_quantization": "w4a16"
+          },
+          "rules": [
+            {
+              "component": "vision",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            },
+            {
+              "component": "prefill",
+              "spec": "w8a16"
+            },
+            {
+              "component": "action",
+              "spec": "nvfp4"
+            },
+            {
+              "component": "action",
+              "roles": [
+                "K",
+                "V",
+                "AdaRMS"
+              ],
+              "spec": "w8a16"
+            }
+          ]
+        },
+        "w4a16_kvint8": {
+          "label": "w4a16_kvint8",
+          "selector": "w4a16_kvint8",
+          "rules": [
+            {
+              "component": "vision",
+              "spec": "w8a16"
+            },
+            {
+              "component": "prefill",
+              "spec": {
+                "format": "w4a16",
+                "group": "channel"
+              }
+            },
+            {
+              "component": "prefill",
+              "roles": [
+                "K",
+                "V"
+              ],
+              "spec": "w8a16"
+            },
+            {
+              "component": "action",
+              "spec": {
+                "format": "w4a16",
+                "group": "channel"
+              }
+            },
+            {
+              "component": "action",
+              "roles": [
+                "K",
+                "V",
+                "AdaRMS"
+              ],
+              "spec": "w8a16"
+            }
+          ]
+        }
+      }
+    },
+    "g05": {
+      "targets": [
+        "g05"
+      ],
+      "components": {
+        "vision": {
+          "label": "Vision"
+        },
+        "text": {
+          "label": "文本层",
+          "roles": [
+            "in_proj_a",
+            "in_proj_b"
+          ]
+        },
+        "action": {
+          "label": "Action"
+        }
+      },
+      "recipes": {
+        "fp16": {
+          "label": "fp16",
+          "selector": "fp16",
+          "profiles": [
+            "g05-base.fp16.*"
+          ]
+        },
+        "w8a16": {
+          "label": "w8a16",
+          "selector": "w8a16",
+          "rules": [
+            {
+              "component": "vision",
+              "spec": "w8a16"
+            },
+            {
+              "component": "text",
+              "spec": "w8a16"
+            },
+            {
+              "component": "text",
+              "roles": [
+                "in_proj_a",
+                "in_proj_b"
+              ],
+              "spec": "fp16"
+            },
+            {
+              "component": "action",
+              "spec": "w8a16"
+            }
+          ]
+        },
+        "w8a16_action_nvfp4": {
+          "label": "w8a16_action_nvfp4",
+          "selector": "w8a16_nvfp4",
+          "rules": [
+            {
+              "component": "vision",
+              "spec": "w8a16"
+            },
+            {
+              "component": "text",
+              "spec": "w8a16"
+            },
+            {
+              "component": "text",
+              "roles": [
+                "in_proj_a",
+                "in_proj_b"
+              ],
+              "spec": "fp16"
+            },
+            {
+              "component": "action",
+              "spec": "nvfp4"
+            }
+          ]
+        }
+      }
+    },
+    "hy_vla": {
+      "targets": [
+        "hy_vla"
+      ],
+      "components": {
+        "vision": {
+          "label": "ViT"
+        },
+        "vlm": {
+          "label": "VLM"
+        },
+        "action": {
+          "label": "动作专家"
+        }
+      },
+      "recipes": {
+        "fp16": {
+          "label": "fp16",
+          "selector": "fp16",
+          "profiles": [
+            "hy-embodied-*.fp16.vla"
+          ]
+        },
+        "w8a16": {
+          "label": "w8a16",
+          "selector": "w8a16",
+          "rules": [
+            {
+              "component": "vision",
+              "spec": "w8a16"
+            },
+            {
+              "component": "vlm",
+              "spec": "w8a16"
+            },
+            {
+              "component": "action",
+              "spec": "w8a16"
+            }
+          ],
+          "profiles": [
+            "hy-embodied-*.w8a16.vla"
+          ]
+        },
+        "w4a16_rtn_g32_vision_w8a16": {
+          "label": "w4a16",
+          "selector": "w4a16",
+          "rules": [
+            {
+              "component": "vision",
+              "spec": "w8a16"
+            },
+            {
+              "component": "vlm",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            },
+            {
+              "component": "action",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            }
+          ],
+          "profiles": [
+            "hy-embodied-*.w4a16-g32.vla"
+          ]
+        },
+        "w8a16_action_nvfp4": {
+          "label": "w8a16_action_nvfp4",
+          "selector": "w8a16_nvfp4",
+          "rules": [
+            {
+              "component": "vision",
+              "spec": "w8a16"
+            },
+            {
+              "component": "vlm",
+              "spec": "w8a16"
+            },
+            {
+              "component": "action",
+              "spec": "nvfp4"
+            }
+          ]
+        },
+        "w4a16_rtn_g32": {
+          "label": "w4a16",
+          "selector": "w4a16_vision",
+          "rules": [
+            {
+              "component": "vision",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            },
+            {
+              "component": "vlm",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            },
+            {
+              "component": "action",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "gr00t": {
+      "targets": [
+        "gr00t"
+      ],
+      "components": {
+        "vision": {
+          "label": "Vision ViT"
+        },
+        "text": {
+          "label": "文本 backbone"
+        },
+        "vl_encoder": {
+          "label": "VL encoder"
+        },
+        "dit": {
+          "label": "DiT"
+        },
+        "glue": {
+          "label": "步间 glue"
+        },
+        "merger": {
+          "label": "merger"
+        },
+        "adaln": {
+          "label": "AdaLN"
+        }
+      },
+      "recipes": {
+        "fp16": {
+          "label": "fp16",
+          "selector": "fp16",
+          "profiles": [
+            "gr00t-*.fp16.vla"
+          ]
+        },
+        "w8a16": {
+          "label": "w8a16",
+          "selector": "w8a16",
+          "rules": [
+            {
+              "component": "vision",
+              "spec": "w8a16"
+            },
+            {
+              "component": "text",
+              "spec": "w8a16"
+            },
+            {
+              "component": "vl_encoder",
+              "spec": "w8a16"
+            },
+            {
+              "component": "dit",
+              "spec": "w8a16"
+            },
+            {
+              "component": "glue",
+              "spec": "w8a16"
+            },
+            {
+              "component": "merger",
+              "spec": "fp16"
+            },
+            {
+              "component": "adaln",
+              "spec": "w8a16"
+            }
+          ],
+          "profiles": [
+            "gr00t-*.w8a16.vla"
+          ]
+        },
+        "w4a16_rtn_g32_vision_glue_adaln_w8a16": {
+          "label": "w4a16",
+          "selector": "w4a16",
+          "rules": [
+            {
+              "component": "vision",
+              "spec": "w8a16"
+            },
+            {
+              "component": "text",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            },
+            {
+              "component": "vl_encoder",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            },
+            {
+              "component": "dit",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            },
+            {
+              "component": "glue",
+              "spec": "w8a16"
+            },
+            {
+              "component": "merger",
+              "spec": "fp16"
+            },
+            {
+              "component": "adaln",
+              "spec": "w8a16"
+            }
+          ],
+          "profiles": [
+            "gr00t-*.w4a16-g32.vla"
+          ]
+        },
+        "w4a16_rtn_g32_glue_adaln_w8a16": {
+          "label": "w4a16",
+          "selector": "w4a16",
+          "rules": [
+            {
+              "component": "vision",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            },
+            {
+              "component": "text",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            },
+            {
+              "component": "vl_encoder",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            },
+            {
+              "component": "dit",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            },
+            {
+              "component": "glue",
+              "spec": "w8a16"
+            },
+            {
+              "component": "merger",
+              "spec": "fp16"
+            },
+            {
+              "component": "adaln",
+              "spec": "w8a16"
+            }
+          ],
+          "profiles": [
+            "gr00t-*.w4a16-g32-vision.vla"
+          ]
+        }
+      }
+    },
+    "lingbot2": {
+      "targets": [
+        "lingbot2"
+      ],
+      "components": {
+        "vision": {
+          "label": "Vision"
+        },
+        "vlm_prefill": {
+          "label": "VLM prefill"
+        },
+        "action": {
+          "label": "动作专家",
+          "roles": [
+            "router"
+          ]
+        }
+      },
+      "recipes": {
+        "fp16": {
+          "label": "fp16",
+          "selector": "fp16"
+        },
+        "w8a16": {
+          "label": "w8a16",
+          "selector": "w8a16",
+          "rules": [
+            {
+              "component": "vision",
+              "spec": "w8a16"
+            },
+            {
+              "component": "vlm_prefill",
+              "spec": "w8a16"
+            },
+            {
+              "component": "action",
+              "spec": "w8a16"
+            },
+            {
+              "component": "action",
+              "roles": [
+                "router"
+              ],
+              "spec": "fp16"
+            }
+          ],
+          "profiles": [
+            "lingbot-vla-v2-*.w8a16.*"
+          ]
+        }
+      }
+    },
+    "lingbot": {
+      "targets": [
+        "lingbot"
+      ],
+      "components": {
+        "vision": {
+          "label": "Vision"
+        }
+      },
+      "recipes": {
+        "fp16_cpu_vision": {
+          "label": "fp16",
+          "selector": "cpu-fp32+rpu-fp16",
+          "rules": [
+            {
+              "component": "vision",
+              "spec": "cpu_fp32"
+            }
+          ],
+          "profiles": [
+            "lingbot-vla-4b.mixed.vla"
+          ]
+        }
+      }
+    },
+    "rhinovla": {
+      "targets": [
+        "rhinovla"
+      ],
+      "components": {
+        "vision": {
+          "label": "Vision（patch / merger）"
+        },
+        "prefix": {
+          "label": "Prefix"
+        },
+        "expert": {
+          "label": "Action expert"
+        },
+        "adarms": {
+          "label": "AdaRMS 条件投影"
+        },
+        "action_io": {
+          "label": "动作 IO"
+        }
+      },
+      "recipes": {
+        "fp16": {
+          "label": "fp16",
+          "selector": "fp16",
+          "profiles": [
+            "rhinovla.fp16.official-nonrtc",
+            "rhinovla.v3.fp16.*",
+            "rhinovla.v3.rtc.fp16.trusted-factory"
+          ],
+          "switches": [
+            {
+              "profiles": [
+                "rhinovla.v3.*"
+              ],
+              "opt_in": {
+                "RPU_RHINOVLA_FULL_W8A16": "0",
+                "RPU_RHINOVLA_EXPERT_W8A16": "0"
+              }
+            }
+          ]
+        },
+        "w8a16_action": {
+          "label": "w8a16",
+          "selector": "w8a16",
+          "rules": [
+            {
+              "component": "expert",
+              "spec": "w8a16"
+            }
+          ],
+          "profiles": [
+            "rhinovla.v3.w8a16-action.source",
+            "rhinovla.v3.w8a16.expert.trusted-factory",
+            "rhinovla.v3.rtc.w8a16.expert.trusted-factory"
+          ],
+          "switches": [
+            {
+              "profiles": [
+                "*.source"
+              ],
+              "opt_in": {
+                "RPU_RHINOVLA_FULL_W8A16": "0",
+                "RPU_RHINOVLA_EXPERT_W8A16": "1"
+              }
+            },
+            {
+              "profiles": [
+                "*.trusted-factory"
+              ],
+              "opt_in": {
+                "RPU_RHINOVLA_FULL_W8A16": "0",
+                "RPU_RHINOVLA_EXPERT_W8A16": "0"
+              },
+              "input": {
+                "expert_w8a16": true,
+                "full_w8a16": false
+              }
+            }
+          ]
+        },
+        "w8a16_action_adarms": {
+          "label": "w8a16",
+          "selector": "w8a16",
+          "rules": [
+            {
+              "component": "expert",
+              "spec": "w8a16"
+            },
+            {
+              "component": "adarms",
+              "spec": "w8a16"
+            }
+          ],
+          "profiles": [
+            "rhinovla.v3.w8a16.full-expert.trusted-factory",
+            "rhinovla.v3.rtc.w8a16.full-expert.trusted-factory"
+          ],
+          "switches": [
+            {
+              "opt_in": {
+                "RPU_RHINOVLA_FULL_W8A16": "0",
+                "RPU_RHINOVLA_EXPERT_W8A16": "0"
+              },
+              "input": {
+                "expert_w8a16": true,
+                "full_w8a16": true
+              }
+            }
+          ]
+        },
+        "w8a16_pipeline": {
+          "label": "w8a16",
+          "selector": "w8a16",
+          "rules": [
+            {
+              "component": "vision",
+              "spec": "w8a16"
+            },
+            {
+              "component": "prefix",
+              "spec": "w8a16"
+            },
+            {
+              "component": "expert",
+              "spec": "w8a16"
+            },
+            {
+              "component": "adarms",
+              "spec": "w8a16"
+            },
+            {
+              "component": "action_io",
+              "spec": "w8a16"
+            }
+          ],
+          "profiles": [
+            "rhinovla.v3.w8a16-pipeline*.source",
+            "rhinovla.v3.w8a16.full-pipeline*.trusted-factory",
+            "rhinovla.v3.rtc.w8a16.full-pipeline*.trusted-factory"
+          ],
+          "switches": [
+            {
+              "profiles": [
+                "*.source"
+              ],
+              "opt_in": {
+                "RPU_RHINOVLA_FULL_W8A16": "1",
+                "RPU_RHINOVLA_EXPERT_W8A16": "1"
+              }
+            },
+            {
+              "profiles": [
+                "*.trusted-factory"
+              ],
+              "opt_in": {
+                "RPU_RHINOVLA_FULL_W8A16": "1",
+                "RPU_RHINOVLA_EXPERT_W8A16": "1"
+              },
+              "input": {
+                "expert_w8a16": true,
+                "full_w8a16": true
+              }
+            }
+          ]
+        }
+      }
+    },
+    "wall_oss": {
+      "targets": [
+        "wall_oss"
+      ],
+      "components": {
+        "vision": {
+          "label": "Vision"
+        },
+        "prefill": {
+          "label": "Prefill（expert0）",
+          "roles": [
+            "Down"
+          ]
+        },
+        "action": {
+          "label": "Action（expert1）"
+        },
+        "action_preprocessor": {
+          "label": "action_preprocessor"
+        }
+      },
+      "recipes": {
+        "fp16": {
+          "label": "fp16",
+          "selector": "fp16",
+          "profiles": [
+            "wall-oss-0.5.fp16.vla"
+          ]
+        },
+        "w8a16": {
+          "label": "w8a16",
+          "selector": "w8a16",
+          "rules": [
+            {
+              "component": "vision",
+              "spec": "w8a16"
+            },
+            {
+              "component": "prefill",
+              "spec": "w8a16"
+            },
+            {
+              "component": "action",
+              "spec": "w8a16"
+            },
+            {
+              "component": "action_preprocessor",
+              "spec": "w8a16"
+            }
+          ],
+          "profiles": [
+            "wall-oss-0.5-w8a16.w8a16.vla"
+          ],
+          "checkpoints": {
+            "w8_checkpoint": "w8a16"
+          }
+        },
+        "w8a16_action_nvfp4": {
+          "label": "w8a16_action_nvfp4",
+          "selector": "w8a16_action_nvfp4",
+          "checkpoints": {
+            "w8_checkpoint": "w8a16"
+          },
+          "rules": [
+            {
+              "component": "vision",
+              "spec": "w8a16"
+            },
+            {
+              "component": "prefill",
+              "spec": "w8a16"
+            },
+            {
+              "component": "action",
+              "spec": "nvfp4"
+            }
+          ]
+        },
+        "w4a16_channel": {
+          "label": "w4a16",
+          "selector": "w4a16",
+          "rules": [
+            {
+              "component": "vision",
+              "spec": "w8a16"
+            },
+            {
+              "component": "prefill",
+              "spec": {
+                "format": "w4a16",
+                "group": "channel"
+              }
+            },
+            {
+              "component": "action",
+              "spec": {
+                "format": "w4a16",
+                "group": "channel"
+              }
+            }
+          ],
+          "profiles": [
+            "wall-oss-0.5-w4a16.w4a16.vla"
+          ]
+        },
+        "w4a16_g32": {
+          "label": "w4a16",
+          "selector": "w4a16-pgrp",
+          "rules": [
+            {
+              "component": "vision",
+              "spec": "w8a16"
+            },
+            {
+              "component": "prefill",
+              "spec": {
+                "format": "w4a16",
+                "group": 32
+              }
+            },
+            {
+              "component": "prefill",
+              "roles": [
+                "Down"
+              ],
+              "spec": "w8a16"
+            },
+            {
+              "component": "action",
+              "spec": {
+                "format": "w4a16",
+                "group": 32
+              }
+            }
+          ],
+          "profiles": [
+            "wall-oss-0.5-w4a16-pgrp.w4a16-pgrp.vla"
+          ]
+        }
+      }
+    },
+    "wall_oss_rtc": {
+      "targets": [
+        "wall_oss_rtc"
+      ],
+      "components": {
+        "vision": {
+          "label": "Vision"
+        },
+        "prefill": {
+          "label": "Prefill"
+        },
+        "action": {
+          "label": "Action"
+        }
+      },
+      "recipes": {
+        "fp16": {
+          "label": "fp16",
+          "selector": "fp16",
+          "profiles": [
+            "wall-oss-0.5.fp16.rtc-controlled"
+          ]
+        },
+        "w8a16": {
+          "label": "w8a16",
+          "selector": "w8a16",
+          "rules": [
+            {
+              "component": "vision",
+              "spec": "w8a16"
+            },
+            {
+              "component": "prefill",
+              "spec": "w8a16"
+            },
+            {
+              "component": "action",
+              "spec": "w8a16"
+            }
+          ],
+          "profiles": [
+            "wall-oss-0.5-w8a16.w8a16.rtc-controlled"
+          ],
+          "checkpoints": {
+            "checkpoint": "wall_oss/w8a16"
+          }
+        }
+      }
+    },
+    "wall_oss_sorting": {
+      "targets": [
+        "wall_oss_sorting"
+      ],
+      "components": {
+        "vision": {
+          "label": "Vision"
+        },
+        "prefill": {
+          "label": "Prefill（expert0，含共享 KV）"
+        },
+        "action": {
+          "label": "Action（expert1）"
+        }
+      },
+      "recipes": {
+        "fp16": {
+          "label": "fp16",
+          "selector": "fp16"
+        },
+        "w8a16": {
+          "label": "w8a16",
+          "selector": "w8a16",
+          "rules": [
+            {
+              "component": "vision",
+              "spec": "w8a16"
+            },
+            {
+              "component": "prefill",
+              "spec": "w8a16"
+            },
+            {
+              "component": "action",
+              "spec": "w8a16"
+            }
+          ],
+          "checkpoints": {
+            "w8_checkpoint": "wall_oss/w8a16"
+          }
+        },
+        "w8a16_action_w4a16_g32": {
+          "label": "w8a16_action_w4a16",
+          "selector": "w8a16_action_w4a16",
+          "checkpoints": {
+            "w8_checkpoint": "wall_oss/w8a16",
+            "action_w4_checkpoint": "wall_oss/w4a16_g32"
+          },
+          "rules": [
+            {
+              "component": "vision",
+              "spec": "w8a16"
+            },
+            {
+              "component": "prefill",
+              "spec": "w8a16"
+            },
+            {
+              "component": "action",
+              "spec": {
+                "format": "w4a16",
+                "group": 32
+              }
+            }
+          ]
+        }
+      }
+    },
+    "internvla_n1": {
+      "targets": [
+        "internvla_n1"
+      ],
+      "components": {
+        "system2": {
+          "label": "System2 backbone"
+        }
+      },
+      "recipes": {
+        "w8a16_system2": {
+          "label": "w8a16",
+          "selector": "fp16",
+          "rules": [
+            {
+              "component": "system2",
+              "spec": "w8a16"
+            }
+          ],
+          "profiles": [
+            "internvla-n1-navdp.fp16.system2-*"
+          ]
+        }
+      }
+    },
+    "dinov3": {
+      "targets": [
+        "dinov3"
+      ],
+      "components": {
+        "vision": {
+          "label": "Vision"
+        }
+      },
+      "recipes": {
+        "fp16": {
+          "label": "fp16",
+          "selector": "fp16",
+          "profiles": [
+            "dinov3-*.fp16.*"
+          ]
+        },
+        "w8a16_vision": {
+          "label": "w8a16",
+          "selector": "w8a16",
+          "rules": [
+            {
+              "component": "vision",
+              "spec": "w8a16"
+            }
+          ],
+          "profiles": [
+            "dinov3-*.w8a16.vision"
+          ],
+          "limits": {
+            "on_install_quantization": "w8a16"
+          }
+        },
+        "w4a16_vision_rtn_g32": {
+          "label": "w4a16",
+          "selector": "w4a16",
+          "rules": [
+            {
+              "component": "vision",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            }
+          ],
+          "profiles": [
+            "dinov3-*.w4a16-g32.vision"
+          ],
+          "limits": {
+            "on_install_quantization": "w4a16"
+          }
+        }
+      }
+    },
+    "gemma4": {
+      "targets": [
+        "gemma4"
+      ],
+      "components": {
+        "text": {
+          "label": "文本层"
+        }
+      },
+      "recipes": {
+        "fp16": {
+          "label": "fp16",
+          "selector": "fp16",
+          "profiles": [
+            "gemma4-*.fp16.*"
+          ]
+        },
+        "w8a16_text": {
+          "label": "w8a16",
+          "selector": "w8a16",
+          "rules": [
+            {
+              "component": "text",
+              "spec": "w8a16"
+            }
+          ],
+          "profiles": [
+            "gemma4-*.w8a16.text"
+          ],
+          "limits": {
+            "on_install_quantization": "w8a16"
+          }
+        },
+        "w4a16_text_rtn_g32": {
+          "label": "w4a16",
+          "selector": "w4a16",
+          "rules": [
+            {
+              "component": "text",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            }
+          ],
+          "profiles": [
+            "gemma4-*.w4a16-g32.text"
+          ],
+          "limits": {
+            "on_install_quantization": "w4a16"
+          }
+        }
+      }
+    },
+    "llama": {
+      "targets": [
+        "llama"
+      ],
+      "components": {
+        "text": {
+          "label": "文本层"
+        }
+      },
+      "recipes": {
+        "fp16": {
+          "label": "fp16",
+          "selector": "fp16",
+          "profiles": [
+            "llama-*.fp16.*"
+          ]
+        },
+        "w8a16_text": {
+          "label": "w8a16",
+          "selector": "w8a16",
+          "rules": [
+            {
+              "component": "text",
+              "spec": "w8a16"
+            }
+          ],
+          "profiles": [
+            "llama-*.w8a16.text"
+          ],
+          "limits": {
+            "on_install_quantization": "w8a16"
+          }
+        },
+        "w4a16_text_rtn_g32": {
+          "label": "w4a16",
+          "selector": "w4a16",
+          "rules": [
+            {
+              "component": "text",
+              "spec": {
+                "format": "w4a16",
+                "group": 32,
+                "method": "rtn"
+              }
+            }
+          ],
+          "profiles": [
+            "llama-*.w4a16-g32.text"
+          ],
+          "limits": {
+            "on_install_quantization": "w4a16"
+          }
+        },
+        "nvfp4_text": {
+          "label": "nvfp4",
+          "selector": "nvfp4",
+          "rules": [
+            {
+              "component": "text",
+              "spec": "nvfp4"
+            }
+          ],
+          "profiles": [
+            "llama-*.nvfp4.text"
+          ],
+          "limits": {
+            "on_install_quantization": "nvfp4"
+          }
+        }
+      }
+    },
+    "halo": {
+      "targets": [
+        "halo"
+      ],
+      "components": {},
+      "recipes": {
+        "fp16": {
+          "label": "fp16",
+          "selector": "fp16",
+          "profiles": [
+            "halo_action_expert.fp16.*"
+          ]
+        }
+      }
+    }
+  }
+}

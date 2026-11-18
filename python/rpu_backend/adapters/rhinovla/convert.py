@@ -73,8 +73,11 @@ def _gather_expert_scales(expert):
     return tuple([linear.weight_scale for linear in group] for group in groups)
 
 
-def convert_expert_for_rpu(expert, *, w8a16=False):
+def convert_expert_for_rpu(expert, *, w8a16=False, num_cores=8):
     """Move a RhinoVLA action expert to device in the CORRECT order.
+
+    ``num_cores`` 4 or 6 swizzles attention on four lanes and the MLP on the
+    whole budget, the reduced v3 owner's layout.
 
     convert_linear_weights_inplace swizzles by weight.element_size();
     swizzling fp32 then casting to fp16 produces a wrong-dwidth byte layout.
@@ -98,14 +101,26 @@ def convert_expert_for_rpu(expert, *, w8a16=False):
             "(_rpu_swizzle_started=True). Weights may be partially swizzled — rebuild "
             "the expert from the checkpoint."
         )
+    if num_cores not in (4, 6, 8) or isinstance(num_cores, bool):
+        raise ValueError(f"RhinoVLA expert supports 4, 6 or 8 cores, got {num_cores!r}")
     expert = expert.half()
     if w8a16:
         _quantize_expert_projections(expert)
     expert._rpu_swizzle_started = True
-    convert_linear_weights_inplace(expert, skip_names={"cond"})
+    reduced = {} if num_cores == 8 else {
+        "attn_num_cores": 4, "mlp_num_cores": num_cores,
+        "lm_head_num_cores": 4, "execution_core_count": num_cores}
+    convert_linear_weights_inplace(expert, skip_names={"cond"}, **reduced)
     expert = expert.to("rpu")
+    expert._rpu_num_cores = num_cores
     expert._rpu_swizzled = True
     return expert
+
+
+def _cold_lanes(cores):
+    # Cold tables run eager col-partition Linear: all eight lanes at the full
+    # budget, the attention lanes at a reduced one.
+    return 8 if cores == 8 else 4
 
 
 def _fold_adarms_cond_dense(norm, layer_idx, src_norm_name):
@@ -183,8 +198,12 @@ def _prepare_full_w8_cond_weights(expert):
         folded = [_fold_adarms_cond_dense(getattr(layer, name), index, name)
                   for name in ("input_layernorm", "post_attention_layernorm")]
         quantized, scale = _quantize_full_w8_weight(torch.cat([x[0] for x in folded]))
+        # The row copy feeds the eight-core live condition GEMV only; a reduced
+        # owner reads the precomputed tables and checks this copy by shape.
         row = transform_linear_weight(quantized, partition=0, num_cores=8).to("rpu")
-        col = transform_linear_weight(quantized, partition=1, num_cores=8).to("rpu")
+        col = transform_linear_weight(
+            quantized, partition=1,
+            num_cores=_cold_lanes(getattr(expert, "_rpu_num_cores", 8))).to("rpu")
         scale = scale.to("rpu")
         bias = torch.cat([x[1] for x in folded]).to(dtype=torch.float16, device="rpu")
         # Row swizzle's leading dimension is N/16, so these views are exactly
@@ -470,6 +489,7 @@ def _prepare_full_w8_adarms_tables(expert, cond_all_cpu, loop_weights, *,
         final_table = torch.nn.functional.linear(final_cond, final_w, final_b).contiguous()
         final_table[:, :1024] += 1.0
     cond_rpu = cond.to("rpu")
+    lanes = _cold_lanes(getattr(expert, "_rpu_num_cores", 8))
     results = []
     for index, (weight, scale, bias) in enumerate(zip(weights, scales, biases)):
         # No dequantized CPU Linear: this dispatched op executes shipped W8A16
@@ -477,7 +497,9 @@ def _prepare_full_w8_adarms_tables(expert, cond_all_cpu, loop_weights, *,
         # RPU .cpu() can share the producer's DDR storage. Keep CPU edits in
         # independent memory so freed device outputs cannot retain dirty CPU
         # cache lines when the device allocator reuses them for later stages.
-        output = torch.ops.rpu.linear_w8a16(cond_rpu, weight, scale, bias).cpu().clone()
+        output = (torch.ops.rpu.linear_w8a16(cond_rpu, weight, scale, bias) if lanes == 8 else
+                  torch.ops.rpu.linear_with_accumulation(
+                      cond_rpu, weight, bias, 1, lanes, False, scale)).cpu().clone()
         output[:, :1024] += 1.0
         if index < 18:
             output[:, 3072:4096] += 1.0
@@ -537,7 +559,8 @@ def _direct_action_input(action_io):
     return not has_in
 
 
-def _prepare_denoise_loop_weights(expert, action_io, mask_proj, *, full_w8a16=False):
+def _prepare_denoise_loop_weights(expert, action_io, mask_proj, *, full_w8a16=False,
+                                  num_cores=8):
     """Prepare RhinoVLA action/final-norm weights for the Phase-3 loop op.
 
     The C++ loop pre/post hooks use single-core SPM GEMMs for the action IO
@@ -641,7 +664,8 @@ def _prepare_denoise_loop_weights(expert, action_io, mask_proj, *, full_w8a16=Fa
         final_w, final_b = _fold_final_norm_dense(expert.norm)
         final_q, final_scale = _quantize_full_w8_weight(final_w)
         final_w = transform_linear_weight(final_q, partition=0, num_cores=8).to("rpu")
-        final_col = transform_linear_weight(final_q, partition=1, num_cores=8).to("rpu")
+        final_col = transform_linear_weight(
+            final_q, partition=1, num_cores=_cold_lanes(num_cores)).to("rpu")
         final_b = final_b.to(dtype=torch.float16, device="rpu").contiguous()
         io_scales["final_norm"] = final_scale.to("rpu")
     else:
@@ -747,7 +771,7 @@ def _precompute_mrope_cos_sin(rotary_emb, prefix_len, suffix_len):
     return cos, sin
 
 
-def _create_kv_cache(config, max_seq_len):
+def _create_kv_cache(config, max_seq_len, *, attn_tp=None):
     """Create RPUCache for KV storage in 7D swizzled format."""
     from rpu_backend.api.cache import RPUCache
     from rpu_backend.runtime.weights import NUM_CORES
@@ -758,7 +782,7 @@ def _create_kv_cache(config, max_seq_len):
         max_seq_len=max_seq_len,
         num_kv_heads=config.num_key_value_heads,
         head_dim=config.head_dim,
-        attn_tp=min(NUM_CORES, config.num_key_value_heads),
+        attn_tp=min(NUM_CORES, config.num_key_value_heads) if attn_tp is None else attn_tp,
     )
 
 

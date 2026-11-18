@@ -175,6 +175,7 @@ def _validate_legacy_32b_text(text_model, cfg, scale_lists, topology=None):
 def install_qwen3_vl_text_for_rpu(
     text_model, *, text_config=None, max_seq_len=None, vision_config=None,
     deepstack_lang_layers=None, enable_deepstack=True, scale_lists=None,
+    nvfp4_tensor_scales=None,
     execution_config=None, topology=None, runtime_align_w8a16=False,
     _runtime_quantized_32b=False, _legacy_32b_w8a16=False,
     _graph_cache_max_entries=None,
@@ -247,6 +248,7 @@ def install_qwen3_vl_text_for_rpu(
         text_config=text_config, max_seq_len=max_seq_len,
         vision_config=vision_config, deepstack_lang_layers=deepstack_lang_layers,
         enable_deepstack=enable_deepstack, scale_lists=scale_lists,
+        nvfp4_tensor_scales=nvfp4_tensor_scales,
         execution_config=execution_config, topology=topology,
         **({"logical_vocab_size": logical_vocab_size}
            if logical_vocab_size is not None else {}),

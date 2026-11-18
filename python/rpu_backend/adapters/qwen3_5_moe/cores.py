@@ -11,8 +11,8 @@ class MoeTopology(DecoderTopology):
 
     def __post_init__(self):
         super().__post_init__()
-        if type(self.routed_weight_mode) is not int or self.routed_weight_mode not in (5, 6):
-            raise ValueError("MoE routed weight mode must be E4M3 or UINT4")
+        if type(self.routed_weight_mode) is not int or self.routed_weight_mode not in (1, 5, 6):
+            raise ValueError("MoE routed weight mode must be INT8, E4M3 or UINT4")
 
     @property
     def routed_tp(self):
@@ -37,7 +37,7 @@ def core_topology(execution=None, *, config=None):
             raise UnsupportedModelError("Qwen3.5-MoE profile does not admit the selected core budget")
         mode = capabilities.routed_weight_mode
     attention = 8 if cores == 8 else 4
-    return MoeTopology(cores, attention, cores, attention, routed_weight_mode=mode)
+    return MoeTopology(cores, attention, cores, cores, routed_weight_mode=mode)
 
 
 def full_topology_tuple(topology):

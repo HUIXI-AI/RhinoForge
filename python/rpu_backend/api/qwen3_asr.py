@@ -368,8 +368,12 @@ class Qwen3ASRModel:
             cos_sin=tables, chunk_envelope_for=lookup_causal_decoder, scale_lists=scale_lists,
             execution_config=execution, _audio_component="asr", _graph_cache_max_entries=2,
             nvfp4_tensor_scales=self._nvfp4_tensor_scales)
+        from rpu_backend.runtime.weights import align_w4_pgrp_scale_for_rpu
         self._head_weight = head_weight.to("rpu")
-        self._head_scale = head_scale.to("rpu") if head_scale is not None else None
+        self._head_scale = (
+            align_w4_pgrp_scale_for_rpu(self._head_weight, head_scale.to("rpu"))
+            if head_scale is not None else None
+        )
         # Reuse the fused decode head and separate last-token prefill projection.
         self._language_model = torch.nn.Module()
         self._language_model.model = self._text
@@ -529,11 +533,16 @@ class Qwen3ASRModel:
         return hidden.unsqueeze(0)
 
     def _project_logits(self, hidden):
-        logical_shape = ({"logical_out_features": self._text.config.vocab_size}
+        from rpu_backend.runtime.topology import decoder_lm_head_vocab_size
+
+        vocab = self._text.config.vocab_size
+        padded_vocab = decoder_lm_head_vocab_size(vocab, self._topology.lm_head_tp)
+        logical_shape = ({"logical_out_features": padded_vocab}
                          if self._head_weight.dtype == torch.uint8 else {})
-        return torch.ops.rpu.linear_with_accumulation(
+        logits = torch.ops.rpu.linear_with_accumulation(
             hidden.contiguous(), self._head_weight, None, 1, self._topology.lm_head_tp,
             self._linear_acc32, self._head_scale, **logical_shape)
+        return logits[..., :vocab] if logits.shape[-1] > vocab else logits
 
     def execution_stats(self) -> dict:
         """Return execution-route counters."""

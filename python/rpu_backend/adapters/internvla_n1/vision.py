@@ -8,7 +8,7 @@ from pathlib import Path
 from rpu_backend.adapters.wall_oss.vision import build_wall_oss_vision
 
 from ._policy import require_controlled_evaluation, verify_asset_manifest
-from .execution import VISION_COMPONENT, component_execution
+from .execution import VISION_COMPONENT, component_execution, internvla_core_count
 
 
 _VISION_PROFILE = {
@@ -78,6 +78,8 @@ def build_internvla_vision(
         fp16_ckpt_dir=str(root),
         execution_config=execution,
         per_window_sdpa=True,
+        # The four-lane owner serves both reduced budgets.
+        num_cores=internvla_core_count(execution),
     )
     vars(result)["_rpu_execution"] = execution
     vars(result)["_fmb_execution_component_id"] = VISION_COMPONENT

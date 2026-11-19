@@ -221,6 +221,8 @@ TORCH_LIBRARY(rpu, m) {
         TORCH_FN(rpu_tts_codec_transpose_overlap));
   m.def("tts_codec_conv_transpose1d_device_post(Tensor input, Tensor weight, Tensor? bias, int channels, int kernel, int stride) -> Tensor",
         TORCH_FN(rpu_tts_codec_conv_transpose1d_device_post));
+  m.def("tts_codec_decoder_stage(Tensor input, Tensor snake_affine, Tensor transpose_weight, Tensor? transpose_bias, Tensor[] first_weights, Tensor[] affines, Tensor[] second_weights, int channels, int kernel, int stride) -> Tensor",
+        TORCH_FN(rpu_tts_codec_decoder_stage));
   // SDPA unified layout: [batch, seq_len, heads, head_dim] instead of standard [batch, heads, seq_len, head_dim]
   m.def("scaled_dot_product_attention_unified(Tensor query, Tensor key, Tensor value, Tensor? attn_mask=None, float dropout_p=0.0, bool is_causal=False, float? scale=None, bool enable_gqa=False) -> Tensor");
   // Fused QKV Attention (SPM版本，减少DDR搬运)
@@ -262,6 +264,8 @@ TORCH_LIBRARY(rpu, m) {
         "int exact_candidates=0) -> ()");
   m.def("causal_decoder_set_tts_predictor_heads(int handle, Tensor[] heads) -> ()");
   m.def("causal_decoder_tts_predictor_logits", TORCH_FN(rpu_causal_decoder_tts_predictor_logits));
+  m.def("causal_decoder_set_tts_talker_head(int handle, Tensor head) -> ()");
+  m.def("causal_decoder_tts_talker_logits", TORCH_FN(rpu_causal_decoder_tts_talker_logits));
   m.def("causal_decoder_clear_lm_head", TORCH_FN(rpu_causal_decoder_clear_lm_head));
   m.def("causal_decoder_set_fast_replay(int handle, bool enabled) -> ()",
         TORCH_FN(rpu_causal_decoder_set_fast_replay));
@@ -1735,6 +1739,7 @@ TORCH_LIBRARY_IMPL(rpu, PrivateUse1, m) {
   m.impl("qwen3vl_pooler_spm_z1_pipeline_forward", TORCH_FN(rpu_qwen3vl_pooler_spm_z1_pipeline_forward));
   m.impl("causal_decoder_set_lm_head", TORCH_FN(rpu_causal_decoder_set_lm_head));
   m.impl("causal_decoder_set_tts_predictor_heads", TORCH_FN(rpu_causal_decoder_set_tts_predictor_heads));
+  m.impl("causal_decoder_set_tts_talker_head", TORCH_FN(rpu_causal_decoder_set_tts_talker_head));
   m.impl("lm_head_logits_top1", TORCH_FN(rpu_lm_head_logits_top1));
   m.impl("argmax_lastdim_host", TORCH_FN(rpu_argmax_lastdim_host));
   m.impl("gemma_set_weights", TORCH_FN(rpu_gemma_set_weights));
@@ -1974,6 +1979,7 @@ TORCH_LIBRARY_IMPL(rpu, AutogradPrivateUse1, m) {
   m.impl("qwen3vl_pooler_spm_z1_pipeline_forward", torch::CppFunction::makeFallthrough());
   m.impl("causal_decoder_set_lm_head", torch::CppFunction::makeFallthrough());
   m.impl("causal_decoder_set_tts_predictor_heads", torch::CppFunction::makeFallthrough());
+  m.impl("causal_decoder_set_tts_talker_head", torch::CppFunction::makeFallthrough());
   m.impl("lm_head_logits_top1", torch::CppFunction::makeFallthrough());
   m.impl("argmax_lastdim_host", torch::CppFunction::makeFallthrough());
   m.impl("gemma_set_weights", torch::CppFunction::makeFallthrough());

@@ -3049,7 +3049,7 @@ public:
         //   条件: decode，或已显式启用并验证的 prefill-last W4 路径。
         if (fused_lm_head_this_forward) {
             rpu_ddr_flush(lm_head_logits_out_.data_ptr<c10::Half>());
-            return lm_head_logits_out_;
+            if (!tts_talker_head_) return lm_head_logits_out_;
         }
 
         return result;
@@ -3088,12 +3088,34 @@ public:
         return lm_head_logits_out_;
     }
 
+    void set_tts_talker_head(const at::Tensor& head) {
+        TORCH_CHECK(num_layers() == 28 && hidden_size() == 1024 && intermediate_size() == 3072 &&
+                        num_q_heads() == 16 && num_kv_heads() == 8 && head_dim() == 128 &&
+                        num_cores() == 8 && attn_tp() == 8 && mlp_tp() == 8 && lm_head_tp() == 8 &&
+                        linear_acc32_ && !has_mrope_ && has_qk_norm_ && use_silu_ &&
+                        !fuse_lm_head_ && !tts_talker_head_ && tts_predictor_heads_.empty() &&
+                        head.device().type() == at::kPrivateUse1 && head.scalar_type() == at::kHalf &&
+                        head.is_contiguous() && head.sizes().equals({3072, 1024}),
+                    "TTS Talker head requires the FP16/ACC32 0.6B Talker profile, installed once");
+        set_lm_head(head, std::nullopt, true, 0, true);
+        tts_talker_head_ = true;
+        invalidate_model_state();
+    }
+
+    at::Tensor tts_talker_logits() const {
+        TORCH_CHECK(tts_talker_head_ && lm_head_logits_out_.defined(),
+                    "TTS fused Talker has no logits; run its decoder first");
+        return lm_head_logits_out_;
+    }
+
     void set_lm_head(
         const at::Tensor& lm_head_weight,
         const std::optional<at::Tensor>& lm_head_scale = std::nullopt,
         bool fuse_prefill_last = false,
-        int64_t exact_candidates = 0) {
+        int64_t exact_candidates = 0,
+        bool allow_tts_talker_prefill = false) {
         TORCH_CHECK(tts_predictor_heads_.empty(), "TTS head bank cannot be replaced by a generic head");
+        TORCH_CHECK(!tts_talker_head_, "TTS Talker head must be cleared before replacement");
         TORCH_CHECK(lm_head_weight.defined(),
                     "set_lm_head: lm_head_weight must be defined");
         const bool reduced_qwen3_w8_head =
@@ -3147,6 +3169,8 @@ public:
                     "set_lm_head: exact_candidates must be 0 or 2, got ",
                     exact_candidates);
         TORCH_CHECK((!fuse_prefill_last && exact_candidates == 0) ||
+                        (allow_tts_talker_prefill && fuse_prefill_last &&
+                         exact_candidates == 0) ||
                         (qwen3vl_2b_w8_profile_ && lm_head_is_w4a16 && has_mrope_ &&
                          num_layers() == 28 && hidden_size() == 2048 &&
                          lm_head_weight.size(0) == 151936),
@@ -3213,6 +3237,7 @@ public:
         lm_head_logits_out_ = at::Tensor{};
         lm_head_logits_dst_base_ = 0;
         fuse_lm_head_ = false;
+        tts_talker_head_ = false;
         invalidate_model_state();  // D-503: last non-empty statement of clear_lm_head
     }
 
@@ -9365,7 +9390,7 @@ protected:
                 lm_head_w_scale_,
                 /*nvfp4_tensor_scale_spm_addr=*/0,
                 /*nvfp4_layer_id=*/0,
-                /*force_acc32=*/tts_head ? false : linear_acc32_);
+                /*force_acc32=*/(tts_head || tts_talker_head_) ? false : linear_acc32_);
             const int64_t local_n = vocab_size_ / lm_head_tp();
             // The logits tensor is [bs, 1, vocab]; core c owns vocab slice
             // [c*local_n, (c+1)*local_n). SPM holds [rows][local_n] per core, so
@@ -9400,7 +9425,7 @@ protected:
                 }
             }
         }
-        if ((!emit_fused_lm_head || tts_head) && !ctx().output_to_spm) {
+        if ((!emit_fused_lm_head || tts_head || tts_talker_head_) && !ctx().output_to_spm) {
             // 正常路径: spm2ddr 写回 output_tensor_ (或 chain buffer)
             emit_layer_output_dma(layer_idx, chunk);
         }
@@ -10293,6 +10318,7 @@ protected:  // LingBot2 sparse-MoE subclass reuses the decoder's layer state.
     at::Tensor lm_head_w_;        // FP16/W8 [V,H] or packed W4 [V,H/2], device
     at::Tensor lm_head_w_scale_;  // W8 [V] or W4 pgrp controller-striped scale
     bool fuse_lm_head_ = false;
+    bool tts_talker_head_ = false;
     bool fuse_prefill_last_lm_head_ = false;
     int64_t lm_head_exact_candidates_ = 0;
     // Explicit sequential-greedy service contract. Disabled by default so the

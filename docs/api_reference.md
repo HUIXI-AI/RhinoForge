@@ -651,6 +651,38 @@ Other execution errors propagate.
   decode; Predictor retains its two-token conditioning prefill and one
   decode Graph; codec replaces its Graph on a frame-count change.
 
+With matching native support, Predictor runs its fixed 15-step loop in C++ once
+both replay Graphs are prepared. Embedding and FP32 sampling still run on CPU
+with the same CPU RNG; this reduces Python dispatch, not device round trips.
+Older extensions and unprepared Graphs retain the Python loop. Execution errors
+propagate without retrying sampling; logical call counts remain unchanged.
+
+The opt-in device-sampling experiment requires matching external operator assets.
+It centers logits and checks their finite `[-100, 100]` envelope on-device,
+replacing invalid values before sampling and rejecting the whole group when its
+validity flags are read back after 15 steps. It does not remove per-step device
+submissions, and its FP16 sampling is not seed-equivalent to the default FP32 path.
+
+With matching experimental assets, set `RPU_TTS_PREDICTOR_GROUP=1` and
+`RPU_TTS_SAMPLING_EXPERIMENT=<asset-directory>` before loading to opt into grouped
+Predictor execution. Decoder, sampling and embedding are recorded into two retained
+Graphs (8 steps + 7 steps), each checked to submit one hardware batch per invocation.
+This preserves the framework's conservative batch budget rather than increasing it.
+After initial single-step preparation, the two step Graphs are retired and replaced
+by these two group Graphs. The single-forward prefill shortcut is disabled in this
+mode; ordinary group replay retains physical-plan and DMA validation. Configuration
+changes or external cache retirement require a model reload. `execution_stats()`
+reports Predictor `group_hw_submits_total`; use before/after differences, not the
+cumulative value, to count submissions for a request. Clear Graphs before retiring
+the group-owned Programs and buffers. The default execution path is unchanged.
+
+The matching Predictor and Talker sampling asset directories are the same directory.
+Set both `RPU_TTS_SAMPLING_EXPERIMENT` and
+`RPU_TTS_TALKER_SAMPLING_EXPERIMENT` to it. The complete sampling delivery contains
+only `tts_sampling_unified.ref` and `tts_sampling_tables.bin`; the latter has a
+versioned header and separate Predictor and Talker parameter sections. Missing,
+truncated or schema-mismatched files are rejected while the sampler is constructed.
+
 Each sequence resets logical KV position while retaining private storage. TTS
 caches only the latest reference speaker embedding by decoded audio content;
 every request still reads and validates the file. Output storage is independent

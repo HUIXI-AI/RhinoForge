@@ -29,15 +29,39 @@
 #include "graph/graph_infra.h"
 #include "graph/graph_runtime.h"
 #include "core/rpu_kernel_decls.h"
+#include "ops/tts_predictor_group.h"
+#include "ops/tts_talker_sampler.h"
 
 #include <pybind11/stl.h>
 #include <pybind11/pybind11.h>
+#include <torch/csrc/utils/pybind.h>
 
 namespace py = pybind11;
 
 namespace graph_pybind {
 
 void add_bindings(py::module_& m) {
+    py::class_<TtsTalkerSampler>(m, "TtsTalkerSampler")
+        .def(py::init<std::string>())
+        .def("reset", &TtsTalkerSampler::reset)
+        .def("reset_interleaved", &TtsTalkerSampler::reset_interleaved)
+        .def("sample", &TtsTalkerSampler::sample)
+        .def("result", &TtsTalkerSampler::result);
+    py::class_<TtsPredictorGroup>(m, "TtsPredictorGroup")
+        .def(py::init<std::string>())
+        .def("reserve", &TtsPredictorGroup::reserve)
+        .def("reserve_noise", &TtsPredictorGroup::reserve_noise)
+        .def("generate", &TtsPredictorGroup::generate, py::keep_alive<7, 1>())
+        .def("retire", &TtsPredictorGroup::retire);
+    m.def("tts_predictor_generate", [](int64_t handle, const at::Tensor& input,
+            const std::vector<at::Tensor>& embeddings, const std::vector<at::Tensor>& keys,
+            const std::vector<at::Tensor>& values, RpuGraphCache& cache,
+            const GraphSignature& prefill, const GraphSignature& decode,
+            const std::vector<int64_t>& prefill_descriptor, const std::vector<int64_t>& decode_descriptor,
+            int64_t execution_len, const at::Tensor& progress) {
+        return rpu_tts_predictor_generate(handle, input, embeddings, keys, values, cache,
+            prefill, decode, prefill_descriptor, decode_descriptor, execution_len, progress);
+    });
     m.def("get_hwperf_evidence_failure_total",
           &rpu_get_hwperf_evidence_failure_total);
     // GraphSignature: A2 admission key 的 7 字段

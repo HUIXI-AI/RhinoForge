@@ -303,6 +303,9 @@ def install_rpu_convolutions(decoder, restore, stats):
     stats["paired_calls"] = 0
     stats["transposed_layers"] = 0
     stats["transposed_calls"] = 0
+    stats["decoder_stages"] = 0
+    stats["decoder_stage_calls"] = 0
+    transpose_parameters = {}
     if device_post or hasattr(torch.ops.rpu, "tts_codec_conv_transpose1d"):
         for module, bias in zip(transposed, transpose_biases):
             if device_post:
@@ -313,6 +316,7 @@ def install_rpu_convolutions(decoder, restore, stats):
                 weight = torch.nn.functional.pad(weight, (0, 0, 0, (-weight.shape[0]) % 128))
             packed = transform_linear_weight(weight, 1, 8).to("rpu")
             bias = bias.to("rpu") if bias is not None else None
+            transpose_parameters[module] = (packed, bias)
 
             def forward(owner, hidden, output_size=None, packed=packed, bias=bias):
                 return _rpu_transpose_convolution(
@@ -359,6 +363,7 @@ def install_rpu_convolutions(decoder, restore, stats):
     stats["convnext_block_calls"] = 0
     stats["standalone_snakes"] = len(standalone_snakes)
     stats["standalone_snake_calls"] = 0
+    snake_affines = {}
     for _, module in standalone_snakes:
         padding = (-module.alpha.numel()) % 128
         affine = torch.stack((
@@ -369,6 +374,7 @@ def install_rpu_convolutions(decoder, restore, stats):
         if not torch.isfinite(affine).all():
             raise ValueError("TTS RPU standalone SnakeBeta parameters exceed finite FP16 range")
         affine = affine.to("rpu")
+        snake_affines[module] = affine
 
         def forward(owner, hidden, affine=affine):
             output = torch.ops.rpu.tts_codec_snake(hidden, affine, owner.alpha.numel())
@@ -442,6 +448,41 @@ def install_rpu_convolutions(decoder, restore, stats):
 
             restore.append((stage, stage.forward))
             stage.forward = types.MethodType(forward, stage)
+
+    stage_native = getattr(torch.ops.rpu, "tts_codec_decoder_stage", None)
+    if (stage_native is not None and complete_residuals and fused_residuals and
+            hasattr(torch.ops.rpu, "tts_codec_residual_unit_padded_rows")):
+        geometries = ((1, 1536, 768, 16, 8), (2, 768, 384, 10, 5),
+                      (3, 384, 192, 8, 4), (4, 192, 96, 6, 3))
+        for index, in_channels, channels, kernel, stride in geometries:
+            stage = decoder.get_submodule(f"decoder.{index}")
+            snake, transpose_block = stage.block[:2]
+            transpose = transpose_block.conv
+            if (snake not in snake_affines or transpose not in transpose_parameters or
+                    transpose.in_channels != in_channels or transpose.out_channels != channels):
+                raise ValueError("TTS RPU decoder-stage geometry differs")
+            first, affine, second = zip(
+                *(resident_parameters[unit] for unit in stage.block[2:]))
+            transpose_weight, transpose_bias = transpose_parameters[transpose]
+
+            def forward(owner, hidden, snake_affine=snake_affines[snake],
+                        transpose_weight=transpose_weight, transpose_bias=transpose_bias,
+                        first=first, affine=affine, second=second, channels=channels,
+                        kernel=kernel, stride=stride):
+                output = torch.ops.rpu.tts_codec_decoder_stage(
+                    hidden,
+                    snake_affine, transpose_weight, transpose_bias,
+                    list(first), list(affine), list(second), channels, kernel, stride)
+                stats["standalone_snake_calls"] += 1
+                stats["transposed_calls"] += 1
+                stats["calls"] += 6
+                stats["paired_calls"] += 3
+                stats["decoder_stage_calls"] += 1
+                return output
+
+            restore.append((stage, stage.forward))
+            stage.forward = types.MethodType(forward, stage)
+        stats["decoder_stages"] = len(geometries)
 
 
 def _residual_pair_affines(decoder, *, full=False, complete=False):

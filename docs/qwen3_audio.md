@@ -351,6 +351,27 @@ The matching extension also uses `tts_codec_conv1d_spm`, `tts_codec_snake` and
 and ConvNeXt normalization/GELU/residual arithmetic. CPU still orchestrates eager
 launches and converts boundaries; this is not an end-to-end device-resident decoder.
 
+Codec SnakeBeta now keeps its five FP16 arithmetic stages in per-core SPM,
+splitting rows across up to eight cores and returning only the final rows to DDR.
+Up to eight capacity-bounded tiles share a one-shot Graph; alpha/scale remain in the same
+temporary SPM scope across tiles and are refreshed on every invocation. The
+planner caps tiles at 512 rows per core and 4 MiB per-core scratch space.
+Transposed-convolution overlap/bias and im2col also group at most eight existing
+tiles per one-shot Graph. Overlap bias uploads in the first batch; im2col retains
+its existing 4 MiB capacity plan and padding/dilation math. ERF GELU groups at most
+eight existing 25,600-element tiles, including input/output DMA, with unchanged math.
+ConvNeXt LayerNorm groups at most sixteen 16-row tiles into each one-shot Graph,
+uploading affine parameters once per invocation without enlarging its SPM buffers
+or changing the per-tile reduction math.
+These paths reuse scratch in stream order and complete and retire each Graph before
+releasing its temporary scope; they add no retained Graph, cross-request cache,
+or runtime dependency. Existing Graph resource budgets may split a batch further.
+The device-im2col, resident residual, ConvNeXt and device-post transpose paths
+also group FP16/ACC32 Linear staging, compute, gather and write-back into a
+one-shot Graph. They retain the shared tiling plan and Graph resource budgets;
+single-row inputs keep the eager scatter route. Legacy staging and other codec
+operations retain their existing paths.
+
 FP16 rounding changes the waveform. Compare identical codec tokens against the
 CPU FP32 anchor and inspect speech content; runtime checks alone do not certify
 audio quality. The RPU path remains experimental even though it is now the default; it does

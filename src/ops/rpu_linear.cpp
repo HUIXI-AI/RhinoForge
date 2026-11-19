@@ -3929,6 +3929,21 @@ namespace {
 constexpr int64_t kTtsCodecLayerNormRows = 16;
 constexpr size_t kTtsCodecIm2colBudget = 4ULL << 20;
 
+template <typename Emit>
+void tts_codec_submit_tile(const Tensor& input, const Tensor& output, Emit emit) {
+  RpuKernelGraph graph;
+  graph.begin();
+  try {
+    graph.keep_alive(input);
+    graph.keep_alive(output);
+    emit();
+    graph.end();
+  } catch (...) {
+    graph.abort();
+    throw;
+  }
+}
+
 Tensor tts_codec_cpu_nct_to_device_rows(const Tensor& input,
                                          const Tensor& device_owner,
                                          int64_t padded_channels = 0) {
@@ -3957,7 +3972,8 @@ Tensor tts_codec_device_rows_to_cpu_nct(const Tensor& rows) {
 
 Tensor tts_codec_im2col_rows(const Tensor& rows, int64_t kernel,
                              int64_t dilation, int64_t left_padding) {
-  TORCH_CHECK(rows.device().type() == at::kPrivateUse1 &&
+  TORCH_CHECK(!RpuKernelGraph::has_active() &&
+                  rows.device().type() == at::kPrivateUse1 &&
                   rows.scalar_type() == at::kHalf && rows.dim() == 2 &&
                   rows.is_contiguous() && kernel > 0 && dilation > 0 &&
                   left_padding >= 0,
@@ -3990,40 +4006,105 @@ Tensor tts_codec_im2col_rows(const Tensor& rows, int64_t kernel,
   const uint32_t column_spm = SPM_ALLOC.addr(0, column_off);
   auto* source = const_cast<c10::Half*>(rows.data_ptr<c10::Half>());
   auto* destination = patches.data_ptr<c10::Half>();
-  for (int64_t row = 0; row < count; row += max_rows) {
-    const int64_t chunk = std::min(count - row, max_rows);
-    const int64_t segment = chunk + width - 1;
-    const int64_t source_begin = row - left_padding;
-    const int64_t valid_begin = std::max<int64_t>(0, source_begin);
-    const int64_t valid_end = std::min(samples, source_begin + segment);
-    rpu_launch_fill_spm_kernel(
-        input_spm, segment * channels, c10::Half(0.0f), 1);
-    if (valid_end > valid_begin) {
-      rpu_launch_ddr_broadcast_spm_dma_immediate(
-          source + valid_begin * channels,
-          (valid_end - valid_begin) * channels,
-          input_spm + (valid_begin - source_begin) * channels * sizeof(c10::Half),
-          1);
-    }
-    rpu_launch_im2col_spm(
-        input_off, column_off, 1, 1, static_cast<int>(segment),
-        static_cast<int>(channels), 1, static_cast<int>(kernel),
-        0, 0, 0, 0, 1, 1, 1, static_cast<int>(dilation), 1);
-    rpu_launch_spm_copy_ddr_dma_immediate(
-        column_spm, destination + row * kernel * channels,
-        chunk * kernel * channels);
+  for (int64_t start = 0; start < count; start += 8 * max_rows) {
+    const int64_t end = std::min(count, start + 8 * max_rows);
+    tts_codec_submit_tile(rows, patches, [&] {
+      for (int64_t row = start; row < end; row += max_rows) {
+        const int64_t chunk = std::min(end - row, max_rows);
+        const int64_t segment = chunk + width - 1;
+        const int64_t source_begin = row - left_padding;
+        const int64_t valid_begin = std::max<int64_t>(0, source_begin);
+        const int64_t valid_end = std::min(samples, source_begin + segment);
+        rpu_launch_fill_spm_kernel(
+            input_spm, segment * channels, c10::Half(0.0f), 1);
+        if (valid_end > valid_begin) {
+          rpu_launch_ddr_broadcast_spm_dma(
+              source + valid_begin * channels,
+              (valid_end - valid_begin) * channels,
+              input_spm + (valid_begin - source_begin) * channels * sizeof(c10::Half),
+              1);
+        }
+        rpu_launch_im2col_spm(
+            input_off, column_off, 1, 1, static_cast<int>(segment),
+            static_cast<int>(channels), 1, static_cast<int>(kernel),
+            0, 0, 0, 0, 1, 1, 1, static_cast<int>(dilation), 1);
+        rpu_launch_spm_copy_ddr_dma(
+            column_spm, destination + row * kernel * channels,
+            chunk * kernel * channels);
+      }
+    });
   }
   return patches;
 }
 
 Tensor tts_codec_snake_rows(const Tensor& rows, const Tensor& alpha,
                             const Tensor& scale) {
-  auto sine = at::sin(at::mul(rows, alpha));
-  return at::add(rows, at::mul(at::mul(sine, sine), scale));
+  TORCH_CHECK(!RpuKernelGraph::has_active() &&
+                  rows.device().type() == at::kPrivateUse1 &&
+                  rows.scalar_type() == at::kHalf && rows.dim() == 2 &&
+                  rows.is_contiguous() && rows.size(0) > 0 &&
+                  rows.size(1) > 0 && rows.size(1) % 16 == 0 &&
+                  alpha.device() == rows.device() && scale.device() == rows.device() &&
+                  alpha.scalar_type() == at::kHalf && scale.scalar_type() == at::kHalf &&
+                  alpha.is_contiguous() && scale.is_contiguous() &&
+                  alpha.sizes().equals({rows.size(1)}) && scale.sizes() == alpha.sizes(),
+              "TTS codec SnakeBeta requires contiguous device FP16 rows and channels");
+  if (!SPM_ALLOC.is_initialized()) SPM_ALLOC.init();
+  SpmAllocator::ScopedTemporary temporary;
+  const int64_t channels = rows.size(1);
+  const size_t budget = std::min<size_t>(SPM_ALLOC.free_space(), 4ULL << 20);
+  const size_t fixed = 2 * channels * sizeof(c10::Half) + 512;
+  const size_t per_row = 3 * channels * sizeof(c10::Half);
+  TORCH_CHECK(budget >= fixed + per_row,
+              "TTS codec SnakeBeta has insufficient free SPM");
+  const int64_t tile = std::min<int64_t>(512, (budget - fixed) / per_row);
+  auto alloc = [](size_t n) {
+    return SPM_ALLOC.addr(0, SPM_ALLOC.alloc_temporary(n * sizeof(c10::Half)));
+  };
+  const uint32_t input_spm = alloc(tile * channels);
+  const uint32_t first = alloc(tile * channels), second = alloc(tile * channels);
+  const uint32_t alpha_spm = alloc(channels), scale_spm = alloc(channels);
+  auto output = at::empty_like(rows);
+  for (int64_t start = 0; start < rows.size(0);) {
+    tts_codec_submit_tile(rows, output, [&] {
+      for (int step = 0; step < 8 && start < rows.size(0); ++step) {
+        const int cores = static_cast<int>(std::min<int64_t>(8, rows.size(0) - start));
+        const int64_t count = std::min(tile, (rows.size(0) - start) / cores);
+        const int64_t elements = count * channels;
+        // Later tiles only use a subset of these cores within this temporary scope.
+        if (start == 0) {
+          rpu_launch_ddr_broadcast_spm_dma(alpha.data_ptr<c10::Half>(), channels, alpha_spm, cores);
+          rpu_launch_ddr_broadcast_spm_dma(scale.data_ptr<c10::Half>(), channels, scale_spm, cores);
+        }
+        rpu_launch_ddr_scatter_spm_dma(
+            rows.data_ptr<c10::Half>() + start * channels, elements,
+            elements * sizeof(c10::Half), input_spm, cores);
+        rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
+            alpha_spm, input_spm, first, count, channels,
+            c10::Half(1.0f), ValuOpType::MUL, false, cores);
+        rpu_launch_eltwise_unary_spm_kernel(
+            first, second, elements, ValuOpType::SIN, GeluMode::NONE, cores);
+        rpu_launch_eltwise_binary_spm_kernel(
+            second, second, first, elements, ValuOpType::MUL, c10::Half(1.0f), cores);
+        rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
+            scale_spm, first, second, count, channels,
+            c10::Half(1.0f), ValuOpType::MUL, false, cores);
+        rpu_launch_eltwise_binary_spm_kernel(
+            input_spm, second, first, elements, ValuOpType::ADD, c10::Half(1.0f), cores);
+        rpu_launch_spm_scatter_ddr_dma(
+            first, output.data_ptr<c10::Half>() + start * channels, elements,
+            elements * sizeof(c10::Half), cores);
+        start += count * cores;
+      }
+    });
+  }
+  return output;
 }
 
 Tensor tts_codec_layernorm_rows(const Tensor& rows, const Tensor& weight,
                                 const Tensor& bias, double eps) {
+  TORCH_CHECK(!RpuKernelGraph::has_active() && rows.dim() == 2 && rows.size(0) > 0,
+              "TTS codec LayerNorm requires nonempty eager rows");
   const int64_t channels = rows.size(1);
   auto output = at::empty_like(rows);
   if (!SPM_ALLOC.is_initialized()) SPM_ALLOC.init();
@@ -4040,23 +4121,30 @@ Tensor tts_codec_layernorm_rows(const Tensor& rows, const Tensor& weight,
       0, SPM_ALLOC.alloc_temporary(channels * sizeof(c10::Half)));
   const uint32_t bias_spm = SPM_ALLOC.addr(
       0, SPM_ALLOC.alloc_temporary(channels * sizeof(c10::Half)));
-  rpu_launch_ddr_broadcast_spm_dma_immediate(
-      const_cast<c10::Half*>(weight.data_ptr<c10::Half>()),
-      channels, weight_spm, 1);
-  rpu_launch_ddr_broadcast_spm_dma_immediate(
-      const_cast<c10::Half*>(bias.data_ptr<c10::Half>()),
-      channels, bias_spm, 1);
   auto* source = const_cast<c10::Half*>(rows.data_ptr<c10::Half>());
   auto* destination = output.data_ptr<c10::Half>();
-  for (int64_t row = 0; row < rows.size(0); row += max_rows) {
-    const int64_t count = std::min(rows.size(0) - row, max_rows);
-    rpu_launch_ddr_broadcast_spm_dma_immediate(
-        source + row * channels, count * channels, input_spm, 1);
-    rpu_launch_layernorm_spm_kernel(
-        input_spm, output_spm, weight_spm, bias_spm,
-        count, channels, eps, false, 0, 1);
-    rpu_launch_spm_copy_ddr_dma_immediate(
-        output_spm, destination + row * channels, count * channels);
+  // Bound command storage while preserving the certified 16-row math tiles.
+  const int64_t batch_rows = 16 * max_rows;
+  for (int64_t start = 0; start < rows.size(0); start += batch_rows) {
+    const int64_t end = std::min(rows.size(0), start + batch_rows);
+    tts_codec_submit_tile(rows, output, [&] {
+      if (start == 0) {
+        rpu_launch_ddr_broadcast_spm_dma(
+            const_cast<c10::Half*>(weight.data_ptr<c10::Half>()), channels, weight_spm, 1);
+        rpu_launch_ddr_broadcast_spm_dma(
+            const_cast<c10::Half*>(bias.data_ptr<c10::Half>()), channels, bias_spm, 1);
+      }
+      for (int64_t row = start; row < end; row += max_rows) {
+        const int64_t count = std::min(end - row, max_rows);
+        rpu_launch_ddr_broadcast_spm_dma(
+            source + row * channels, count * channels, input_spm, 1);
+        rpu_launch_layernorm_spm_kernel(
+            input_spm, output_spm, weight_spm, bias_spm,
+            count, channels, eps, false, 0, 1);
+        rpu_launch_spm_copy_ddr_dma(
+            output_spm, destination + row * channels, count * channels);
+      }
+    });
   }
   return output;
 }
@@ -4068,6 +4156,34 @@ void check_tts_codec_device_half(const Tensor& tensor,
                   tensor.scalar_type() == at::kHalf && tensor.is_contiguous() &&
                   tensor.sizes().equals(shape),
               name, " has invalid device FP16 geometry");
+}
+
+Tensor tts_codec_linear_rows(const Tensor& rows, const Tensor& weight,
+                             const c10::optional<Tensor>& bias) {
+  TORCH_CHECK(!RpuKernelGraph::has_active() && rows.dim() == 2 &&
+                  rows.size(0) > 0 && rows.size(0) <= 255 * 1920 && weight.dim() == 2,
+              "TTS codec Linear requires bounded eager rows");
+  check_tts_codec_device_half(rows, {rows.size(0), weight.size(1)}, "TTS codec Linear input");
+  check_tts_codec_device_half(weight, weight.sizes(), "TTS codec Linear weight");
+  TORCH_CHECK(rows.device() == weight.device(), "TTS codec Linear device mismatch");
+  if (bias.has_value()) {
+    check_tts_codec_device_half(*bias, {weight.size(0)}, "TTS codec Linear bias");
+    TORCH_CHECK(bias->device() == rows.device(), "TTS codec Linear bias device mismatch");
+  }
+  validate_parallel_linear_geometry(rows.size(0), weight.size(0), weight.size(1), 1, 8);
+  // Keep the eager single-row scatter path; all other tiles retain ACC32 math.
+  if (rows.size(0) == 1) {
+    return rpu_linear_with_accumulation(rows, weight, bias, 1, 8, true, c10::nullopt);
+  }
+  auto output = at::empty({rows.size(0), weight.size(0)}, rows.options());
+  const uint64_t destination = RpuGetDevAddr(output.data_ptr<c10::Half>());
+  tts_codec_submit_tile(rows, output, [&] {
+    RpuKernelGraph::active().keep_alive(weight);
+    if (bias.has_value()) RpuKernelGraph::active().keep_alive(*bias);
+    rpu_launch_linear_ddr_kernel(rows, weight, output, bias.value_or(Tensor{}),
+        bias.has_value(), 1, &destination, 0, nullptr, 8, {}, true);
+  });
+  return output;
 }
 
 }  // namespace
@@ -4111,8 +4227,8 @@ Tensor rpu_tts_codec_conv1d_spm(
               "tts_codec_conv1d_spm: expected CPU FP32 bias");
   auto rows = tts_codec_cpu_nct_to_device_rows(input, weight);
   auto patches = tts_codec_im2col_rows(rows, kernel, dilation, 0);
-  auto projected = rpu_linear_with_accumulation(
-      patches, weight, device_bias ? bias : c10::nullopt, 1, 8, true, c10::nullopt)
+  auto projected = tts_codec_linear_rows(
+      patches, weight, device_bias ? bias : c10::nullopt)
                        .narrow(1, 0, out_channels);
   auto output = tts_codec_device_rows_to_cpu_nct(projected);
   if (bias.has_value() && !device_bias) output.add_(bias->view({1, out_channels, 1}));
@@ -4162,13 +4278,11 @@ static Tensor tts_codec_residual_unit_impl(
         channel(5).narrow(0, 0, row_channels));
   }
   auto patches = tts_codec_im2col_rows(hidden, 7, dilation, 6 * dilation);
-  hidden = rpu_linear_with_accumulation(
-      patches, first_weight, c10::nullopt, 1, 8, true, c10::nullopt);
+  hidden = tts_codec_linear_rows(patches, first_weight, c10::nullopt);
   hidden = at::add(hidden, channel(0));
   hidden = tts_codec_snake_rows(
       hidden, channel(1), channel(2));
-  hidden = rpu_linear_with_accumulation(
-      hidden, second_weight, c10::nullopt, 1, 8, true, c10::nullopt);
+  hidden = tts_codec_linear_rows(hidden, second_weight, c10::nullopt);
   hidden = at::add(hidden, channel(3));
   if (complete) {
     hidden = at::add(hidden, residual);
@@ -4262,15 +4376,12 @@ Tensor rpu_tts_codec_convnext_block(
 
   auto residual = tts_codec_cpu_nct_to_device_rows(input, depthwise_weight);
   auto patches = tts_codec_im2col_rows(residual, 7, 1, 6);
-  auto hidden = rpu_linear_with_accumulation(
-      patches, depthwise_weight, depthwise_bias, 1, 8, true, c10::nullopt);
+  auto hidden = tts_codec_linear_rows(patches, depthwise_weight, depthwise_bias);
   auto normalized = tts_codec_layernorm_rows(
       hidden, norm_weight, norm_bias, eps);
-  hidden = rpu_linear_with_accumulation(
-      normalized, first_weight, first_bias, 1, 8, true, c10::nullopt);
+  hidden = tts_codec_linear_rows(normalized, first_weight, first_bias);
   hidden = rpu_gelu_erf(hidden);
-  hidden = rpu_linear_with_accumulation(
-      hidden, second_weight, second_bias, 1, 8, true, c10::nullopt);
+  hidden = tts_codec_linear_rows(hidden, second_weight, second_bias);
   hidden = at::mul(hidden, gamma);
   return tts_codec_device_rows_to_cpu_nct(at::add(hidden, residual));
 }
@@ -4467,9 +4578,60 @@ Tensor rpu_tts_codec_conv_transpose1d_device_post(
                    bias->is_contiguous() && bias->sizes().equals({padded})),
               "tts_codec_conv_transpose1d_device_post expects padded FP16 device bias");
   auto rows = tts_codec_cpu_nct_to_device_rows(input, weight);
-  auto projected = rpu_linear_with_accumulation(rows, weight, c10::nullopt, 1, 8, true, c10::nullopt);
+  auto projected = tts_codec_linear_rows(rows, weight, c10::nullopt);
   auto output = rpu_tts_codec_transpose_overlap(projected, bias, channels, kernel, stride);
   return tts_codec_device_rows_to_cpu_nct(output.narrow(1, 0, channels));
+}
+
+Tensor rpu_tts_codec_decoder_stage(
+    const Tensor& input, const Tensor& snake_affine,
+    const Tensor& transpose_weight, const c10::optional<Tensor>& transpose_bias,
+    at::TensorList first_weights, at::TensorList affines,
+    at::TensorList second_weights, int64_t channels, int64_t kernel, int64_t stride) {
+  TORCH_CHECK(!RpuKernelGraph::has_active(),
+              "tts_codec_decoder_stage requires eager execution");
+  TORCH_CHECK(input.device().is_cpu() && input.scalar_type() == at::kFloat &&
+                  input.dim() == 3 && input.size(0) == 1 && input.size(2) > 0 &&
+                  input.size(2) <= 255 * 640,
+              "tts_codec_decoder_stage expects bounded CPU FP32 NCT");
+  const int64_t in = input.size(1);
+  TORCH_CHECK((in == 1536 && channels == 768 && kernel == 16 && stride == 8) ||
+                  (in == 768 && channels == 384 && kernel == 10 && stride == 5) ||
+                  (in == 384 && channels == 192 && kernel == 8 && stride == 4) ||
+                  (in == 192 && channels == 96 && kernel == 6 && stride == 3),
+              "tts_codec_decoder_stage: unsupported geometry");
+  const int64_t padded_in = CeilDiv(in, int64_t{128}) * 128;
+  const int64_t padded_out = CeilDiv(channels, int64_t{128}) * 128;
+  check_tts_codec_device_half(
+      snake_affine, {2, padded_in}, "TTS decoder-stage SnakeBeta affine");
+  check_tts_codec_device_half(
+      transpose_weight, {kernel * padded_out, in},
+      "TTS decoder-stage transpose weight");
+  TORCH_CHECK(!transpose_bias.has_value() ||
+                  (transpose_bias->device() == transpose_weight.device() &&
+                   transpose_bias->scalar_type() == at::kHalf &&
+                   transpose_bias->is_contiguous() &&
+                   transpose_bias->sizes().equals({padded_out})),
+              "tts_codec_decoder_stage: invalid transpose bias");
+  TORCH_CHECK(first_weights.size() == 3 && affines.size() == 3 &&
+                  second_weights.size() == 3,
+              "tts_codec_decoder_stage requires three residual units");
+
+  auto rows = tts_codec_cpu_nct_to_device_rows(input, transpose_weight);
+  rows = tts_codec_snake_rows(
+      rows, snake_affine.select(0, 0).narrow(0, 0, in),
+      snake_affine.select(0, 1).narrow(0, 0, in));
+  rows = tts_codec_linear_rows(rows, transpose_weight, c10::nullopt);
+  rows = rpu_tts_codec_transpose_overlap(
+      rows, transpose_bias, channels, kernel, stride);
+  const bool padded_rows = channels == 96 || channels == 192;
+  for (int64_t index = 0; index < 3; ++index) {
+    rows = tts_codec_residual_unit_impl(
+        rows, first_weights[index], affines[index], second_weights[index],
+        index == 0 ? 1 : index == 1 ? 3 : 9, channels, true, true,
+        padded_rows);
+  }
+  return tts_codec_device_rows_to_cpu_nct(rows.narrow(1, 0, channels));
 }
 
 Tensor rpu_tts_codec_transpose_overlap(
@@ -4515,42 +4677,47 @@ Tensor rpu_tts_codec_transpose_overlap(
   const uint32_t input_spm = alloc(input_elements), head = alloc(work_elements);
   const uint32_t tail = alloc(work_elements), sum = alloc(work_elements);
   const uint32_t output_spm = alloc(work_elements), bias_spm = alloc(padded);
-  if (bias.has_value()) {
-    rpu_launch_ddr_broadcast_spm_dma_immediate(
-        const_cast<c10::Half*>(bias->data_ptr<c10::Half>()), padded, bias_spm, 1);
-  }
   auto output = at::empty({groups * stride, padded}, projected.options());
   auto* source = const_cast<c10::Half*>(projected.data_ptr<c10::Half>());
-  for (int64_t start = 0; start < groups; start += tile) {
-    const int64_t n = std::min(tile, groups - start), elements = n * block;
-    uint32_t result = input_spm;
-    if (direct) {
-      rpu_launch_ddr_broadcast_spm_dma_immediate(source + start * block,
-                                                elements, input_spm, 1);
-    } else {
-      // Reload the previous group at every tile boundary; pad only the sequence ends.
-      rpu_launch_fill_spm_kernel(input_spm, (n + 1) * 2 * block, c10::Half(0.0f), 1);
-      const int64_t begin = std::max<int64_t>(0, start - 1);
-      const int64_t end = std::min(count, start + n);
-      rpu_launch_ddr_broadcast_spm_dma_immediate(
-          source + begin * 2 * block, (end - begin) * 2 * block,
-          input_spm + (begin - start + 1) * 2 * block * sizeof(c10::Half), 1);
-      rpu_launch_slice_spm_kernel(input_spm + 2 * block * sizeof(c10::Half), head,
-                                  {n, 2 * block}, {n, block}, {0, 0}, 1);
-      rpu_launch_slice_spm_kernel(input_spm, tail,
-                                  {n, 2 * block}, {n, block}, {0, block}, 1);
-      rpu_launch_eltwise_binary_spm_kernel(head, tail, sum, elements,
-                                          ValuOpType::ADD, c10::Half(1.0f), 1);
-      result = sum;
-    }
-    if (bias.has_value()) {
-      rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
-          bias_spm, result, output_spm, n * stride, padded,
-          c10::Half(1.0f), ValuOpType::ADD, false, 1);
-      result = output_spm;
-    }
-    rpu_launch_spm_copy_ddr_dma_immediate(
-        result, output.data_ptr<c10::Half>() + start * block, elements);
+  for (int64_t batch = 0; batch < groups; batch += 8 * tile) {
+    const int64_t batch_end = std::min(groups, batch + 8 * tile);
+    tts_codec_submit_tile(projected, output, [&] {
+      if (batch == 0 && bias.has_value()) {
+        rpu_launch_ddr_broadcast_spm_dma(
+            const_cast<c10::Half*>(bias->data_ptr<c10::Half>()), padded, bias_spm, 1);
+      }
+      for (int64_t start = batch; start < batch_end; start += tile) {
+        const int64_t n = std::min(tile, batch_end - start), elements = n * block;
+        uint32_t result = input_spm;
+        if (direct) {
+          rpu_launch_ddr_broadcast_spm_dma(source + start * block,
+                                        elements, input_spm, 1);
+        } else {
+          // Reload the previous group at every tile boundary; pad only the sequence ends.
+          rpu_launch_fill_spm_kernel(input_spm, (n + 1) * 2 * block, c10::Half(0.0f), 1);
+          const int64_t begin = std::max<int64_t>(0, start - 1);
+          const int64_t end = std::min(count, start + n);
+          rpu_launch_ddr_broadcast_spm_dma(
+              source + begin * 2 * block, (end - begin) * 2 * block,
+              input_spm + (begin - start + 1) * 2 * block * sizeof(c10::Half), 1);
+          rpu_launch_slice_spm_kernel(input_spm + 2 * block * sizeof(c10::Half), head,
+                                      {n, 2 * block}, {n, block}, {0, 0}, 1);
+          rpu_launch_slice_spm_kernel(input_spm, tail,
+                                      {n, 2 * block}, {n, block}, {0, block}, 1);
+          rpu_launch_eltwise_binary_spm_kernel(head, tail, sum, elements,
+                                              ValuOpType::ADD, c10::Half(1.0f), 1);
+          result = sum;
+        }
+        if (bias.has_value()) {
+          rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
+              bias_spm, result, output_spm, n * stride, padded,
+              c10::Half(1.0f), ValuOpType::ADD, false, 1);
+          result = output_spm;
+        }
+        rpu_launch_spm_copy_ddr_dma(
+            result, output.data_ptr<c10::Half>() + start * block, elements);
+      }
+    });
   }
   return output;
 }

@@ -202,6 +202,11 @@ at::Tensor rpu_tts_codec_conv1d(
 at::Tensor rpu_tts_codec_conv_transpose1d_device_post(
     const at::Tensor& input, const at::Tensor& weight, const c10::optional<at::Tensor>& bias,
     int64_t channels, int64_t kernel, int64_t stride);
+at::Tensor rpu_tts_codec_decoder_stage(
+    const at::Tensor& input, const at::Tensor& snake_affine,
+    const at::Tensor& transpose_weight, const c10::optional<at::Tensor>& transpose_bias,
+    at::TensorList first_weights, at::TensorList affines,
+    at::TensorList second_weights, int64_t channels, int64_t kernel, int64_t stride);
 at::Tensor rpu_tts_codec_transpose_overlap(
     const at::Tensor& projected, const c10::optional<at::Tensor>& bias,
     int64_t channels, int64_t kernel, int64_t stride);
@@ -3343,6 +3348,16 @@ void rpu_causal_decoder_set_lm_head(
     int64_t exact_candidates = 0);
 void rpu_causal_decoder_set_tts_predictor_heads(int64_t handle, at::TensorList heads);
 at::Tensor rpu_causal_decoder_tts_predictor_logits(int64_t handle);
+void rpu_causal_decoder_set_tts_talker_head(int64_t handle, const at::Tensor& head);
+at::Tensor rpu_causal_decoder_tts_talker_logits(int64_t handle);
+class RpuGraphCache;
+struct GraphSignature;
+at::Tensor rpu_tts_predictor_generate(
+    int64_t handle, const at::Tensor& input, at::TensorList embeddings,
+    at::TensorList keys, at::TensorList values, RpuGraphCache& cache,
+    const GraphSignature& prefill_signature, const GraphSignature& decode_signature,
+    at::IntArrayRef prefill_descriptor, at::IntArrayRef decode_descriptor,
+    int64_t execution_len, const at::Tensor& progress);
 void rpu_causal_decoder_clear_lm_head(int64_t handle);
 void rpu_causal_decoder_set_rhinovla_high_precision_fusions(int64_t handle, bool enabled);
 void rpu_causal_decoder_set_rhinovla_high_precision(int64_t handle, bool enabled);

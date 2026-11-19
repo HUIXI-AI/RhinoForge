@@ -2905,6 +2905,14 @@ at::Tensor rpu_causal_decoder_tts_predictor_logits(int64_t handle) {
     return CausalDecoderRegistry::get(handle, "rpu_causal_decoder")->tts_predictor_logits();
 }
 
+void rpu_causal_decoder_set_tts_talker_head(int64_t handle, const at::Tensor& head) {
+    CausalDecoderRegistry::get(handle, "rpu_causal_decoder")->set_tts_talker_head(head);
+}
+
+at::Tensor rpu_causal_decoder_tts_talker_logits(int64_t handle) {
+    return CausalDecoderRegistry::get(handle, "rpu_causal_decoder")->tts_talker_logits();
+}
+
 void rpu_causal_decoder_clear_lm_head(int64_t handle) {
     CausalDecoderRegistry::get(handle, "rpu_causal_decoder")->clear_lm_head();
 }

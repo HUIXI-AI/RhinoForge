@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 from contextlib import nullcontext
+from functools import partial
 import operator
 import re
 from pathlib import Path
@@ -81,8 +82,17 @@ def _read_reference(path):
     return samples, rate
 
 
+def _sampled_talker_logits(hidden, token):
+    value = int(token.item())
+    if token.shape != (1, 1) or not ((0 <= value < 2048) or value == 2150):
+        raise RuntimeError("invalid TTS Talker sampled token")
+    logits = torch.full((*hidden.shape[:-1], 3072), -torch.inf, dtype=torch.float32)
+    logits[..., value] = 0
+    return logits
+
+
 def _predictor_generate(owner, inputs_embeds, *, max_new_tokens, do_sample,
-                        top_k=50, top_p=1.0, temperature=0.9, **kwargs):
+                        top_k=50, top_p=1.0, temperature=0.9, _rpu_state=None, **kwargs):
     # shortcut: only the frozen checkpoint's 15-step sampling recipe is supported.
     if (max_new_tokens != 15 or do_sample is not True
             or (top_k, top_p, temperature) != (50, 1.0, 0.9)
@@ -90,6 +100,10 @@ def _predictor_generate(owner, inputs_embeds, *, max_new_tokens, do_sample,
             or owner.generation_config.eos_token_id is not None
             or owner.generation_config.repetition_penalty not in (None, 1)):
         raise ValueError("TTS Predictor requires the fixed 15-step sampling profile")
+    if _rpu_state is not None:
+        result = _predictor_native(owner, inputs_embeds, *_rpu_state)
+        if result is not None:
+            return types.SimpleNamespace(sequences=result)
     from transformers.generation.logits_process import TemperatureLogitsWarper, TopKLogitsWarper
 
     warpers = (TemperatureLogitsWarper(temperature), TopKLogitsWarper(top_k))
@@ -108,6 +122,72 @@ def _predictor_generate(owner, inputs_embeds, *, max_new_tokens, do_sample,
         tokens.append(ids)
         cache = result.past_key_values
     return types.SimpleNamespace(sequences=torch.cat(tokens, dim=1))
+
+
+def _predictor_native(owner, inputs_embeds, part, head_calls):
+    from rpu_backend.graph import _runtime
+
+    native = getattr(_runtime._cpp_ext, "tts_predictor_generate", None)
+    if (native is None or not part.get("fused_heads") or
+            "native_prefill" not in part or type(owner.small_to_mtp_projection) is not torch.nn.Identity):
+        return None
+    signatures = (part["prefill_signature"], part["signature"])
+    for signature in (() if "experimental_group" in part else signatures):
+        graph = part["graph"].lookup(signature)
+        if graph is None or graph.state() != 2 or not graph.replayable():
+            return None
+        try:
+            part["graph"]._validate_ready_graph(graph, signature)
+        finally:
+            del graph
+    embeddings = owner.model.get_input_embeddings()
+    if len(embeddings) < 14 or any(type(x) is not torch.nn.Embedding or x.max_norm is not None
+                                  or x.padding_idx is not None for x in embeddings[:14]):
+        return None
+    cache = part["cache"]
+    import os
+    experiment_path = os.environ.get("RPU_TTS_SAMPLING_EXPERIMENT")
+    if "experimental_group" in part and (
+            os.environ.get("RPU_TTS_PREDICTOR_GROUP") != "1" or
+            experiment_path != part["experimental_group_asset"]):
+        raise RuntimeError("TTS group configuration changed; reload the model")
+    weights = [x.weight for x in embeddings[:14]]
+    if experiment_path:
+        if "experimental_embeddings" not in part:
+            if any(not torch.isfinite(x).all() or not torch.isfinite(x.half()).all() for x in weights):
+                raise ValueError("TTS experimental embedding exceeds FP16 range")
+            part["experimental_embeddings"] = [x.half().to(cache.k_caches[0].device) for x in weights]
+        weights = part["experimental_embeddings"]
+        if os.environ.get("RPU_TTS_PREDICTOR_GROUP") == "1":
+            if not part.get("experimental_group_enabled"):
+                raise RuntimeError("TTS group must be enabled before loading the model")
+            if "experimental_group" not in part:
+                part["experimental_group"] = _runtime._cpp_ext.TtsPredictorGroup(experiment_path)
+                part["experimental_group_asset"] = experiment_path
+            native = part["experimental_group"].generate
+    cache.reset_to_position(0)
+    progress = torch.zeros(4, dtype=torch.int64)
+    execution_len, descriptor = part["native_prefill"]
+    for key in ("head_hidden", "head_device", "head_logits", "head_index"):
+        part.pop(key, None)
+    try:
+        result = native(part["handle"], inputs_embeds, weights,
+            cache.k_caches, cache.v_caches, part["graph"]._impl,
+            signatures[0]._impl, signatures[1]._impl, descriptor, part["descriptor"],
+            execution_len, progress)
+        cache.update_position(16)
+        return result
+    except BaseException:
+        part["graph"]._execution_plans.clear()
+        cache.reset_to_position(0)
+        raise
+    finally:
+        calls, tokens, consumed, published = progress.tolist()
+        part["calls"] += calls
+        part["tokens"] += tokens
+        part["fused_head_calls"] += consumed
+        for index in range(published):
+            head_calls[index + 1] += 1
 
 
 def _tts_mlp_weight(weight, component, layer_index, path):
@@ -177,6 +257,7 @@ class Qwen3TTSModel:
         return model
 
     def _install_rpu(self):
+        import os
         from rpu_backend.graph import GraphCache, GraphSignature, GraphRuntimePolicy
         from rpu_backend.runtime.weights import transform_linear_weight
         from rpu_backend.runtime._native_retirement import _InstalledNativeResource
@@ -231,7 +312,9 @@ class Qwen3TTSModel:
             torch.ops.rpu.causal_decoder_set_weights(handle, *groups, cos, sin, norm, 16, 8, 128, 1024, 3072, 1e-6, True)
             torch.ops.rpu.causal_decoder_set_linear_acc32(handle, True)
             if name == "predictor":
-                torch.ops.rpu.causal_decoder_set_fast_replay(handle, True)
+                part["experimental_group_enabled"] = os.environ.get("RPU_TTS_PREDICTOR_GROUP") == "1"
+                # The existing prefill shortcut skips a whole single-forward Graph.
+                torch.ops.rpu.causal_decoder_set_fast_replay(handle, not part["experimental_group_enabled"])
             if name == "talker":
                 from rpu_backend.adapters.qwen3 import lookup_causal_decoder
 
@@ -261,8 +344,27 @@ class Qwen3TTSModel:
             self._head_weights.append(weight)
             self._restore.append((head, head.forward))
             part = self._components["talker" if index == 0 else "predictor"]
+            if index == 0:
+                torch.ops.rpu.causal_decoder_set_tts_talker_head(part["handle"], weight)
+                part["fused_talker_head"] = True
+                part["fused_head_calls"] = 0
+                descriptor = list(torch.ops.rpu.causal_decoder_resolve_decode_stage_descriptor(part["handle"]))
+                part["descriptor"] = descriptor
+                part["signature"] = GraphSignature(op_id="qwen3_tts_talker", shapes=[1, 1, 1024],
+                    dyn_dims=[part["handle"], *descriptor], dtypes=[torch.float16])
+                import os
+                talker_asset = os.environ.get("RPU_TTS_TALKER_SAMPLING_EXPERIMENT")
+                if talker_asset:
+                    from rpu_backend.graph import _runtime
+                    part["talker_sampler"] = _runtime._cpp_ext.TtsTalkerSampler(talker_asset)
+                    part["talker_sampler_asset"] = talker_asset
+                    part["talker_sampler_reference"] = weight
 
             def linear(owner, hidden, weight=weight, index=index, part=part):
+                token = part.pop("head_token", None) if index == 0 else None
+                if token is not None:
+                    calls[index] += 1
+                    return _sampled_talker_logits(hidden, token)
                 fused = _take_predictor_logits(part, hidden, index)
                 device_hidden = _take_head_input(part, hidden)
                 if fused is None:
@@ -287,9 +389,15 @@ class Qwen3TTSModel:
             part["descriptor"] = descriptor
             part["signature"] = GraphSignature(op_id="qwen3_tts_predictor", shapes=[1, 1, 1024],
                 dyn_dims=[part["handle"], *descriptor], dtypes=[torch.float16])
+            experiment_path = os.environ.get("RPU_TTS_SAMPLING_EXPERIMENT")
+            if part["experimental_group_enabled"] and experiment_path:
+                from rpu_backend.graph import _runtime
+                part["experimental_group"] = _runtime._cpp_ext.TtsPredictorGroup(experiment_path)
+                part["experimental_group_asset"] = experiment_path
         predictor = talker.code_predictor
         self._restore_generate = (predictor, predictor.generate)
-        predictor.generate = types.MethodType(_predictor_generate, predictor)
+        predictor.generate = types.MethodType(partial(_predictor_generate,
+            _rpu_state=(self._components["predictor"], self._head_calls)), predictor)
         self._restore_talker_generate = (talker, talker.generate)
         talker.generate = self._generate_talker
         from rpu_backend.adapters.qwen3_tts.codec import install_codec_activations, install_codec_convolutions
@@ -306,6 +414,29 @@ class Qwen3TTSModel:
                                             self._restore, self._codec_convolutions)
 
     def _generate_talker(self, *args, **kwargs):
+        import os
+        part = self._components.get("talker", {})
+        predictor = self._components.get("predictor", {})
+        experiment_path = os.environ.get("RPU_TTS_SAMPLING_EXPERIMENT")
+        if (predictor.get("experimental_group_enabled") and experiment_path and
+                "experimental_group" not in predictor):
+            from rpu_backend.graph import _runtime
+            predictor["experimental_group"] = _runtime._cpp_ext.TtsPredictorGroup(experiment_path)
+            predictor["experimental_group_asset"] = experiment_path
+        predictor_noise = None
+        sampler = part.get("talker_sampler")
+        if sampler is not None:
+            if os.environ.get("RPU_TTS_TALKER_SAMPLING_EXPERIMENT") != part["talker_sampler_asset"]:
+                raise RuntimeError("TTS Talker sampling configuration changed; reload the model")
+            reset = (sampler.reset_interleaved if "experimental_group" in predictor
+                     else sampler.reset)
+            predictor_noise = reset(part["generation_limit"], part["talker_sampler_reference"])
+        if "experimental_group" in predictor:
+            group = predictor["experimental_group"]
+            if predictor_noise is None:
+                group.reserve(part["generation_limit"], self._head_weights[1])
+            else:
+                group.reserve_noise(part["generation_limit"], self._head_weights[1], predictor_noise)
         result = self._restore_talker_generate[1](*args, **kwargs)
         ids = result.sequences
         eos = self._wrapper.model.config.talker_config.codec_eos_token_id
@@ -432,6 +563,9 @@ class Qwen3TTSModel:
                     "graph_invariant_ok": graph.cache_invariant_ok()}
                 if name == "predictor":
                     result["components"][name]["fused_head_calls"] = part.get("fused_head_calls", 0)
+                    if "experimental_group" in part:
+                        result["components"][name]["group_hw_submits_total"] = sum(
+                            e.hw_batch_submit_total for e in graph.snapshot())
             return result
         finally:
             self._lock.release()
@@ -450,6 +584,8 @@ class Qwen3TTSModel:
                 # Retire every captured queue before either component's weights.
                 for part in self._components.values():
                     part["graph"].clear()
+                    if "experimental_group" in part:
+                        part["experimental_group"].retire(part["graph"]._impl)
                 for part in reversed(list(self._components.values())):
                     part["resource"].retire()
                     part["handle"] = None
@@ -549,6 +685,7 @@ def _decoder_forward(part, hidden, cache, attention_mask, position_ids, cache_po
     part.pop("head_device", None)
     part.pop("head_logits", None)
     part.pop("head_index", None)
+    part.pop("head_token", None)
     if part.get("fused_heads", False) and not (
             (cache.position == 0 and count == 2) or
             (2 <= cache.position <= 15 and count == 1)):
@@ -582,12 +719,22 @@ def _decoder_forward(part, hidden, cache, attention_mask, position_ids, cache_po
             if execution_len > size:
                 half_input = torch.nn.functional.pad(half_input, (0, 0, 0, execution_len - size))
         device_input = half_input.to("rpu")
+        graph_logits = sampled_token = None
         with part["graph"].capture(signature):
             raw = torch.ops.rpu.causal_decoder_forward(part["handle"], device_input,
                 cache.k_caches, cache.v_caches, None, cache.position, True,
                 planned_stage_descriptor=descriptor)
+            if part.get("fused_talker_head"):
+                graph_logits = torch.ops.rpu.causal_decoder_tts_talker_logits(part["handle"])
+                if "talker_sampler" in part:
+                    part["talker_sampler"].sample(graph_logits)
+                    graph_logits = None
+        if "talker_sampler" in part:
+            sampled_token = part["talker_sampler"].result()
         if size > 1:
             part["prefill_signature"] = signature
+            if part.get("fused_heads", False):
+                part["native_prefill"] = (execution_len, descriptor)
         if head_only:
             physical_size = execution_len if size > 1 else size
             if raw.shape != (1, physical_size, 1024) or raw.dtype != torch.float16:
@@ -617,9 +764,15 @@ def _decoder_forward(part, hidden, cache, attention_mask, position_ids, cache_po
             part["head_index"] = cache.position - 1
         return BaseModelOutputWithPast(last_hidden_state=result, past_key_values=cache)
     result = torch.cat(chunks, dim=1)
-    if count == 1:
+    if count == 1 or sampled_token is not None:
         # The head immediately consumes this exact result before another decoder replay.
         part["head_hidden"], part["head_device"] = result, raw
+        if graph_logits is not None:
+            if graph_logits.shape != (1, 1, 3072) or graph_logits.dtype != torch.float16:
+                raise RuntimeError("invalid fused TTS Talker logits")
+            part["head_logits"], part["head_index"] = graph_logits, 0
+        elif sampled_token is not None:
+            part["head_token"] = sampled_token
     # The upstream speech wrapper consumes only the final normalized hidden state.
     return BaseModelOutputWithPast(last_hidden_state=result, past_key_values=cache,
         hidden_states=(result,) if output_hidden_states else None)

@@ -17,6 +17,8 @@ RPU 卷积路径仍为经过有限样本验证的实验性实现。
 ## 准备与运行
 
 按[语音指南](../../../docs/qwen3_audio.zh.md)安装 audio 依赖、匹配运行库、固定版本权重及准备后的源码。
+如需启用 Predictor/Talker RPU 采样，先按
+[采样资产说明](../../../docs/qwen3_tts_sampling_assets.zh.md)部署两个资产文件并设置环境变量。
 复制模板，填写 `checkpoint`、`source`（准备后的 `qwen_tts/` 目录）、`input.reference_audio`、
 `input.text` 和新的 `run.output_dir`，从仓库根目录执行：
 

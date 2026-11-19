@@ -68,6 +68,9 @@ set(RPU_GRAPH_SOURCES
 )
 
 set(RPU_OPS_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_tts_predictor.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_tts_predictor_group.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_tts_talker_sampler.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_gather.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_grouped_parallel_linear.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_moe_gather_mul.cpp"

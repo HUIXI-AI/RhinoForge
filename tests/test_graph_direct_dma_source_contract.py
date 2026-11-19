@@ -45,6 +45,9 @@ QUEUE_CACHE_GET_OWNERS = (
 )
 
 BATCH_LIFECYCLE_OWNERS: dict[tuple[str, str], Counter[str]] = {
+    ("src/ops/tts_sampling_experiment.h", "run"): Counter(
+        build_batch=1, enqueue_batch=1, discard_completed_batch=1
+    ),
     (
         "src/graph/graph_runtime_execute.cpp",
         "RpuKernelGraph::execute_ddr_copy",
@@ -92,10 +95,12 @@ ADD_BARRIER_OWNERS: dict[tuple[str, str], int] = {
 }
 
 RAW_QUEUE_SDK_TOKEN_INVENTORY: dict[str, Counter[str]] = {
+    "enqueue_batch": Counter({"src/ops/tts_sampling_experiment.h": 1}),
     "build_batch": Counter(
         {
             "src/graph/graph_runtime_execute.cpp": 2,
             "src/ops/rpu_memcpy.cpp": 1,
+            "src/ops/tts_sampling_experiment.h": 1,
         }
     ),
     "enqueu_batch": Counter(
@@ -108,11 +113,13 @@ RAW_QUEUE_SDK_TOKEN_INVENTORY: dict[str, Counter[str]] = {
         {
             "src/graph/graph_runtime_execute.cpp": 2,
             "src/ops/rpu_memcpy.cpp": 1,
+            "src/ops/tts_sampling_experiment.h": 1,
         }
     ),
     "add_dma_kernel": Counter(
         {
             "src/core/rpu_kernel_cache.h": 1,
+            "src/ops/tts_sampling_experiment.h": 1,
         }
     ),
     "add_dma_kernel_mutable": Counter(
@@ -307,9 +314,6 @@ IMMEDIATE_CALLERS: dict[tuple[str, str], Counter[str]] = {
     ("src/ops/rpu_eltwise_binary.cpp", "rpu_eltwise_bx1xc_test"): _c(
         broadcast=2, spm_copy=1
     ),
-    ("src/ops/rpu_eltwise_unary.cpp", "rpu_gelu_erf"): _c(
-        broadcast=1, spm_copy=1
-    ),
     ("src/ops/rpu_eltwise_unary.cpp", "rpu_launch_eltwise_unary_kernel"): _c(
         broadcast=1, spm_copy=1
     ),
@@ -347,12 +351,6 @@ IMMEDIATE_CALLERS: dict[tuple[str, str], Counter[str]] = {
     ),
     ("src/ops/rpu_l2norm.cpp", "rpu_l2norm_test"): _c(
         broadcast=1, spm_copy=1
-    ),
-    ("src/ops/rpu_linear.cpp", "tts_codec_im2col_rows"): _c(
-        broadcast=1, spm_copy=1
-    ),
-    ("src/ops/rpu_linear.cpp", "tts_codec_layernorm_rows"): _c(
-        broadcast=3, spm_copy=1
     ),
     ("src/ops/rpu_partial_mrope.cpp", "rpu_partial_mrope_test"): _c(
         broadcast=1, spm_copy=1, ddr_scatter=1, spm_scatter=1
@@ -414,7 +412,8 @@ def test_raw_queue_and_sdk_dma_surface_is_allowlisted() -> None:
         rf"(?<![A-Za-z0-9_])"
         rf"(?:(?:::)?(?:[A-Za-z_]\w*::)*)make_unique\s*<\s*"
         rf"{RAW_QUEUE_TYPE}\s*>\s*[\(\{{]",
-    ) == Counter({"src/graph/graph_runtime_execute.cpp": 3})
+    ) == Counter({"src/graph/graph_runtime_execute.cpp": 3,
+                  "src/ops/tts_sampling_experiment.h": 1})
     # Freeze direct temporary/heap type-initializers and named stack objects
     # separately.  The direct form intentionally sees the one allowed `new`
     # construction; any additional `Queue_t(...)` / `Queue_t{...}` temporary
@@ -540,6 +539,7 @@ def test_raw_queue_and_sdk_dma_surface_is_allowlisted() -> None:
     ) == Counter(
         {
             "src/core/rpu_kernel_cache.h": 1,
+            "src/ops/tts_sampling_experiment.h": 1,
         }
     )
     assert _count_by_file(
@@ -555,6 +555,7 @@ def test_raw_queue_and_sdk_dma_surface_is_allowlisted() -> None:
         {
             "src/graph/graph_runtime_execute.cpp": 2,
             "src/ops/rpu_memcpy.cpp": 1,
+            "src/ops/tts_sampling_experiment.h": 1,
         }
     )
     assert _count_by_file(
@@ -571,12 +572,13 @@ def test_raw_queue_and_sdk_dma_surface_is_allowlisted() -> None:
         {
             "src/graph/graph_runtime_execute.cpp": 2,
             "src/ops/rpu_memcpy.cpp": 1,
+            "src/ops/tts_sampling_experiment.h": 1,
         }
     )
 
     batch_lifecycle = re.compile(
         r"(?:->|\.)\s*"
-        r"(?P<method>build_batch|enqueu_batch|discard_completed_batch)\s*\("
+        r"(?P<method>build_batch|enqueu_batch|enqueue_batch|discard_completed_batch)\s*\("
     )
     batch_spans: dict[str, list[tuple[str, int, int]]] = {}
     for (path, function), expected in BATCH_LIFECYCLE_OWNERS.items():
@@ -797,7 +799,8 @@ def test_direct_dma_guards_precede_every_side_effect() -> None:
     gelu_body = unary[begin:end]
     cold_guard = re.search(r"TORCH_CHECK\s*\(\s*!graph_dma::active\(\)", gelu_body)
     assert cold_guard is not None
-    for effect in ("at::empty(", "SPM_ALLOC.init()", "SPM_ALLOC.alloc_temporary(", BROADCAST, SPM_COPY):
+    for effect in ("at::empty(", "SPM_ALLOC.init()", "SPM_ALLOC.alloc_temporary(",
+                   "rpu_launch_ddr_broadcast_spm_dma(", "rpu_launch_spm_copy_ddr_dma("):
         assert cold_guard.start() < gelu_body.index(effect)
 
     _, begin, end = _function_span(execute, "RpuKernelGraph::execute_data_node")
@@ -938,8 +941,8 @@ def test_immediate_dma_call_inventory_is_exact() -> None:
             +expected_bare
         ), api
 
-    assert sum(actual.values()) == 84
-    assert len(IMMEDIATE_CALLERS) == 39
+    assert sum(actual.values()) == 76
+    assert len(IMMEDIATE_CALLERS) == 36
     assert Counter(
         {
             api: sum(
@@ -951,8 +954,8 @@ def test_immediate_dma_call_inventory_is_exact() -> None:
         }
         ) == Counter(
         {
-            BROADCAST: 35,
-            SPM_COPY: 32,
+            BROADCAST: 30,
+            SPM_COPY: 29,
             BYTE_COPY: 2,
             DDR_SCATTER: 9,
             SPM_SCATTER: 6,

@@ -9,6 +9,7 @@
 // Cache keys, resource descriptors, SPM pools, and HostCallback tiering live in
 // graph_infra.h so runtime depends on infra, not the other way around.
 #pragma once
+#include <deque>
 
 #include "rpu_ops.h"  // KernelId, KernelCache, QueueCache, g_rpu_ddr_flush_enabled 等
 #include "graph/execution_coordinator.h"
@@ -1439,6 +1440,13 @@ public:
     //   REPLAYING   : cursor 前向扫下一个 Kernel node,校验 kernel_name 一致
     // 调用者:Op 侧把原先的 KernelCache::instance().get_kernel(name) 换成这个入口。
     ::rhino_lkn::Kernel_t* get_kernel_reset(const std::string& name);
+    // The caller retains this immutable Program until Graph retirement.
+    ::rhino_lkn::Kernel_t* get_kernel_reset(
+        const std::string& name, ::rhino_lkn::Program_t& program);
+
+    // Caller retains these stable slots until the captured queue is retired.
+    void snapshot_legacy_dma_bases(const GraphOpStreamStamp& begin,
+                                   std::deque<uint64_t>& slots);
 
     // Typed DDR-register census.  The outer subsystem opens exactly one scope
     // at Graph cursor/node zero.  BUILD records an exact ordered census;
@@ -1839,7 +1847,8 @@ private:
     // REPLAYING 返回已录制 kernel。调用者需自行调用 reset_regs()。
     ::rhino_lkn::Kernel_t* get_kernel(KernelId id);
     // Dynamic 版本,语义同上;set pending_kernel_name_ 代替 pending_kernel_id_。
-    ::rhino_lkn::Kernel_t* get_kernel(const std::string& name);
+    ::rhino_lkn::Kernel_t* get_kernel(const std::string& name,
+                                     ::rhino_lkn::Program_t* program = nullptr);
 
     const GraphKernelRegisterRule& kernel_register_rule_for(
         KernelId id) const;

@@ -5,6 +5,11 @@ import subprocess
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
+LINEAR_BRIDGE = r'''
+Tensor tts_codec_linear_rows(const Tensor&x,const Tensor&w,const c10::optional<Tensor>&b){
+ return rpu_linear_with_accumulation(x,w,b,1,8,true,c10::nullopt);
+}
+'''
 
 
 def test_transpose_device_post_boundary_and_owned_output(tmp_path):
@@ -13,7 +18,7 @@ def test_transpose_device_post_boundary_and_owned_output(tmp_path):
         "Tensor tts_codec_cpu_nct_to_device_rows(", 1)[1].split("Tensor tts_codec_im2col_rows(", 1)[0]
     function = "Tensor rpu_tts_codec_conv_transpose1d_device_post(" + source.split(
         "Tensor rpu_tts_codec_conv_transpose1d_device_post(", 1)[1].split(
-        "Tensor rpu_tts_codec_transpose_overlap(", 1)[0]
+        "Tensor rpu_tts_codec_decoder_stage(", 1)[0]
     harness = r'''
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
@@ -62,7 +67,72 @@ int main(){
 }
 '''
     cpp, exe = tmp_path / "post.cpp", tmp_path / "post"
-    cpp.write_text(harness + helpers + function + cases)
+    cpp.write_text(harness + LINEAR_BRIDGE + helpers + function + cases)
+    root = Path(torch.__file__).resolve().parent
+    subprocess.run(["g++", "-std=c++17", "-O0",
+        f"-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}",
+        "-I", str(root / "include"), str(cpp), "-L", str(root / "lib"),
+        "-ltorch_cpu", "-lc10", f"-Wl,-rpath,{root / 'lib'}", "-o", str(exe)], check=True)
+    subprocess.run([str(exe)], check=True)
+
+
+def test_decoder_stage_has_one_host_boundary_and_three_residuals(tmp_path):
+    source = (ROOT / "src/ops/rpu_linear.cpp").read_text()
+    function = "Tensor rpu_tts_codec_decoder_stage(" + source.split(
+        "Tensor rpu_tts_codec_decoder_stage(", 1)[1].split(
+        "Tensor rpu_tts_codec_transpose_overlap(", 1)[0]
+    harness = r'''
+#include <ATen/ATen.h>
+#include <cassert>
+using at::Tensor;
+int uploads=0,downloads=0,snakes=0,linears=0,overlaps=0,residuals=0;
+int64_t CeilDiv(int64_t x,int64_t y){return (x+y-1)/y;}
+struct RpuKernelGraph{static inline bool active=false;static bool has_active(){return active;}};
+void check_tts_codec_device_half(const Tensor&t,c10::IntArrayRef shape,const char*){
+ TORCH_CHECK(t.scalar_type()==at::kHalf&&t.is_contiguous()&&t.sizes().equals(shape));
+}
+Tensor tts_codec_cpu_nct_to_device_rows(const Tensor&x,const Tensor&,int64_t=0){
+ ++uploads;return x.squeeze(0).t().to(at::kHalf).contiguous();
+}
+Tensor tts_codec_device_rows_to_cpu_nct(const Tensor&x){
+ ++downloads;return x.t().unsqueeze(0).to(at::kFloat).contiguous();
+}
+Tensor tts_codec_snake_rows(const Tensor&x,const Tensor&,const Tensor&){++snakes;return x+1;}
+Tensor tts_codec_linear_rows(const Tensor&x,const Tensor&w,const c10::optional<Tensor>&){
+ ++linears;return at::zeros({x.size(0),w.size(0)},x.options());
+}
+Tensor rpu_tts_codec_transpose_overlap(const Tensor&x,const c10::optional<Tensor>&,
+ int64_t c,int64_t,int64_t s){++overlaps;return at::zeros({(x.size(0)+1)*s,CeilDiv(c,128)*128},x.options());}
+Tensor tts_codec_residual_unit_impl(const Tensor&x,const Tensor&,const Tensor&,const Tensor&,
+ int64_t d,int64_t c,bool complete,bool resident,bool padded){
+ int step=residuals%3;assert(complete&&resident&&padded&&c==96&&d==(step==0?1:step==1?3:9));
+ ++residuals;return x+d;
+}
+'''
+    cases = r'''
+int main(){
+ auto x=at::randn({1,192,3}),saved=x.clone();
+ auto snake=at::ones({2,256},at::kHalf),tw=at::zeros({6*128,192},at::kHalf);
+ auto bias=at::zeros({128},at::kHalf),w=at::zeros({128,128},at::kHalf);
+ std::vector<Tensor> first(3,w),affine(3,at::zeros({6,128},at::kHalf)),second(3,w);
+ auto y=rpu_tts_codec_decoder_stage(x,snake,tw,bias,first,affine,second,96,6,3);
+ assert(y.sizes().equals({1,96,12})&&uploads==1&&downloads==1&&snakes==1&&
+        linears==1&&overlaps==1&&residuals==3&&at::equal(x,saved));
+ auto held=y.clone();rpu_tts_codec_decoder_stage(x+1,snake,tw,bias,first,affine,second,96,6,3);
+ assert(at::equal(y,held));
+ int before=uploads;bool rejected=false;try{
+  std::vector<Tensor> short_list(2,w);
+  rpu_tts_codec_decoder_stage(x,snake,tw,bias,short_list,affine,second,96,6,3);
+ }catch(const c10::Error&){rejected=true;}assert(rejected&&uploads==before);
+ rejected=false;try{rpu_tts_codec_decoder_stage(x,snake,tw,bias,first,affine,second,192,6,3);}
+ catch(const c10::Error&){rejected=true;}assert(rejected&&uploads==before);
+ RpuKernelGraph::active=true;rejected=false;
+ try{rpu_tts_codec_decoder_stage(x,snake,tw,bias,first,affine,second,96,6,3);}
+ catch(const c10::Error&){rejected=true;}assert(rejected&&uploads==before);
+}
+'''
+    cpp, exe = tmp_path / "stage.cpp", tmp_path / "stage"
+    cpp.write_text(harness + function + cases)
     root = Path(torch.__file__).resolve().parent
     subprocess.run(["g++", "-std=c++17", "-O0",
         f"-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}",
@@ -179,7 +249,7 @@ int main(){
 }
 '''
     cpp, exe = tmp_path / "residual.cpp", tmp_path / "residual"
-    cpp.write_text(harness + upload + function + cases)
+    cpp.write_text(harness + LINEAR_BRIDGE + upload + function + cases)
     torch_root = Path(torch.__file__).resolve().parent
     subprocess.run([
         "g++", "-std=c++17", "-O0",
@@ -255,7 +325,7 @@ int main(){
 }
 '''
     cpp, exe = tmp_path / "codec.cpp", tmp_path / "codec"
-    cpp.write_text(harness + function + cases)
+    cpp.write_text(harness + LINEAR_BRIDGE + function + cases)
     torch_root = Path(torch.__file__).resolve().parent
     subprocess.run([
         "g++", "-std=c++17", "-O0", "-include", "ATen/Parallel.h",
@@ -324,7 +394,7 @@ int main(){
 }
 '''
     cpp, exe = tmp_path / "pair.cpp", tmp_path / "pair"
-    cpp.write_text(harness + function + cases)
+    cpp.write_text(harness + LINEAR_BRIDGE + function + cases)
     torch_root = Path(torch.__file__).resolve().parent
     subprocess.run([
         "g++", "-std=c++17", "-O0",
@@ -392,7 +462,7 @@ int main(){
 }
 '''
     cpp, exe = tmp_path / "transpose.cpp", tmp_path / "transpose"
-    cpp.write_text(harness + function + cases)
+    cpp.write_text(harness + LINEAR_BRIDGE + function + cases)
     torch_root = Path(torch.__file__).resolve().parent
     subprocess.run([
         "g++", "-std=c++17", "-O0",

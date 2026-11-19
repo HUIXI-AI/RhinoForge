@@ -25,6 +25,9 @@ just the next function call.
   view does not need another cache flush. An device-to-device copy implemented with
   host `memcpy` still has both CPU read and write boundaries. See the
   [cache controls](../../docs/runtime_config.md#memory-and-coherency-controls).
+- A row-partition projection that repacks device output with host `memcpy` must
+  acquire the logical source range through the CPU-boundary flush. The optional
+  intra-device flush is insufficient because production may disable it.
 - RhinoVLA's unrolled action path uploads its cold condition table once and
   publishes the four live CPU request fields through one packed buffer per
   forward. Every field is refreshed, including in-place mask changes. An owned

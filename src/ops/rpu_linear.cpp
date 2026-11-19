@@ -3540,9 +3540,10 @@ void rpu_launch_linear_ddr_kernel(const at::Tensor &input, const at::Tensor &wei
   }
 
   // Col input and fixed bias are published by their DDR->SPM wrappers in
-  // eager and Graph paths. Row repacking and its host bias addition still
-  // need publication here; mutable col bias was published before its DMA.
-  if (partition == 0) rpu_ddr_flush(xp);
+  // eager and Graph paths. Row repacking reads a device-produced input on the
+  // CPU, so acquire the logical range before memcpy even when the optional
+  // intra-device flush is disabled. Mutable col bias was published before DMA.
+  if (partition == 0) rpu_ddr_flush_force_sized(xp, input.nbytes());
   rpu_ddr_flush(wp);
   if (has_bias && partition == 0) rpu_ddr_flush(bp);
 

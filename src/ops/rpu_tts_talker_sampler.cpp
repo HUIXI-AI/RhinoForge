@@ -1,9 +1,9 @@
 #include "tts_talker_sampler.h"
 #include "core/rpu_spm_allocator.h"
 #include "graph/graph_runtime.h"
+#include "tts_sampling_assets.h"
 #include <rhino_launch_program.h>
 #include <array>
-#include <fstream>
 
 namespace {
 constexpr int kVocab = 3072;
@@ -19,13 +19,6 @@ constexpr uint32_t kOneHot = 0x1a4000, kMerged = 0x1a6000, kAllocation = 0x1a800
 
 void check(int status) {
     TORCH_CHECK(status == 0, "TTS Talker sampling Launch status ", status);
-}
-
-void read_exact(const std::string& path, void* dst, size_t size) {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    TORCH_CHECK(file && size_t(file.tellg()) == size, "TTS Talker sampling fixture size: ", path);
-    file.seekg(0);
-    TORCH_CHECK(bool(file.read(static_cast<char*>(dst), size)), "TTS Talker sampling fixture read");
 }
 
 struct TensorBuffer {
@@ -62,11 +55,11 @@ struct TtsTalkerSampler::Impl {
         "binary_sameshape", "argmax_reduceC_tileN", "one_hot_last_dim", "binary_sameshape"};
 
     explicit Impl(const std::string& path) {
-        read_exact(path + "/talker_params.bin", params, sizeof(params));
-        read_exact(path + "/talker_scm.bin", scm, sizeof(scm));
+        tts_sampling_assets::read(path, tts_sampling_assets::TableSet::Talker,
+                                  params, sizeof(params), scm, sizeof(scm));
         for (int i = 0; i < 20; ++i)
             check(programs[i].create_with_binary_file(
-                (path + "/tts_talker_sampling_experiment.ref").c_str(), names[i]));
+                (path + "/tts_sampling_unified.ref").c_str(), names[i]));
     }
 };
 

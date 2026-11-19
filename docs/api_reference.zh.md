@@ -555,6 +555,12 @@ DMA 校验。切换配置或外部清理缓存后须重新加载模型。`execut
 `group_hw_submits_total` 是累计硬件提交数，应取请求前后差值。关闭时先清图，再释放组持有的
 Program 和缓冲区。默认执行路径不变。
 
+Predictor 与 Talker 使用同一个采样资产目录；将
+`RPU_TTS_SAMPLING_EXPERIMENT` 和 `RPU_TTS_TALKER_SAMPLING_EXPERIMENT`
+都指向该目录。完整交付仅包含 `tts_sampling_unified.ref` 和
+`tts_sampling_tables.bin` 两个文件；后者通过版本头分隔 Predictor 与 Talker
+参数区。构造采样器时会拒绝缺失、截断或结构版本不匹配的文件。
+
 每个新序列重置逻辑 KV 位置并保留私有存储。TTS 按解码后的音频内容只缓存最新
 speaker embedding，每次请求仍读取和校验参考文件。输出存储独立于重放；释放时
 先清 Graph，再释放 native handle 和权重。Predictor 的最后一行设备 hidden 只借给

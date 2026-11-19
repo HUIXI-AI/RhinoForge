@@ -56,6 +56,10 @@ python -m pip check
 `audio` 包含 TorchAudio、ONNX Runtime 和 python-sox，以满足上游导入链；当前 12Hz
 路径不调用 SoX 可执行文件，未安装该程序时可能收到上游警告。
 
+启用 Predictor/Talker RPU 采样时，按照
+[Qwen3-TTS RPU 采样资产使用说明](qwen3_tts_sampling_assets.zh.md)部署统一的两个资产文件，
+并在加载模型前设置对应环境变量。
+
 ## 2. 下载权重并准备 TTS 源码
 
 ```bash

@@ -676,6 +676,13 @@ reports Predictor `group_hw_submits_total`; use before/after differences, not th
 cumulative value, to count submissions for a request. Clear Graphs before retiring
 the group-owned Programs and buffers. The default execution path is unchanged.
 
+The matching Predictor and Talker sampling asset directories are the same directory.
+Set both `RPU_TTS_SAMPLING_EXPERIMENT` and
+`RPU_TTS_TALKER_SAMPLING_EXPERIMENT` to it. The complete sampling delivery contains
+only `tts_sampling_unified.ref` and `tts_sampling_tables.bin`; the latter has a
+versioned header and separate Predictor and Talker parameter sections. Missing,
+truncated or schema-mismatched files are rejected while the sampler is constructed.
+
 Each sequence resets logical KV position while retaining private storage. TTS
 caches only the latest reference speaker embedding by decoded audio content;
 every request still reads and validates the file. Output storage is independent

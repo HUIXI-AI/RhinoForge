@@ -1,10 +1,10 @@
 #pragma once
 #include "core/rpu_spm_allocator.h"
+#include "tts_sampling_assets.h"
 #include <rhino_launch_queue.h>
 #include <rhino_launch_program.h>
 #include <array>
 #include <cstring>
-#include <fstream>
 
 static at::Tensor tts_sampling_checked_result(const at::Tensor& valid, const at::Tensor& ids) {
     TORCH_CHECK(valid.device().is_cpu() && valid.scalar_type() == at::kHalf &&
@@ -53,12 +53,6 @@ class TtsSamplingExperiment {
         "binary_scalar", "topk_by_kvsort_fp16", "binary_Nx1_NxC_v16_batch",
         "where_sameshape", "softmax_c16_gauto", "binary_sameshape", "argmax_reduceC_tileN", "gather_scalar"};
     static void check(int status) { TORCH_CHECK(status == 0, "TTS sampling Launch status ", status); }
-    static void read(const std::string& path, void* dst, size_t size) {
-        std::ifstream file(path, std::ios::binary | std::ios::ate);
-        TORCH_CHECK(file && size_t(file.tellg()) == size, "TTS sampling fixture size: ", path);
-        file.seekg(0);
-        TORCH_CHECK(bool(file.read(static_cast<char*>(dst), size)), "TTS sampling fixture read");
-    }
     struct TensorBuffer { rhino_lkn::HostDDR_t* root; size_t offset; };
     static TensorBuffer buffer(const at::Tensor& tensor) {
         TORCH_CHECK(tensor.is_contiguous(), "TTS sampling requires contiguous storage");
@@ -86,10 +80,10 @@ public:
         }
     }
     explicit TtsSamplingExperiment(const std::string& path) {
-        read(path + "/params.bin", params_, sizeof(params_));
-        read(path + "/scm.bin", scm_, sizeof(scm_));
+        tts_sampling_assets::read(path, tts_sampling_assets::TableSet::Predictor,
+                                  params_, sizeof(params_), scm_, sizeof(scm_));
         for (int i = 0; i < 14; ++i) {
-            check(programs_[i].create_with_binary_file((path + "/tts_sampling_experiment.ref").c_str(), names_[i]));
+            check(programs_[i].create_with_binary_file((path + "/tts_sampling_unified.ref").c_str(), names_[i]));
             auto k = std::make_unique<Kernel>(programs_[i], names_[i]);
             for (uint32_t j = 0; j < 68; ++j) check(k->set_regs(j, params_[i][j]));
             for (uint32_t j = 0; j < 256; j += 2)

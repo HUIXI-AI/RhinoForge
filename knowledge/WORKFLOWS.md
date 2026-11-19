@@ -214,7 +214,10 @@ Start with the [Qwen3 speech guide](../docs/qwen3_audio.md) and retain these con
   every step's validity flags, and reject the group on readback before returning
   tokens. Verify NaN/Inf and both envelope endpoints on the target operator assets;
   do not assume device comparison semantics match CPU. This removes per-step
-  logits readback, not the remaining decoder/sampler submissions.
+  logits readback, not the remaining decoder/sampler submissions. Predictor and
+  Talker load their kernels from `tts_sampling_unified.ref` and their separately
+  sized table sections from the versioned `tts_sampling_tables.bin`; point both
+  sampling asset environment variables at that same two-file directory.
 - The optional TTS Predictor group path records decoder, sampler and embedding
   directly into 8-step and 7-step Graphs under the existing batch budget. Retire
   the old two step Graphs first; keep Programs, per-invocation mutable DMA slots

@@ -53,9 +53,28 @@ LightNav 上游源码和模型权重。
 
 ## W8A16 权重转换
 
-先在 FP16 CPU 模型上采集 Text 36 层、7 类投影的输入激活二阶矩。当前校准使用客户
+先在原始未量化 CPU 模型（按 LightNav 上游加载口径为 BF16）上采集 Text 36 层、7 类
+投影的输入激活二阶矩。当前校准使用客户
 35 帧序列中的第 9、14、19、24、29、34 帧完整窗口，并按 FP16 的 5 个输出 token
-执行 teacher forcing。统计文件必须恰好包含 252 个 `float32` 向量。
+执行 teacher forcing。这里的帧号从 0 开始。统计文件必须恰好包含 252 个 `float32`
+向量。
+
+先用原始 FP16 checkpoint 按[运行真实图片序列](#运行真实图片序列)生成推理结果，再采集统计：
+
+```bash
+python examples/lightnav_collect_activation_stats.py \
+  --input /path/to/dataset.json \
+  --images-dir /path/to/images \
+  --teacher-output /path/to/fp16_result.json \
+  --checkpoint /path/to/LightNav-0 \
+  --lightnav-source /path/to/LightNav-0-source \
+  --history-frames 9 \
+  --frame-indices 9,14,19,24,29,34 \
+  --output /outside/the/repository/lightnav_activation_moments.safetensors
+```
+
+`--teacher-output` 必须是同一图片序列的 FP16 推理结果，每个指定帧必须恰好有 5 个
+token。统计文件是外部模型资产，仓库的 `*.safetensors` 规则会忽略它；不要强制加入 Git。
 
 从原始 FP16 checkpoint 生成全 Text W8 + Vision W8 配置：
 

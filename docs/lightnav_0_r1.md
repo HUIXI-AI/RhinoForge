@@ -61,10 +61,32 @@ processor/tokenizer files, and `action_tokenizer/`.
 ## W8A16 conversion
 
 Collect input-activation second moments for all seven projection types in all
-36 Text layers on the FP16 CPU model. The current calibration uses full windows
-at frames 9, 14, 19, 24, 29, and 34 of the customer sequence, with FP16's five
-tokens teacher-forced. The statistics file must contain exactly 252 float32
-vectors.
+36 Text layers on the original unquantized CPU model (BF16, matching the
+upstream LightNav loader). The current calibration uses full windows at frames
+9, 14, 19, 24, 29, and 34 of the customer sequence, with all five FP16 output
+tokens teacher-forced. Frame indices are zero-based. The statistics file must
+contain exactly 252 float32 vectors.
+
+First produce the FP16 result with the original checkpoint as described in
+[Run an ordered image sequence](#run-an-ordered-image-sequence), then collect
+the statistics:
+
+```bash
+python examples/lightnav_collect_activation_stats.py \
+  --input /path/to/dataset.json \
+  --images-dir /path/to/images \
+  --teacher-output /path/to/fp16_result.json \
+  --checkpoint /path/to/LightNav-0 \
+  --lightnav-source /path/to/LightNav-0-source \
+  --history-frames 9 \
+  --frame-indices 9,14,19,24,29,34 \
+  --output /outside/the/repository/lightnav_activation_moments.safetensors
+```
+
+`--teacher-output` must be the FP16 inference result for the same image sequence,
+with exactly five tokens for every selected frame. The statistics file is an
+external model asset covered by the repository's `*.safetensors` ignore rule;
+do not force-add it to Git.
 
 Create the full Text-W8 + Vision-W8 checkpoint from the original FP16 checkpoint:
 

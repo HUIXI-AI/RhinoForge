@@ -26,6 +26,7 @@
 #include "rpu_kernel_decls.h"    // rpu_launch_*, PreparedMask, sdpa_prepare_mask, sdpa_dma_mask_to_spm
 #include "rpu_profile.h"         // g_rpu_debug_level / log_at, rpu_ddr_flush
 #include "rpu_helpers.h"         // ValuOpType
+#include "rpu_runtime_state.h"   // rpu_concurrent_safe_spm_enabled
 #include "rhino_launch_buffer.h" // RpuGetDevAddr (mutable-DMA live addr)
 #include "graph/graph_runtime.h" // RpuKernelGraph (keep_alive, has_active)
 
@@ -8571,11 +8572,16 @@ void FusedModelBase::run_preload_callbacks_(
     // skips the cursor advance, so the next op-emitted DMA lands on a preload
     // node and trips "DMA variant drift" (Fixed vs MutableSrc) at cursor N.
     const bool inside_graph = graph_dma::active();
+    bool concurrent_safe_spm = false;
+#ifdef RPU_RUNTIME_STATE_H_INCLUDED
+    concurrent_safe_spm = rpu_concurrent_safe_spm_enabled();
+#endif
 
     // A COMPLETE immediate invocation must execute its declared preload routes
     // itself: it cannot inherit a prior Graph's consumption receipt.
     // Legacy PASSTHROUGH may reuse clean Persistent data as before.
     if (!inside_graph
+        && !concurrent_safe_spm
         && !pimpl_->ctx_.has_complete_physical_manifest()
         && pimpl_->cached_preload_gen_ == SPM_ALLOC.persistent_generation()
         && !pimpl_->preload_callbacks_dirty_) {
@@ -8665,6 +8671,9 @@ void FusedModelBase::run_preload_callbacks_(
     for (const auto& d : decls) {
         if (!d.preload_callback) continue;
         if (!pimpl_->resident_preload_priming_ && resident_preloads_enabled() &&
+#ifdef RPU_RUNTIME_STATE_H_INCLUDED
+            !rpu_concurrent_safe_spm_enabled() &&
+#endif
             std::binary_search(pimpl_->resident_preload_names_.begin(),
                                pimpl_->resident_preload_names_.end(), std::string(d.name))) {
             validate_resident_preloads_();
@@ -15792,7 +15801,11 @@ at::Tensor FusedModelBase::run_all_layers_impl(
         : planned_stage_candidate->physical_manifest;
     const bool transferred_external_physical_manifest =
         pimpl_->ctx_.bind_physical_manifest(physical_manifest, prepared_candidate);
-    if (resident_preloads_enabled()) {
+    bool concurrent_safe_spm_preloads = false;
+#ifdef RPU_RUNTIME_STATE_H_INCLUDED
+    concurrent_safe_spm_preloads = rpu_concurrent_safe_spm_enabled();
+#endif
+    if (resident_preloads_enabled() && !concurrent_safe_spm_preloads) {
         TORCH_CHECK(pimpl_->ctx_.has_complete_physical_manifest(),
                     "resident preload reuse requires a COMPLETE live physical manifest");
         // These exact routes ran in this owner's successful cold initializer.
@@ -16412,12 +16425,27 @@ at::Tensor FusedModelBase::run_all_layers_impl(
         RpuKernelGraph::active().state() == RpuKernelGraph::State::REPLAYING;
     const bool composite_preload_follower =
         consume_spm_pipeline_composite_preload_follower();
+    bool concurrent_safe_spm = false;
+#ifdef RPU_RUNTIME_STATE_H_INCLUDED
+    concurrent_safe_spm = rpu_concurrent_safe_spm_enabled();
+#endif
     const bool skip_clean_preload_callbacks_recording =
+        !concurrent_safe_spm &&
         static_cfg.clean_recording_skip_preload_callbacks &&
         RpuKernelGraph::has_active() &&
         RpuKernelGraph::active().state() == RpuKernelGraph::State::RECORDING &&
         pimpl_->cached_preload_gen_ == SPM_ALLOC.persistent_generation() &&
         !pimpl_->preload_callbacks_dirty_;
+#ifdef RPU_RUNTIME_STATE_H_INCLUDED
+    const bool track_concurrent_preload_prologue =
+        !build_trace_run && concurrent_safe_spm &&
+        RpuKernelGraph::has_active() &&
+        RpuKernelGraph::active().state() == RpuKernelGraph::State::RECORDING;
+    const size_t concurrent_preload_prologue_begin =
+        track_concurrent_preload_prologue
+        ? RpuKernelGraph::active().recorded_node_count()
+        : 0;
+#endif
     if (!checked_body_replay && !deep_full_skip && !skip_preload_callbacks_replay &&
         !composite_preload_follower &&
         !skip_clean_preload_callbacks_recording)
@@ -16502,6 +16530,13 @@ at::Tensor FusedModelBase::run_all_layers_impl(
         std::invoke(static_cfg.preload_fn, *this);
         pimpl_->weights_dirty_ = false;
     }
+#ifdef RPU_RUNTIME_STATE_H_INCLUDED
+    if (track_concurrent_preload_prologue) {
+        RpuKernelGraph::active().mark_segment_preload_prologue(
+            concurrent_preload_prologue_begin,
+            RpuKernelGraph::active().recorded_node_count());
+    }
+#endif
     if (C10_UNLIKELY(build_trace_run)) {
         auto& candidate = pimpl_->pipeline_build_trace_;
         TORCH_INTERNAL_ASSERT(candidate.profile != nullptr &&
@@ -16595,8 +16630,23 @@ at::Tensor FusedModelBase::run_all_layers_impl(
     // 11.5 pre_layers_fn (EXT-Pi05) — once per body iteration, BEFORE the
     // layer loop. It emits into the caller-owned graph scope when one is
     // active. Subclass bodies must not open a raw or nested graph scope.
+    bool pre_layers_untracked_temp = false;
     if (static_cfg.pre_layers_fn != nullptr) {
+#ifdef RPU_RUNTIME_STATE_H_INCLUDED
+        const size_t pre_begin = RpuKernelGraph::has_active()
+            ? RpuKernelGraph::active().recorded_node_count()
+            : 0;
+#endif
         std::invoke(static_cfg.pre_layers_fn, *this);
+#ifdef RPU_RUNTIME_STATE_H_INCLUDED
+        if (RpuKernelGraph::has_active() &&
+            RpuKernelGraph::active().state() == RpuKernelGraph::State::RECORDING) {
+            const size_t pre_end = RpuKernelGraph::active().recorded_node_count();
+            pre_layers_untracked_temp =
+                (pre_end > pre_begin) &&
+                !RpuKernelGraph::active().has_preload_prologue_covering(pre_begin, pre_end);
+        }
+#endif
     }
 
     // 12. main compute — for-each-layer-group
@@ -16606,9 +16656,35 @@ at::Tensor FusedModelBase::run_all_layers_impl(
     // op 内部 wq->enqueu_kernel 走 RpuQueue proxy(无 graph scope 立即发射,
     // 有 scope 则进 RECORDING/REPLAYING)。Python 端 with cache.capture(sig)
     // 由 P5.5 提供。
+    int prev_split_layer = -1;
     for_each_fmb_execution_step(
         execution_spec, static_cast<uint32_t>(body_it),
         [&](const FmbExecutionStepView& step) {
+#ifdef RPU_RUNTIME_STATE_H_INCLUDED
+            const bool is_layer_entry_step = (step.layer != prev_split_layer);
+            prev_split_layer = step.layer;
+            const bool next_reads_spm = step.updates_io_context
+                ? step.input_in_spm
+                : pimpl_->ctx_.input_in_spm;
+            const bool sequential_independent_chunks =
+                execution_spec.chunk_mode == ChunkMode::SEQUENTIAL &&
+                !execution_spec.has_kv_first &&
+                !execution_spec.chunk_outer_within_group &&
+                execution_spec.inter_layer_io == InterLayerIO::DDR_PINGPONG;
+            const bool has_untracked_cross_layer_temp =
+                pre_layers_untracked_temp ||
+                (layout_ctx.use_attn_mask && !rpu_concurrent_safe_spm_enabled());
+            if (step.traversal_ordinal > 0 && !next_reads_spm &&
+                layout_ctx.forward_operand_residency !=
+                    FmbForwardOperandResidency::FORWARD &&
+                !has_untracked_cross_layer_temp &&
+                (is_layer_entry_step || sequential_independent_chunks) &&
+                RpuKernelGraph::has_active() &&
+                RpuKernelGraph::active().state() ==
+                    RpuKernelGraph::State::RECORDING) {
+                RpuKernelGraph::active().mark_safe_split_boundary();
+            }
+#endif
             if (step.updates_io_context) {
                 pimpl_->ctx_.input_in_spm = step.input_in_spm;
                 pimpl_->ctx_.output_to_spm = step.output_to_spm;

@@ -745,8 +745,8 @@ public:
                     && noise_pad.is_contiguous() && noise_pad.device().type() == at::kPrivateUse1,
                     "noise_pad must be [1,AH,action_dim_pad] fp16 contig device");
         // Node-count backstop (wall_oss precedent): num_steps bodies must stay well below the
-        // 32768 batch-item cap. GR00T body ≈ 32 blocks + glue ≈ ~360 nodes → 4×≈1.4k. Loud-fail margin.
-        TORCH_CHECK(num_steps_ * 2000 < 32000, "unroll num_steps too large for the kernel-batch cap");
+        // 65536 batch-item cap. GR00T body ≈ 32 blocks + glue ≈ ~360 nodes → 4×≈1.4k. Loud-fail margin.
+        TORCH_CHECK(num_steps_ * 2000 < 65536, "unroll num_steps too large for the kernel-batch cap");
         // Enter unroll mode (rebuild on transition from plain / step form).
         if (!denoise_mode_ || !loop_mode_) { denoise_mode_ = true; loop_mode_ = true; invalidate_model_state(/*planning_domain_changed=*/false); }
 
@@ -1035,7 +1035,7 @@ public:
                         state_pad.is_contiguous() &&
                         state_pad.device().type() == at::kPrivateUse1,
                     "state_pad must be [1,1,action_dim_pad] fp16 contig device");
-        TORCH_CHECK(num_steps_ * 2000 < 32000,
+        TORCH_CHECK(num_steps_ * 2000 < 65536,
                     "unroll num_steps too large for the kernel-batch cap");
 
         actions_ref_ = noise_pad;

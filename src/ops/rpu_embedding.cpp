@@ -91,6 +91,7 @@ void rpu_launch_gather_embedding_kernel(
 at::Tensor rpu_gather_embedding(const at::Tensor &vocab, const at::Tensor &ids)
 {
     RECORD_FUNCTION("rpu::gather_embedding", {});
+    TORCH_CHECK(!graph_dma::active(), "gather_embedding: eager only");
     TORCH_CHECK(vocab.dim() == 2 && vocab.scalar_type() == at::kHalf,
                 "gather_embedding: vocab must be [V,H] fp16, got dim=", vocab.dim(),
                 " dtype=", vocab.scalar_type());
@@ -124,13 +125,21 @@ at::Tensor rpu_gather_embedding(const at::Tensor &vocab, const at::Tensor &ids)
     });
     const uint32_t out_spm_addr = SPM_ALLOC.addr(0, offsets[0]);
 
-    rpu_launch_gather_embedding_kernel(
-        const_cast<c10::Half *>(vocab.data_ptr<c10::Half>()),
-        const_cast<int32_t *>(ids.data_ptr<int32_t>()),
-        out_spm_addr, N, H, /*num_cores=*/1);
+    const bool eager_batch = !RpuKernelGraph::has_active();
+    {
+        ScopedEagerAtomicBatch batch(eager_batch, /*num_cores=*/1);
+        rpu_launch_gather_embedding_kernel(
+            const_cast<c10::Half *>(vocab.data_ptr<c10::Half>()),
+            const_cast<int32_t *>(ids.data_ptr<int32_t>()),
+            out_spm_addr, N, H, /*num_cores=*/1);
 
-    // SPM → DDR (core-0 SPM holds the full [N,H] gathered rows).
-    rpu_launch_spm_copy_ddr_dma_immediate(out_spm_addr, out.data_ptr<c10::Half>(), n_elem);
+        // SPM → DDR (core-0 SPM holds the full [N,H] gathered rows).
+        rpu_launch_spm_copy_ddr_dma(out_spm_addr, out.data_ptr<c10::Half>(), n_elem);
+        if (eager_batch) {
+            batch.submit();
+            rpu_ddr_flush(out.data_ptr<c10::Half>());
+        }
+    }
 
     SPM_ALLOC.reset_temporary();
     return out;
@@ -149,6 +158,7 @@ at::Tensor rpu_assemble_inputs_embeds(const at::Tensor &vocab, const at::Tensor 
                                       const at::Tensor &merged, int64_t img_start)
 {
     RECORD_FUNCTION("rpu::assemble_inputs_embeds", {});
+    TORCH_CHECK(!graph_dma::active(), "assemble_inputs_embeds: eager only");
     TORCH_CHECK(vocab.dim() == 2 && vocab.scalar_type() == at::kHalf,
                 "assemble_inputs_embeds: vocab must be [V,H] fp16");
     TORCH_CHECK(ids.dim() == 1 && ids.scalar_type() == at::kInt,
@@ -181,17 +191,25 @@ at::Tensor rpu_assemble_inputs_embeds(const at::Tensor &vocab, const at::Tensor 
     });
     const uint32_t spm = SPM_ALLOC.addr(0, offsets[0]);
 
-    // 1. gather all N token embeddings → SPM (image rows get vocab[image_pad], overwritten next).
-    rpu_launch_gather_embedding_kernel(
-        const_cast<c10::Half *>(vocab.data_ptr<c10::Half>()),
-        const_cast<int32_t *>(ids.data_ptr<int32_t>()),
-        spm, N, H, /*num_cores=*/1);
-    // 2. scatter the M vision rows into the contiguous image block (DDR→SPM, core 0).
-    rpu_launch_ddr_broadcast_spm_dma_immediate(
-        const_cast<c10::Half *>(merged.data_ptr<c10::Half>()),
-        M * H, spm + (uint32_t)(img_start * H * 2), /*num_cores=*/1);
-    // 3. SPM → DDR output.
-    rpu_launch_spm_copy_ddr_dma_immediate(spm, out.data_ptr<c10::Half>(), n_elem);
+    const bool eager_batch = !RpuKernelGraph::has_active();
+    {
+        ScopedEagerAtomicBatch batch(eager_batch, /*num_cores=*/1);
+        // 1. gather all N token embeddings → SPM (image rows get vocab[image_pad], overwritten next).
+        rpu_launch_gather_embedding_kernel(
+            const_cast<c10::Half *>(vocab.data_ptr<c10::Half>()),
+            const_cast<int32_t *>(ids.data_ptr<int32_t>()),
+            spm, N, H, /*num_cores=*/1);
+        // 2. scatter the M vision rows into the contiguous image block (DDR→SPM, core 0).
+        rpu_launch_ddr_broadcast_spm_dma(
+            const_cast<c10::Half *>(merged.data_ptr<c10::Half>()),
+            M * H, spm + (uint32_t)(img_start * H * 2), /*num_cores=*/1);
+        // 3. SPM → DDR output.
+        rpu_launch_spm_copy_ddr_dma(spm, out.data_ptr<c10::Half>(), n_elem);
+        if (eager_batch) {
+            batch.submit();
+            rpu_ddr_flush(out.data_ptr<c10::Half>());
+        }
+    }
 
     SPM_ALLOC.reset_temporary();
     return out;
@@ -301,19 +319,22 @@ at::Tensor rpu_assemble_inputs_embeds_parts(
             vocab, merged_parts, runs, out, spm, chunk_rows);
         return out;
     } else {
+        ScopedEagerAtomicBatch batch(/*enabled=*/true, /*num_cores=*/1);
         rpu_launch_gather_embedding_kernel(
             const_cast<c10::Half*>(vocab.data_ptr<c10::Half>()),
             const_cast<int32_t*>(ids.data_ptr<int32_t>()), spm, N, H, /*num_cores=*/1);
+        for (size_t index = 0; index < merged_parts.size(); ++index) {
+            const int64_t start = run_data[2 * index];
+            const int64_t length = run_data[2 * index + 1];
+            rpu_launch_ddr_broadcast_spm_dma(
+                const_cast<c10::Half*>(merged_parts[index].data_ptr<c10::Half>()),
+                length * H, spm + static_cast<uint32_t>(start * row_bytes), /*num_cores=*/1);
+        }
+        rpu_launch_spm_copy_ddr_dma(spm, out.data_ptr<c10::Half>(), n_elem);
+        batch.submit();
+        rpu_ddr_flush(out.data_ptr<c10::Half>());
+        return out;
     }
-    for (size_t index = 0; index < merged_parts.size(); ++index) {
-        const int64_t start = run_data[2 * index];
-        const int64_t length = run_data[2 * index + 1];
-        rpu_launch_ddr_broadcast_spm_dma_immediate(
-            const_cast<c10::Half*>(merged_parts[index].data_ptr<c10::Half>()),
-            length * H, spm + static_cast<uint32_t>(start * row_bytes), /*num_cores=*/1);
-    }
-    rpu_launch_spm_copy_ddr_dma_immediate(spm, out.data_ptr<c10::Half>(), n_elem);
-    return out;
 }
 
 // torch op: assemble_inputs_embeds_rev(vocab[V,H], ids[N], merged_window[M,H],
@@ -332,6 +353,7 @@ at::Tensor rpu_assemble_inputs_embeds_rev(const at::Tensor &vocab, const at::Ten
                                           const at::Tensor &rev_idx, const at::Tensor &runs)
 {
     RECORD_FUNCTION("rpu::assemble_inputs_embeds_rev", {});
+    TORCH_CHECK(!graph_dma::active(), "assemble_inputs_embeds_rev: eager only");
     TORCH_CHECK(vocab.dim() == 2 && vocab.scalar_type() == at::kHalf,
                 "assemble_inputs_embeds_rev: vocab must be [V,H] fp16");
     TORCH_CHECK(ids.dim() == 1 && ids.scalar_type() == at::kInt,
@@ -356,6 +378,20 @@ at::Tensor rpu_assemble_inputs_embeds_rev(const at::Tensor &vocab, const at::Ten
                 "assemble_inputs_embeds_rev: shape mismatch (H/M)");
     TORCH_CHECK(H % 16 == 0, "assemble_inputs_embeds_rev: hidden must be mult of 16, got ", H);
 
+    const int64_t *runs_p = runs.data_ptr<int64_t>();
+    const int64_t n_runs = runs.size(0);
+    int64_t validated_off = 0;
+    for (int64_t r = 0; r < n_runs; ++r) {
+        const int64_t rs = runs_p[2 * r];
+        const int64_t rl = runs_p[2 * r + 1];
+        TORCH_CHECK(rs >= 0 && rs + rl <= N, "assemble_inputs_embeds_rev: run [", rs, ",", rs + rl,
+                    ") out of [0,", N, ")");
+        TORCH_CHECK((validated_off % 64) == 0,
+                    "assemble_inputs_embeds_rev: rev_idx run offset ", validated_off, " not 64-aligned (256B)");
+        validated_off += rl;
+    }
+    TORCH_CHECK(validated_off == M, "assemble_inputs_embeds_rev: sum(run_lens) ", validated_off, " != merged rows ", M);
+
     auto out = at::empty({N, H}, vocab.options());
     const int64_t n_elem = N * H;
 
@@ -366,35 +402,34 @@ at::Tensor rpu_assemble_inputs_embeds_rev(const at::Tensor &vocab, const at::Ten
     });
     const uint32_t spm = SPM_ALLOC.addr(0, offsets[0]);
 
-    // 1. gather all N token embeddings → SPM (image rows get vocab[image_pad], overwritten next).
-    rpu_launch_gather_embedding_kernel(
-        const_cast<c10::Half *>(vocab.data_ptr<c10::Half>()),
-        const_cast<int32_t *>(ids.data_ptr<int32_t>()),
-        spm, N, H, /*num_cores=*/1);
-    // 2. per-run: gather merged_window[rev_idx[off:off+len]] → spm[run_start, ...].
-    int32_t *rev_base = const_cast<int32_t *>(rev_idx.data_ptr<int32_t>());
-    const int64_t *runs_p = runs.data_ptr<int64_t>();
-    const int64_t n_runs = runs.size(0);
-    int64_t off = 0;
-    for (int64_t r = 0; r < n_runs; ++r) {
-        const int64_t rs = runs_p[2 * r];
-        const int64_t rl = runs_p[2 * r + 1];
-        TORCH_CHECK(rs >= 0 && rs + rl <= N, "assemble_inputs_embeds_rev: run [", rs, ",", rs + rl,
-                    ") out of [0,", N, ")");
-        // rev_idx slice ptr must be 256B aligned for the gather (ids read via glarge>>8).
-        // int32 → 256B/4 = 64-element granularity. Wall-OSS runs are 64-token merge blocks.
-        TORCH_CHECK((off % 64) == 0,
-                    "assemble_inputs_embeds_rev: rev_idx run offset ", off, " not 64-aligned (256B)");
+    const bool eager_batch = !RpuKernelGraph::has_active();
+    {
+        ScopedEagerAtomicBatch batch(eager_batch, /*num_cores=*/1);
+        // 1. gather all N token embeddings → SPM (image rows get vocab[image_pad], overwritten next).
         rpu_launch_gather_embedding_kernel(
-            const_cast<c10::Half *>(merged_window.data_ptr<c10::Half>()),
-            rev_base + off,
-            spm + (uint32_t)(rs * H * 2),
-            rl, H, /*num_cores=*/1);
-        off += rl;
+            const_cast<c10::Half *>(vocab.data_ptr<c10::Half>()),
+            const_cast<int32_t *>(ids.data_ptr<int32_t>()),
+            spm, N, H, /*num_cores=*/1);
+        // 2. per-run: gather merged_window[rev_idx[off:off+len]] → spm[run_start, ...].
+        int32_t *rev_base = const_cast<int32_t *>(rev_idx.data_ptr<int32_t>());
+        int64_t off = 0;
+        for (int64_t r = 0; r < n_runs; ++r) {
+            const int64_t rs = runs_p[2 * r];
+            const int64_t rl = runs_p[2 * r + 1];
+            rpu_launch_gather_embedding_kernel(
+                const_cast<c10::Half *>(merged_window.data_ptr<c10::Half>()),
+                rev_base + off,
+                spm + (uint32_t)(rs * H * 2),
+                rl, H, /*num_cores=*/1);
+            off += rl;
+        }
+        // 3. SPM → DDR output.
+        rpu_launch_spm_copy_ddr_dma(spm, out.data_ptr<c10::Half>(), n_elem);
+        if (eager_batch) {
+            batch.submit();
+            rpu_ddr_flush(out.data_ptr<c10::Half>());
+        }
     }
-    TORCH_CHECK(off == M, "assemble_inputs_embeds_rev: sum(run_lens) ", off, " != merged rows ", M);
-    // 3. SPM → DDR output.
-    rpu_launch_spm_copy_ddr_dma_immediate(spm, out.data_ptr<c10::Half>(), n_elem);
 
     SPM_ALLOC.reset_temporary();
     return out;

@@ -29,15 +29,22 @@ at::Tensor rpu_gelu_erf(const at::Tensor& input) {
   constexpr int64_t block = 25600;
   const uint32_t spm = SPM_ALLOC.addr(0, SPM_ALLOC.alloc_temporary(
       std::min(input.numel(), block) * sizeof(c10::Half)));
+  ScopedEagerAtomicBatch batch(/*enabled=*/true, /*num_cores=*/1);
+  const size_t flush_threshold = ScopedEagerAtomicBatch::default_flush_node_threshold();
   for (int64_t offset = 0; offset < input.numel(); offset += block) {
+    if (batch.recorded_node_count() >= flush_threshold) {
+      batch.flush_and_reopen();
+    }
     const int64_t count = std::min(input.numel() - offset, block);
-    rpu_launch_ddr_broadcast_spm_dma_immediate(
+    rpu_launch_ddr_broadcast_spm_dma(
         input.data_ptr<c10::Half>() + offset, count, spm, 1);
     rpu_launch_eltwise_unary_spm_kernel(
         spm, spm, count, ValuOpType::ADD, GeluMode::ERF, 1);
-    rpu_launch_spm_copy_ddr_dma_immediate(
+    rpu_launch_spm_copy_ddr_dma(
         spm, output.data_ptr<c10::Half>() + offset, count);
   }
+  batch.submit();
+  rpu_ddr_flush(output.data_ptr<c10::Half>());
   return output;
 }
 
@@ -98,13 +105,20 @@ void rpu_launch_eltwise_unary_kernel(const at::Tensor &input,
     const int64_t block = op_type == ValuOpType::SILU ? 15872 : 25600;
     const uint32_t spm = SPM_ALLOC.addr(0, SPM_ALLOC.alloc_temporary(
         static_cast<size_t>(std::min(count, block)) * sizeof(c10::Half)));
+    ScopedEagerAtomicBatch batch(/*enabled=*/true, /*num_cores=*/1);
+    const size_t flush_threshold = ScopedEagerAtomicBatch::default_flush_node_threshold();
     for (int64_t offset = 0; offset < count; offset += block) {
+      if (batch.recorded_node_count() >= flush_threshold) {
+        batch.flush_and_reopen();
+      }
       const int64_t elements = std::min(count - offset, block);
-      rpu_launch_ddr_broadcast_spm_dma_immediate(in + offset, elements, spm, 1);
+      rpu_launch_ddr_broadcast_spm_dma(in + offset, elements, spm, 1);
       rpu_launch_eltwise_unary_spm_kernel(
           spm, spm, elements, op_type, GeluMode::NONE, 1, precision);
-      rpu_launch_spm_copy_ddr_dma_immediate(spm, out + offset, elements);
+      rpu_launch_spm_copy_ddr_dma(spm, out + offset, elements);
     }
+    batch.submit();
+    rpu_ddr_flush(out);
     return;
   }
 

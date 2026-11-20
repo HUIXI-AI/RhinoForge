@@ -385,7 +385,7 @@ void rpu_launch_sdpa_spm_vctxlen_kernel(
 
       auto* wq = GET_QUEUE(core_num);
       wq->set_broadcast_mode(true);
-      wq->set_flush_icache(false);
+      wq->set_flush_icache(true);
       wq->enqueu_kernel(*kernel, {grid_dim_x, grid_dim_y, grid_dim_z}, core_list);
 }
 

@@ -484,7 +484,12 @@ at::Tensor rpu_linear_w8a8(const at::Tensor& input, const at::Tensor& weight,
   const uint32_t b = bias ? alloc(ln * 2) : 0;
   auto output_shape = input.sizes().vec(); output_shape.back() = n;
   auto output = at::empty(output_shape, input.options());
-  if (bias) {
+  const size_t max_scatter_rows_per_chunk =
+      row ? chunk : std::max<size_t>(1, 4096 / std::max<size_t>(1, size_t(num_cores)));
+  const size_t step_chunk = std::min(chunk, max_scatter_rows_per_chunk);
+  ScopedEagerAtomicBatch eager_batch(!RpuKernelGraph::has_active(), int(num_cores));
+  auto emit_bias_upload = [&]() {
+    if (!bias) return;
     if (row) {
       // Row kernels add the local bias. Only core0 receives the logical bias;
       // every other core must see zero before the shared FP16 ring reduction.
@@ -493,9 +498,18 @@ at::Tensor rpu_linear_w8a8(const at::Tensor& input, const at::Tensor& weight,
     } else {
       rpu_launch_ddr_scatter_spm_dma(*bias, 0, ln, ln * 2, b, int(num_cores));
     }
-  }
-  for (size_t first = 0; first < size_t(m); first += chunk) {
-    const size_t rows = std::min(chunk, size_t(m) - first);
+  };
+  emit_bias_upload();
+  const size_t eager_flush_threshold =
+      ScopedEagerAtomicBatch::default_flush_node_threshold();
+  for (size_t first = 0; first < size_t(m); first += step_chunk) {
+    const size_t rows = std::min(step_chunk, size_t(m) - first);
+    const size_t est_nodes = (row ? rows : rows * size_t(num_cores)) + 64;
+    if (eager_batch.active() &&
+        eager_batch.recorded_node_count() + est_nodes > eager_flush_threshold) {
+      eager_batch.flush_and_reopen();
+      emit_bias_upload();
+    }
     if (row) {
       // No host repacking: scatter each physical input row's K shards.
       for (size_t r = 0; r < rows; ++r)
@@ -513,10 +527,14 @@ at::Tensor rpu_linear_w8a8(const at::Tensor& input, const at::Tensor& weight,
                                                int(num_cores), int(num_cores));
       rpu_launch_spm_copy_ddr_dma(reduced, output.data_ptr<c10::Half>() + first * n, rows * n);
     } else {
-      rpu_launch_spm_scatter_rows_ddr_dma_immediate(y,
+      rpu_launch_spm_scatter_rows_ddr_dma(y,
           output.data_ptr<c10::Half>() + first * n, rows, ln, ln * 2, n * 2, ln * 2,
           int(num_cores));
     }
+  }
+  if (eager_batch.active()) {
+    eager_batch.submit();
+    rpu_ddr_flush(output.data_ptr<c10::Half>());
   }
   return output;
 }

@@ -59,7 +59,7 @@ std::vector<uint32_t> stage_members(const at::Tensor& t, const MergerDims& d,
     std::vector<uint32_t> addrs(kMembers);
     for (int64_t m = 0; m < kMembers; ++m) {
         const uint32_t off = base_off + (uint32_t)m * stride;
-        rpu_launch_ddr_scatter_spm_dma_immediate(
+        rpu_launch_ddr_scatter_spm_dma(
             p + m * d.N, d.per_core,
             d.per_core * (int64_t)sizeof(c10::Half),
             SPM_ALLOC.addr(0, off), kCores);
@@ -74,6 +74,7 @@ std::vector<uint32_t> stage_members(const at::Tensor& t, const MergerDims& d,
 // The consumer folds the factor 1/4 into Wb. Equal-shaped predictor outputs
 // can then be added without an implicit leading-axis broadcast.
 at::Tensor rpu_hyvla_merger_pool(const at::Tensor& nxc) {
+    TORCH_CHECK(!graph_dma::active(), "hyvla_merger_pool: eager only");
     const auto d = check_member_major(nxc, "hyvla_merger_pool");
 
     if (!SPM_ALLOC.is_initialized()) SPM_ALLOC.init();
@@ -82,6 +83,11 @@ at::Tensor rpu_hyvla_merger_pool(const at::Tensor& nxc) {
     const uint32_t off_acc = SPM_ALLOC.alloc_temporary((size_t)stride);
     const uint32_t acc = SPM_ALLOC.addr(0, off_acc);
 
+    at::Tensor out = at::empty({kMembers, d.G, d.D},
+        at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1));
+    c10::Half* op = out.data_ptr<c10::Half>();
+
+    ScopedEagerAtomicBatch batch(!RpuKernelGraph::has_active(), kCores);
     const auto a = stage_members(nxc, d, off_m);
 
     // acc = ((m0 + m1) + m2) + m3
@@ -92,13 +98,13 @@ at::Tensor rpu_hyvla_merger_pool(const at::Tensor& nxc) {
     rpu_launch_eltwise_binary_spm_kernel(acc, a[3], acc, d.per_core,
                                          ValuOpType::ADD, c10::Half(1.0), kCores);
 
-    at::Tensor out = at::empty({kMembers, d.G, d.D},
-        at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1));
-    c10::Half* op = out.data_ptr<c10::Half>();
     for (int64_t m = 0; m < kMembers; ++m) {
-        rpu_launch_spm_scatter_ddr_dma_immediate(
+        rpu_launch_spm_scatter_ddr_dma(
             acc, op + m * d.N, d.per_core,
             d.per_core * (int64_t)sizeof(c10::Half), kCores);
+    }
+    if (batch.active()) {
+        batch.submit();
     }
     rpu_ddr_flush(op);
     return out;
@@ -114,6 +120,7 @@ at::Tensor rpu_hyvla_merger_pool(const at::Tensor& nxc) {
 // DIV 省成 1 次。max 减法是标准的 softmax 数值稳定化，与 host 的 `F.softmax` 同法。
 // =============================================================================
 at::Tensor rpu_hyvla_merger_combine(const at::Tensor& nxc, const at::Tensor& sc) {
+    TORCH_CHECK(!graph_dma::active(), "hyvla_merger_combine: eager only");
     const auto d = check_member_major(nxc, "hyvla_merger_combine(nxc)");
     const auto ds = check_member_major(sc, "hyvla_merger_combine(sc)");
     TORCH_CHECK(d.G == ds.G && d.D == ds.D,
@@ -130,6 +137,11 @@ at::Tensor rpu_hyvla_merger_combine(const at::Tensor& nxc, const at::Tensor& sc)
     const uint32_t sum = SPM_ALLOC.addr(0, off_sum);
     const uint32_t o   = SPM_ALLOC.addr(0, off_out);
 
+    at::Tensor out = at::empty({d.G, d.D},
+        at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1));
+    c10::Half* op = out.data_ptr<c10::Half>();
+
+    ScopedEagerAtomicBatch batch(!RpuKernelGraph::has_active(), kCores);
     const auto x = stage_members(nxc, d, off_x);
     const auto e = stage_members(sc,  d, off_e);
 
@@ -168,11 +180,11 @@ at::Tensor rpu_hyvla_merger_combine(const at::Tensor& nxc, const at::Tensor& sc)
     rpu_launch_eltwise_binary_spm_kernel(o, sum, o, d.per_core,
                                          ValuOpType::DIV, c10::Half(1.0), kCores);
 
-    at::Tensor out = at::empty({d.G, d.D},
-        at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1));
-    c10::Half* op = out.data_ptr<c10::Half>();
-    rpu_launch_spm_scatter_ddr_dma_immediate(
+    rpu_launch_spm_scatter_ddr_dma(
         o, op, d.per_core, d.per_core * (int64_t)sizeof(c10::Half), kCores);
+    if (batch.active()) {
+        batch.submit();
+    }
     rpu_ddr_flush(op);
     return out;
 }

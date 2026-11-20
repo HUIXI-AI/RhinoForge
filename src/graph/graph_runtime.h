@@ -251,7 +251,7 @@ void process_guarded_spm_alloc_reset_all();
 
 struct QueueLaunchState {
     bool broadcast_mode = true;
-    bool flush_icache = false;
+    bool flush_icache = true;
 
     bool operator==(const QueueLaunchState& other) const {
         return broadcast_mode == other.broadcast_mode &&
@@ -1117,12 +1117,22 @@ struct Segment {
         std::vector<uint8_t> core_ids;
         uint64_t graph_lifetime_id = 0;
         uint64_t build_generation = 0;
+        std::vector<std::pair<size_t, size_t>> prologue_spans;
         size_t start_idx = 0;
         size_t end_idx = 0;
         bool broadcast_mode = false;
-        bool flush_icache = false;
+        bool flush_icache = true;
     };
     std::shared_ptr<const PreparedBatchSnapshot> batch_snapshot;
+    std::vector<std::pair<size_t, size_t>> prologue_spans;
+
+    template <typename Fn>
+    void for_each_node_index(Fn&& fn) const {
+        for (const auto& [b, e] : prologue_spans) {
+            for (size_t i = b; i < e; ++i) fn(i);
+        }
+        for (size_t i = start_idx; i < end_idx; ++i) fn(i);
+    }
 };
 
 struct ReplayPlan {
@@ -1655,6 +1665,27 @@ public:
     GraphLocalSpmPool& local_spm_pool() { return local_spm_pool_; }
     // 对称 GlobalSPM 池。rpu_sdpa 等用 GlobalSPM_t 作临时 buffer 的 op 走这条。
     GraphGlobalSpmPool& global_spm_pool() { return global_spm_pool_; }
+
+    // Mark a clean Temp-SPM-dead node boundary (e.g. between chunks/layers in
+    // DDR_PINGPONG) so resource-budget AUTO-SPLIT prefers cutting here instead
+    // of mid-chunk across live Temporary SPM buffers.
+    void mark_safe_split_boundary();
+
+    // Mark an idempotent preload span [begin_idx, end_idx) recorded near the
+    // start of segment 0 (e.g. forward-constant Temp tables or Persistent
+    // preloads under RPU_CONCURRENT_SAFE_SPM=1) so segments_[1..] re-emit it
+    // atomically at the head of their own hardware batch.
+    void mark_segment_preload_prologue(size_t begin_idx, size_t end_idx);
+    bool has_preload_prologue_covering(size_t begin_idx,
+                                       size_t end_idx) const noexcept {
+        if (begin_idx >= end_idx) return true;
+        for (const auto& [b, e] : preload_prologue_spans_) {
+            if (b <= begin_idx && end_idx <= e) return true;
+        }
+        return false;
+    }
+
+    size_t recorded_node_count() const noexcept { return nodes_.size(); }
 
     // ==================== _to_copy admission ====================
     //
@@ -2432,6 +2463,8 @@ private:
     std::vector<std::unique_ptr<::rhino_lkn::Kernel_t>> kernels_;
     std::vector<GraphNode> nodes_;
     std::vector<Segment> segments_;
+    std::vector<size_t> safe_split_boundaries_;
+    std::vector<std::pair<size_t, size_t>> preload_prologue_spans_;
     bool batch_snapshot_admission_bound_ = false;
     bool batch_snapshot_available_ = false;
     uint32_t batch_snapshot_contracts_ = 0;
@@ -3146,3 +3179,33 @@ inline void emit_barrier(uint8_t self_stream, uint8_t target_stream) {
 }
 
 }  // namespace graph_dma
+
+// =============================================================================
+// ScopedEagerAtomicBatch — Reusable one-shot atomic batch for PASSTHROUGH ops
+// =============================================================================
+//
+// Packages a multi-step eager sequence (DDR->SPM DMA + compute kernel(s) +
+// SPM->DDR DMA) into a single signature-less RpuKernelGraph one-shot hardware
+// submission when no outer Graph is active, eliminating both per-step ioctl
+// round-trip overhead and inter-submission Low-SPM preemption windows across
+// concurrent RPU processes.
+class ScopedEagerAtomicBatch {
+public:
+    ScopedEagerAtomicBatch(bool enabled, int num_cores);
+    ScopedEagerAtomicBatch(const ScopedEagerAtomicBatch&) = delete;
+    ScopedEagerAtomicBatch& operator=(const ScopedEagerAtomicBatch&) = delete;
+    ~ScopedEagerAtomicBatch();
+
+    bool active() const noexcept { return graph_ != nullptr; }
+    size_t recorded_node_count() const noexcept {
+        return graph_ ? graph_->recorded_node_count() : 0;
+    }
+    static size_t default_flush_node_threshold() noexcept;
+    void flush_and_reopen();
+    void submit();
+
+private:
+    static RpuKernelGraph& graph_for(int num_cores);
+    RpuKernelGraph* graph_ = nullptr;
+    int num_cores_ = 0;
+};

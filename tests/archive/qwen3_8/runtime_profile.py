@@ -3,7 +3,7 @@ from pathlib import Path
 import subprocess
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 
 
 def _function(source, signature):
@@ -152,8 +152,8 @@ int main() {
     for (int cores : {4,6,8}) {
         policy.execution_core_count=cores;
         const auto ordinary_budget=segment_resource_budget("rpu_qwen3_5",policy);
-        assert(ordinary_budget.entries==(cores==8 ? 8192u : 4096u));
-        assert(ordinary_budget.kd_bytes==(4u<<20) && ordinary_budget.instr_bytes==(32u<<20));
+        assert(ordinary_budget.entries==65536u);
+        assert(ordinary_budget.kd_bytes==(8u<<20) && ordinary_budget.instr_bytes==(64u<<20));
         const int prior=allocations;
         accessible=false;
         assert(!prepare_graph_runtime_arenas(policy) && allocations==prior && claims==0);
@@ -223,17 +223,17 @@ int main() {
     assert(allocations==before_default);
     policy.execution_core_count=8;
     auto budget=segment_resource_budget("rpu_qwen3_5", policy);
-    assert(budget.entries==8192 && budget.kd_bytes==(4u<<20) && budget.instr_bytes==(32u<<20));
-    // Reduced-core text must split dense batches without changing the
-    // process SDK limits. Exercise the real budget and cut predicate together.
+    assert(budget.entries==65536 && budget.kd_bytes==(8u<<20) && budget.instr_bytes==(64u<<20));
+    // All core counts use the unified 65536 SDK batch ceiling bounded by
+    // configured LKN_* limits. Exercise the real budget and cut predicate together.
     for (int cores : {4,6,8}) {
         policy.execution_core_count=cores;
-        const size_t ceiling=cores==8 ? 8192 : 4096;
+        const size_t ceiling=65536;
         for (size_t sdk_entries : {size_t{6000},size_t{65536},size_t{131072}}) {
             policy.lkn_max_batch_entries=sdk_entries;
             const auto text_budget=segment_resource_budget("qwen3_causal_decoder",policy);
-            assert(text_budget.entries==std::min(ceiling,sdk_entries/2));
-            assert(text_budget.kd_bytes==(4u<<20) && text_budget.instr_bytes==(32u<<20));
+            assert(text_budget.entries==std::min(ceiling,sdk_entries));
+            assert(text_budget.kd_bytes==(8u<<20) && text_budget.instr_bytes==(64u<<20));
             SegmentResourceUse full;
             full.entries=text_budget.entries-1;
             SegmentResourceUse one;
@@ -250,14 +250,14 @@ int main() {
     budget=segment_resource_budget("rpu_qwen3_5", policy);
     assert(budget.entries==65536 && budget.kd_bytes==(8u<<20) && budget.instr_bytes==(64u<<20));
     for (const char* label : {"qwen3_causal_decoder", "rpu_g05_qwen3_5_prefill", "qwen3_5_vision", ""}) {
-        assert(segment_resource_budget(label, policy).entries==8192);
+        assert(segment_resource_budget(label, policy).entries==65536);
     }
     policy.lkn_max_batch_entries=16;
     policy.lkn_kd_buf_mb=1;
     policy.lkn_instr_buf_mb=2;
     budget=segment_resource_budget("rpu_qwen3_5", policy);
     assert(budget.entries==16 && budget.kd_bytes==(1u<<20) && budget.instr_bytes==(2u<<20));
-    assert(segment_resource_budget("foreign", policy).entries==8);
+    assert(segment_resource_budget("foreign", policy).entries==16);
     // A DMA on stream 2 requires its own completion packet beyond the 16-byte
     // batch tail. This boundary previously passed the planner but failed SDK.
     const std::vector<std::unique_ptr<rhino_lkn::Kernel_t>> kernels;

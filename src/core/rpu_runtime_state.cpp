@@ -11,6 +11,21 @@
 
 #include "rpu_runtime_state.h"
 #include "rpu_ops.h"
+#include <cstdlib>
+#include <cstring>
+
+bool rpu_concurrent_safe_spm_enabled() {
+    const char* raw = std::getenv("RPU_CONCURRENT_SAFE_SPM");
+    if (raw == nullptr || raw[0] == '\0' || std::strcmp(raw, "0") == 0) {
+        return false;
+    }
+    if (std::strcmp(raw, "1") == 0) {
+        return true;
+    }
+    TORCH_CHECK(false,
+                "RPU_CONCURRENT_SAFE_SPM must be unset, empty, '0', or '1'; got '",
+                raw, "'");
+}
 
 // =============================================================================
 // Globals — explicit zero/default-init per D-03

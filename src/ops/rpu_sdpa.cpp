@@ -503,7 +503,7 @@ static void launch_sdpa_spm_unified_impl(
 
   auto* wq = GET_QUEUE(core_num);
   wq->set_broadcast_mode(true);
-  wq->set_flush_icache(false);
+  wq->set_flush_icache(true);
 
   wq->enqueu_kernel(*kernel, {grid_dim_x, grid_dim_y, grid_dim_z}, core_list);
 }
@@ -918,7 +918,7 @@ void split_kv_enqueue(Kernel_t* kernel, uint16_t grid_x, uint16_t grid_y = 1) {
   static const std::vector<uint8_t> cores{0, 1, 2, 3, 4, 5, 6, 7};
   auto* wq = GET_QUEUE(MAX_CORES);
   wq->set_broadcast_mode(true);
-  wq->set_flush_icache(false);
+  wq->set_flush_icache(true);
   wq->enqueu_kernel(*kernel, {grid_x, grid_y, 1}, cores);
 }
 

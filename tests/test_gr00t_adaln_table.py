@@ -178,7 +178,9 @@ struct Allocator{
  uint32_t addr(int,uint32_t off){return 0x10000000+off;}
 };Allocator SPM_ALLOC;
 struct SpmAllocator:Allocator{struct ScopedTemporary{int64_t mark=SPM_ALLOC.used;~ScopedTemporary(){SPM_ALLOC.used=mark;}};};
+struct ScopedEagerAtomicBatch{ScopedEagerAtomicBatch(bool,int){}void submit(){}};
 void rpu_ddr_flush_force(float*){}
+void rpu_ddr_flush(float*){}
 enum class ValuOpType{ADD};
 std::map<uint32_t,std::vector<float>>spm;
 int step=-1,linear_calls=0,copy_calls=0,fail_at=-1;int64_t last_copy_end=0;

@@ -416,15 +416,23 @@ def _is_qwen3_vl_dense_eager_profile(model) -> bool:
                 or _qwen3_vl_has_quant_metadata(config)):
             return False
         rope = getattr(text, "rope_parameters", None) or getattr(text, "rope_scaling", None) or {}
+        vocab_size = getattr(text, "vocab_size", None)
+        valid_vocab = (
+            isinstance(vocab_size, int)
+            and not isinstance(vocab_size, bool)
+            and vocab_size >= 151936
+            and vocab_size % 16 == 0
+        )
         return (
-            (text.num_attention_heads, text.head_dim)
+            valid_vocab
+            and (text.num_attention_heads, text.head_dim)
             == _SUPPORTED_TEXT_DETAILS[profile]
-            and (text.model_type, text.hidden_act, text.rms_norm_eps, text.vocab_size,
+            and (text.model_type, text.hidden_act, text.rms_norm_eps,
              text.attention_bias, text.use_cache, config.tie_word_embeddings,
              text.tie_word_embeddings, rope.get("rope_type"),
              rope.get("rope_theta", getattr(text, "rope_theta", None)),
              rope.get("mrope_interleaved"), tuple(rope.get("mrope_section", ())))
-            == ("qwen3_vl_text", "silu", 1e-6, 151936, False, True,
+            == ("qwen3_vl_text", "silu", 1e-6, False, True,
                 True, True, "default", 5_000_000, True, (24, 20, 20))
             and (vision.hidden_size, vision.intermediate_size, vision.depth,
                  vision.num_heads, vision.patch_size, vision.temporal_patch_size,
@@ -925,7 +933,8 @@ def _apply_prefill_lm_head(model, hidden, slice_indices):
     logical_shape = ({"logical_out_features": head.out_features}
                      if weight.dtype == torch.uint8 else {})
     out = torch.ops.rpu.linear_with_accumulation(
-        head_input.contiguous(), weight, getattr(head, "bias", None), 1, cores,
+        head_input.contiguous(), weight, getattr(head, "bias", None),
+        getattr(head, "_rpu_linear_partition", 1), cores,
         getattr(text, "_rpu_execution", {}).get("prefill", {}).get("linear_acc32", False), scale,
         **logical_shape,
     )
@@ -2152,8 +2161,23 @@ class Qwen3VLAdapter:
                 # The strict loader already performed the sole physical pgrp pack.
                 swizzled = lm_head_cpu
             elif topology is None:
-                swizzled = transform_linear_weight(lm_head_cpu, partition=1)
+                lm_head_partition = (
+                    0
+                    if (
+                        lm_head_cpu.ndim == 2
+                        and lm_head_cpu.shape[0] % 128 != 0
+                        and lm_head_cpu.shape[0] % 16 == 0
+                        and lm_head_cpu.shape[1] % 128 == 0
+                    )
+                    else 1
+                )
+                swizzled = transform_linear_weight(
+                    lm_head_cpu, partition=lm_head_partition,
+                )
                 self.model.lm_head.weight = nn.Parameter(swizzled, requires_grad=False)
+                if lm_head_partition == 0:
+                    self.model.lm_head._rpu_linear_partition = 0
+                    self.model.lm_head._rpu_linear_num_cores = 8
             else:
                 # Reduced text layers were streamed above; convert the
                 # untied vocabulary head separately with its own cold layout.
@@ -2404,6 +2428,12 @@ class Qwen3VLAdapter:
                     lm_scale,
                     fuse_prefill_last_lm_head,
                     lm_head_exact_candidates,
+                )
+            elif getattr(self.model.lm_head, "_rpu_linear_partition", 1) == 0:
+                # Non-128-row-aligned vocabulary heads use row-partition swizzle
+                # and stay on the eager head boundary rather than decode col-fusion.
+                self.model._rpu_lm_head_w_keepalive = (
+                    self.model.lm_head.weight.detach()
                 )
             else:
                 lm_w = self.model.lm_head.weight.detach().to(
@@ -2862,11 +2892,17 @@ def _rpu_qwen3vl_forward(
             pooler, grid_in.detach().cpu(), spatial_merge_size,
         )
     elif precomputed_vision is not None:
-        if image_grid_thw is None:
+        if (image_grid_thw is None) == (video_grid_thw is None):
             raise ValueError(
-                "Qwen3VL device forward: image_grid_thw must accompany "
-                "rpu_precomputed_vision."
+                "Qwen3VL device forward: exactly one of image_grid_thw or "
+                "video_grid_thw must accompany rpu_precomputed_vision."
             )
+        if video_grid_thw is not None:
+            visual_grid_thw = video_grid_thw
+            visual_token_id = self.config.video_token_id
+        else:
+            visual_grid_thw = image_grid_thw
+            visual_token_id = self.config.image_token_id
         if not isinstance(precomputed_vision, dict):
             raise TypeError(
                 "Qwen3VL device forward: rpu_precomputed_vision must be a dict."
@@ -2902,7 +2938,7 @@ def _rpu_qwen3vl_forward(
                     "[0, len(pooler_output_parts))"
                 )
             expected_rows = int((
-                image_grid_thw.detach().cpu().prod(-1)
+                visual_grid_thw.detach().cpu().prod(-1)
                 // (spatial_merge_size ** 2)
             ).sum().item())
             actual_rows = sum(
@@ -2916,13 +2952,12 @@ def _rpu_qwen3vl_forward(
         else:
             visual_embeds_flat = _split_image_embeds_per_image(
                 precomputed_vision["pooler_output"],
-                image_grid_thw.detach().cpu(),
+                visual_grid_thw.detach().cpu(),
                 spatial_merge_size,
             )
             deepstack_features = list(
                 precomputed_vision["deepstack_features"]
             )
-        visual_token_id = self.config.image_token_id
 
     # ----- Build inputs_embeds + scatter image features --------------------
     input_ids_cpu = None

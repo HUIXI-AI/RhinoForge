@@ -452,8 +452,6 @@ static struct McConvSpmCache {
     uint32_t in_off = 0, flt_off = 0, out_off = 0, bias_off = 0;
     size_t in_bytes = 0, flt_bytes = 0, out_bytes = 0, bias_bytes = 0;
     int core_num = 0;
-    bool weight_loaded = false;
-    bool bias_loaded = false;
     bool allocated = false;
     uint64_t alloc_gen = 0;
 
@@ -474,8 +472,6 @@ static struct McConvSpmCache {
         flt_off  = SPM_ALLOC.alloc_temporary(fb);
         out_off  = SPM_ALLOC.alloc_temporary(ob);
         bias_off = (bb > 0) ? SPM_ALLOC.alloc_temporary(bb) : 0;
-        weight_loaded = false;
-        bias_loaded = false;
         allocated = true;
         alloc_gen = SPM_ALLOC.generation();
     }
@@ -484,8 +480,6 @@ static struct McConvSpmCache {
         if (allocated) SPM_ALLOC.reset_temporary();
         in_off = flt_off = out_off = bias_off = 0;
         core_num = 0;
-        weight_loaded = false;
-        bias_loaded = false;
         allocated = false;
     }
 } g_mc_conv_spm_cache;
@@ -552,21 +546,17 @@ void rpu_launch_conv2d_multicore_ddr_kernel(
                    reinterpret_cast<const char*>(input_nhwc) + c * bpc * in_batch_bytes,
                    spm_in_v16_size * DW16);
 
-        // DMA weight (first call only — weight is constant)
-        if (!g_mc_conv_spm_cache.weight_loaded) {
-            ddr_to_spm(SPM_ALLOC.cpu_ptr(c, flt_off),
-                       reinterpret_cast<const char*>(weight_nhwc) + c * flt_core_bytes,
-                       spm_flt_v16_size * DW16);
-        }
+        // Temporary SPM lies in Low SPM and is never owned across RPU submissions
+        // or concurrent processes; reload weight and bias on every call.
+        ddr_to_spm(SPM_ALLOC.cpu_ptr(c, flt_off),
+                   reinterpret_cast<const char*>(weight_nhwc) + c * flt_core_bytes,
+                   spm_flt_v16_size * DW16);
 
-        // DMA bias (first call only — bias is constant)
-        if (has_bias && !g_mc_conv_spm_cache.bias_loaded) {
+        if (has_bias) {
             ddr_to_spm(SPM_ALLOC.cpu_ptr(c, bias_off), bias_ptr,
                        spm_bias_v16_size * DW16);
         }
     }
-    g_mc_conv_spm_cache.weight_loaded = true;
-    if (has_bias) g_mc_conv_spm_cache.bias_loaded = true;
 
     // Kernel selection: tile_n based on cpc, tile_k based on cin
     int tile_n = select_tile_n_mc(cpc);

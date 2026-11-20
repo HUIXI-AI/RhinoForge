@@ -18,6 +18,14 @@ def test_overlap_tiles_boundaries_and_ownership(tmp_path):
 using at::Tensor;
 enum class ValuOpType {ADD};
 struct RpuKernelGraph {static inline bool active=false;static bool has_active(){return active;}};
+namespace graph_dma { bool active() { return RpuKernelGraph::has_active(); } }
+struct ScopedEagerAtomicBatch {
+ ScopedEagerAtomicBatch(bool enabled,int){assert(enabled);}
+ bool active()const{return true;} size_t recorded_node_count()const{return 0;}
+ static size_t default_flush_node_threshold(){return 45000;}
+ void flush_and_reopen(){} void submit(){}
+};
+void rpu_ddr_flush(void*){}
 struct SpmAllocator {
  static inline uint32_t offset=0;
  struct ScopedTemporary {~ScopedTemporary(){offset=0;}};
@@ -29,8 +37,8 @@ struct SpmAllocator {
 auto memory=at::empty({(4<<20)/2},at::kHalf);
 Tensor region(uint32_t a,int64_t n){assert(a%2==0);return memory.narrow(0,a/2,n);}
 void rpu_launch_fill_spm_kernel(uint32_t a,int64_t n,c10::Half v,int cores){assert(cores==1);region(a,n).fill_(float(v));}
-void rpu_launch_ddr_broadcast_spm_dma_immediate(c10::Half*p,int64_t n,uint32_t a,int cores){assert(cores==1);region(a,n).copy_(at::from_blob(p,{n},at::kHalf));}
-void rpu_launch_spm_copy_ddr_dma_immediate(uint32_t a,c10::Half*p,int64_t n){at::from_blob(p,{n},at::kHalf).copy_(region(a,n));}
+void rpu_launch_ddr_broadcast_spm_dma(c10::Half*p,int64_t n,uint32_t a,int cores){assert(cores==1);region(a,n).copy_(at::from_blob(p,{n},at::kHalf));}
+void rpu_launch_spm_copy_ddr_dma(uint32_t a,c10::Half*p,int64_t n){at::from_blob(p,{n},at::kHalf).copy_(region(a,n));}
 void rpu_launch_slice_spm_kernel(uint32_t a,uint32_t b,const std::vector<int64_t>&in,const std::vector<int64_t>&out,const std::vector<int64_t>&start,int cores){
  assert(cores==1&&in.size()==2&&in[0]==out[0]&&start[0]==0);
  region(b,out[0]*out[1]).view(out).copy_(region(a,in[0]*in[1]).view(in).narrow(1,start[1],out[1]));

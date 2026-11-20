@@ -156,7 +156,10 @@ def test_ddr_linear_publications_cover_dirty_inputs_before_dma(tmp_path):
     profile = (ROOT / "src/core/rpu_profile.h").read_text()
     macros = "\n".join(
         profile[profile.index(f"#define {name}("):].split("\n\n", 1)[0]
-        for name in ("rpu_ddr_flush", "rpu_ddr_flush_force")
+        for name in (
+            "rpu_ddr_flush", "rpu_ddr_flush_force",
+            "rpu_ddr_flush_force_sized",
+        )
     )
     harness = r'''
 #include <algorithm>
@@ -175,7 +178,11 @@ def test_ddr_linear_publications_cover_dirty_inputs_before_dma(tmp_path):
 #define TORCH_CHECK(c, ...) do { if (!(c)) throw std::runtime_error("rejected"); } while (0)
 namespace c10 { using Half = float; }
 bool g_rpu_ddr_flush_enabled = true, g_rpu_ddr_flush_force_enabled = true;
-struct Memory { std::vector<float> cpu, device; explicit Memory(size_t n):cpu(n),device(n){} };
+struct Memory {
+    std::vector<float> cpu, device;
+    bool device_newer=false;
+    explicit Memory(size_t n):cpu(n),device(n){}
+};
 std::vector<std::shared_ptr<Memory>> memories;
 std::vector<void*> flushed;
 std::vector<size_t> flushed_bytes;
@@ -195,7 +202,12 @@ void RpuDdrFlush(void* pointer) {
     flushed_bytes.push_back(0);
     if(publication_only) return;
     auto [memory,offset] = lookup(reinterpret_cast<uint64_t>(pointer));
-    std::copy(memory->cpu.begin()+offset,memory->cpu.end(),memory->device.begin()+offset);
+    if(memory->device_newer) {
+        std::copy(memory->device.begin()+offset,memory->device.end(),memory->cpu.begin()+offset);
+        memory->device_newer=false;
+    } else {
+        std::copy(memory->cpu.begin()+offset,memory->cpu.end(),memory->device.begin()+offset);
+    }
 }
 void RpuDdrFlush(void* pointer,size_t bytes) {
     flushed.push_back(pointer);
@@ -203,7 +215,12 @@ void RpuDdrFlush(void* pointer,size_t bytes) {
     if(publication_only) return;
     auto [memory,offset] = lookup(reinterpret_cast<uint64_t>(pointer));
     assert(bytes%sizeof(float)==0 && offset+bytes/sizeof(float)<=memory->cpu.size());
-    std::copy_n(memory->cpu.begin()+offset,bytes/sizeof(float),memory->device.begin()+offset);
+    if(memory->device_newer) {
+        std::copy_n(memory->device.begin()+offset,bytes/sizeof(float),memory->cpu.begin()+offset);
+        memory->device_newer=false;
+    } else {
+        std::copy_n(memory->cpu.begin()+offset,bytes/sizeof(float),memory->device.begin()+offset);
+    }
 }
 }
 uint64_t RpuGetDevAddr(void* pointer) {
@@ -216,6 +233,7 @@ struct Tensor {
     Tensor()=default;
     explicit Tensor(size_t n):memory(std::make_shared<Memory>(n)){memories.push_back(memory);}
     template<class T> T* data_ptr() const {return reinterpret_cast<T*>(memory->cpu.data());}
+    size_t nbytes() const {return memory->cpu.size()*sizeof(float);}
     int options() const {return 0;}
 };
 Tensor empty(std::initializer_list<int64_t> shape,int) {
@@ -363,11 +381,31 @@ int main(){
             auto count=[&](void* ptr){return std::count(flushed.begin(),flushed.end(),ptr);};
             size_t input_flushes=0;
             for(void* ptr:flushed) if(lookup(reinterpret_cast<uint64_t>(ptr)).first==input.memory.get()) ++input_flushes;
-            assert(input_flushes==(normal?(partition==0?1:chunks):0));
+            assert(input_flushes==(partition==0?size_t(force):normal?chunks:0));
             assert(count(weight.data_ptr<float>())==int(normal));
             assert(count(bias.data_ptr<float>())==int(normal && bias_mode!=0));
             assert(g_rpu_ddr_flush_enabled==normal && g_rpu_ddr_flush_force_enabled==force);
             ++cases;
+        }
+    }
+    // A row-partition head repacks device-produced hidden state with host
+    // memcpy. The default optional flush is off, so the CPU boundary flush
+    // must acquire each new logical input before that read.
+    {
+        memories.clear();spm.clear();graph_dma::nodes.clear();
+        at::Tensor input(32),weight(32*32),bias;
+        g_rpu_ddr_flush_enabled=false;g_rpu_ddr_flush_force_enabled=true;
+        expected_weight=0;
+        for(float value:{10.0f,20.0f,10.0f}) {
+            std::fill(input.memory->cpu.begin(),input.memory->cpu.end(),-1.0f);
+            for(size_t col=0;col<32;++col) input.memory->device[col]=value+float(col%4);
+            input.memory->device_newer=true;
+            flushed.clear();flushed_bytes.clear();consumed=0;
+            graph_dma::mode=graph_dma::Mode::Eager;expected_input=value;
+            transport(input,weight,bias,false,0,nullptr,1,1);
+            assert(consumed==1 && !input.memory->device_newer);
+            assert(std::count(flushed.begin(),flushed.end(),input.data_ptr<float>())==1);
+            assert(flushed_bytes.front()==input.memory->cpu.size()*sizeof(float));
         }
     }
     int range_cases=0;

@@ -11130,6 +11130,9 @@ protected:  // LingBot2 sparse-MoE subclass reuses the decoder's layer state.
         // Existing Wall ownership is unchanged. New zero-growth adopters use
         // this forward's native-validated COMPLETE route as their authority.
         bool retain_mask = keep_explicit_mask_in_spm_;
+#ifdef RPU_RUNTIME_STATE_H_INCLUDED
+        if (rpu_concurrent_safe_spm_enabled()) retain_mask = false;
+#endif
         if (explicit_mask_residency_requested_) {
             retain_mask = false;  // legacy callers remain per-layer
             if (ctx().has_complete_physical_manifest()) {

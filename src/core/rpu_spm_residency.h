@@ -1,6 +1,7 @@
 #pragma once
 
 #include "fused_model_base.h"
+#include "rpu_runtime_state.h"
 
 #include <algorithm>
 #include <cstring>
@@ -36,6 +37,9 @@ inline ForwardSpmResidencyCandidate make_forward_spm_residency_candidate(
     result.original_peak_bytes = estimate_temporary_total(declarations);
     result.retained_peak_bytes = result.original_peak_bytes;
     if (names.size() == 0) return result;
+#ifdef RPU_RUNTIME_STATE_H_INCLUDED
+    if (rpu_concurrent_safe_spm_enabled()) return result;
+#endif
 
     std::vector<size_t> selected;
     for (const char* name : names) {

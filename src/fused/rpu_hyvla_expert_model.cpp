@@ -3114,10 +3114,10 @@ void HyVlaExpertModel::unroll_forward(
                 ") 必须等于 set_action_weights 的 num_steps(", num_steps_, ")");
     const int64_t cs = expert_chunk_size_, np = action_dim_pad_, h = hidden_size();
 
-    // 节点数护栏: graph_runtime 在 batch 溢出 (上限 32768) 时**静默丢弃**。
+    // 节点数护栏: 控制单段 unroll 远低于 65536 单 batch 节点上限。
 
-    TORCH_CHECK(num_steps * 1500 < 32000,
-                "denoise unroll (", num_steps, " 个 body) 会逼近 32768 的 batch 上限");
+    TORCH_CHECK(num_steps <= (65536 - 1) / 1500,
+                "denoise unroll (", num_steps, " 个 body) 会逼近 65536 的 batch 上限");
 
     TORCH_CHECK(x0_rpu.dim() == 3 && x0_rpu.size(0) == 1 && x0_rpu.size(1) == cs
              && x0_rpu.size(2) == np && x0_rpu.scalar_type() == at::kHalf

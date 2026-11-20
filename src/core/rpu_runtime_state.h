@@ -31,6 +31,7 @@
 //             no `namespace rpu` wrapper (D-01).
 
 #pragma once
+#define RPU_RUNTIME_STATE_H_INCLUDED 1
 
 #include <cstdint>
 #include <string>
@@ -50,6 +51,11 @@ RpuLknBatchConfigSnapshot rpu_lkn_batch_config_at_load();
 // Cold arena preflight only: SDK Queue constructors still parse their current
 // environment, so reject drift before this profile allocates model weights.
 RpuLknBatchConfigSnapshot rpu_lkn_batch_config_at_preflight();
+
+// Opt-in cross-process shared-SPM protection (`RPU_CONCURRENT_SAFE_SPM=1`):
+// forces per-forward/per-segment Persistent SPM reloads instead of relying on
+// cross-batch High-SPM residency when co-running with large external REFs.
+bool rpu_concurrent_safe_spm_enabled();
 
 // =============================================================================
 // Globals — defined in rpu_runtime_state.cpp with explicit zero/default-init

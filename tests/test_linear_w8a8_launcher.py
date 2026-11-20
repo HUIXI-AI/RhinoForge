@@ -181,6 +181,7 @@ struct RpuKernelGraph {
   std::vector<at::Tensor> owners;
   std::vector<GraphDdrRegisterOperandSpec> last_specs;
   bool pending=false;
+  static bool has_active() { return graph_dma::capturing; }
   static RpuKernelGraph& active() { static RpuKernelGraph value; return value; }
   Writer stage_kernel_ddr_registers(KernelId id,std::vector<GraphDdrRegisterOperandSpec> specs) {
     assert(!pending); pending=true;
@@ -244,7 +245,16 @@ void rpu_launch_all_reduce_sum_residual_kernel(uint32_t partial,uint32_t zero,ui
 void rpu_launch_spm_copy_ddr_dma(uint32_t from,c10::Half* out,int64_t count) {
   record("copy_out",{from,RpuGetDevAddr(out),uint64_t(count)});
 }
-void rpu_launch_spm_scatter_rows_ddr_dma_immediate(uint32_t from,c10::Half* out,int64_t rows,int64_t nc,int64_t spm_stride,int64_t ddr_stride,int64_t core_stride,int cores) {
+struct ScopedEagerAtomicBatch {
+  bool enabled_ = false;
+  ScopedEagerAtomicBatch(bool enabled, int) : enabled_(enabled) {}
+  bool active() const noexcept { return enabled_; }
+  size_t recorded_node_count() const noexcept { return 0; }
+  static size_t default_flush_node_threshold() noexcept { return 45000; }
+  void flush_and_reopen() {}
+  void submit() {}
+};
+void rpu_launch_spm_scatter_rows_ddr_dma(uint32_t from,c10::Half* out,int64_t rows,int64_t nc,int64_t spm_stride,int64_t ddr_stride,int64_t core_stride,int cores) {
   assert(spm_stride==nc*2 && core_stride==nc*2 && ddr_stride==nc*2*cores);
   record("scatter_out",{from,RpuGetDevAddr(out),uint64_t(rows),uint64_t(nc),uint64_t(cores)});
 }

@@ -114,7 +114,7 @@ Attention TP4 与物理八分片对应有效 KV slots `8*8/4=16`，batch 为一�
 每个 kernel 保留自己的 `core_ids`。Graph kernel 使用 `[0,N)` 内连续核区间，queue prefix 覆盖该区间；DMA-first/only segment
 使用 owner 核数，DMA engine ID 必须在 `0..N-1`。DDR-to-DDR 复制使用独立同步队列并在
 完成后释放 batch；它与 immediate、retained 队列各自管理生命周期。普通 Graph 提交在四核、
-六核时最多 4096 entries，八核时最多 8192，同时不得超过 SDK 配置上限的一半；这些限制不改变
+六核与八核下共享 SDK batch 上限（默认最多 65536 entries 及配置的 KD/instruction 缓冲容量）；这些限制不改变
 planner chunk 或算子核数。
 
 Residual ring 按消费核数归约；只有部分核生产数据时，先清空所有消费分片再写入有效前缀。

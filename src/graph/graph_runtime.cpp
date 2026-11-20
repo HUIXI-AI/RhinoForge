@@ -3004,6 +3004,8 @@ void RpuKernelGraph::begin_impl(const std::optional<GraphSignature>& sig) {
         for (auto& r : tier3_oneshot_transient_owners_) r.mark_released();
         tier3_oneshot_transient_owners_.clear();
         tier3_oneshot_transient_tensors_.clear();
+        safe_split_boundaries_.clear();
+        preload_prologue_spans_.clear();
         last_stats_ = {};
         last_stats_.hwperf_evidence_failure_total = hwperf_evidence_failure_total_;
         pending_kernel_id_.reset();
@@ -3466,6 +3468,8 @@ void RpuKernelGraph::invalidate_impl(bool from_abort) {
     kernels_.clear();
     nodes_.clear();
     segments_.clear();
+    safe_split_boundaries_.clear();
+    preload_prologue_spans_.clear();
     // invalidate 是硬重置:录制状态没了,keep_alive 的引用也就没有持有的理由。
     // 保持三条生命周期入口(begin_impl PASSTHROUGH / end / invalidate←abort)
     // 对称,免得下一个 keep_alive 生产方继承一个静默的滞留窗口。
@@ -3947,4 +3951,92 @@ std::vector<int> RpuKernelGraph::resolve_recording_input_deps(
     }
     std::sort(deps.begin(), deps.end());
     return deps;
+}
+
+void RpuKernelGraph::mark_safe_split_boundary() {
+    if (state_ != State::RECORDING) return;
+    const size_t pos = nodes_.size();
+    if (safe_split_boundaries_.empty() || safe_split_boundaries_.back() < pos) {
+        safe_split_boundaries_.push_back(pos);
+    }
+}
+
+void RpuKernelGraph::mark_segment_preload_prologue(size_t begin_idx,
+                                                   size_t end_idx) {
+    if (state_ != State::RECORDING) return;
+    TORCH_CHECK(begin_idx <= end_idx && end_idx <= nodes_.size(),
+                "mark_segment_preload_prologue: invalid range [", begin_idx,
+                ", ", end_idx, ") for ", nodes_.size(), " nodes");
+    if (begin_idx == end_idx) return;
+    TORCH_CHECK(preload_prologue_spans_.empty() ||
+                    begin_idx >= preload_prologue_spans_.back().second,
+                "mark_segment_preload_prologue: overlapping/out-of-order range [",
+                begin_idx, ", ", end_idx, ") after [",
+                preload_prologue_spans_.back().first, ", ",
+                preload_prologue_spans_.back().second, ")");
+    if (!preload_prologue_spans_.empty() &&
+        preload_prologue_spans_.back().second == begin_idx) {
+        preload_prologue_spans_.back().second = end_idx;
+    } else {
+        preload_prologue_spans_.emplace_back(begin_idx, end_idx);
+    }
+}
+
+ScopedEagerAtomicBatch::ScopedEagerAtomicBatch(bool enabled, int num_cores)
+    : num_cores_(num_cores) {
+    if (!enabled) return;
+    TORCH_CHECK(num_cores >= 1 && num_cores <= 8,
+                "ScopedEagerAtomicBatch: num_cores must be in [1, 8], got ",
+                num_cores);
+    RpuKernelGraph& g = graph_for(num_cores);
+    g.begin();
+    graph_ = &g;
+}
+
+ScopedEagerAtomicBatch::~ScopedEagerAtomicBatch() {
+    if (graph_ == nullptr) return;
+    try {
+        graph_->abort();
+    } catch (...) {
+    }
+}
+
+size_t ScopedEagerAtomicBatch::default_flush_node_threshold() noexcept {
+    const size_t max_entries =
+        static_cast<size_t>(rpu_lkn_batch_config_at_load().max_entries);
+    return std::max<size_t>(64, std::min<size_t>(45000, (max_entries * 3) / 4));
+}
+
+void ScopedEagerAtomicBatch::flush_and_reopen() {
+    if (graph_ == nullptr) return;
+    submit();
+    RpuKernelGraph& g = graph_for(num_cores_);
+    g.begin();
+    graph_ = &g;
+}
+
+void ScopedEagerAtomicBatch::submit() {
+    if (graph_ == nullptr) return;
+    RpuKernelGraph* graph = graph_;
+    graph_ = nullptr;
+    try {
+        graph->end();
+    } catch (...) {
+        try {
+            graph->abort();
+        } catch (...) {
+        }
+        throw;
+    }
+}
+
+RpuKernelGraph& ScopedEagerAtomicBatch::graph_for(int num_cores) {
+    thread_local std::array<std::unique_ptr<RpuKernelGraph>, 8> graphs;
+    auto& graph = graphs.at(static_cast<size_t>(num_cores - 1));
+    if (!graph) {
+        GraphRuntimePolicy policy;
+        policy.execution_core_count = num_cores;
+        graph = std::make_unique<RpuKernelGraph>(policy);
+    }
+    return *graph;
 }

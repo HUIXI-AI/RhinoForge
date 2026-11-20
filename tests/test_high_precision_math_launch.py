@@ -118,6 +118,13 @@ struct SpmAllocator {
 std::vector<c10::Half> slab;
 bool staged = false;
 int dma_in = 0, dma_out = 0, device_address_queries = 0;
+struct ScopedEagerAtomicBatch {
+  ScopedEagerAtomicBatch(bool, int) {}
+  size_t recorded_node_count() const noexcept { return 0; }
+  static size_t default_flush_node_threshold() noexcept { return 45000; }
+  void flush_and_reopen() {}
+  void submit() {}
+};
 void rpu_launch_ddr_broadcast_spm_dma_immediate(c10::Half* x, int64_t n, uint32_t addr, int cores) {
   assert(addr == 0x40001000 && cores == 1 && n * 2 <= int64_t(SPM_ALLOC.allocated));
   assert(n % 8 == 0 && !staged);
@@ -126,6 +133,12 @@ void rpu_launch_ddr_broadcast_spm_dma_immediate(c10::Half* x, int64_t n, uint32_
 void rpu_launch_spm_copy_ddr_dma_immediate(uint32_t addr, c10::Half* out, int64_t n) {
   assert(addr == 0x40001000 && staged && n == int64_t(slab.size()));
   std::copy(slab.begin(), slab.end(), out); staged = false; ++dma_out;
+}
+void rpu_launch_ddr_broadcast_spm_dma(c10::Half* x, int64_t n, uint32_t addr, int cores) {
+  rpu_launch_ddr_broadcast_spm_dma_immediate(x, n, addr, cores);
+}
+void rpu_launch_spm_copy_ddr_dma(uint32_t addr, c10::Half* out, int64_t n) {
+  rpu_launch_spm_copy_ddr_dma_immediate(addr, out, n);
 }
 void rpu_ddr_flush(void*) {}
 uint64_t RpuGetDevAddr(void*) { ++device_address_queries; return 0x1200000000ull; }

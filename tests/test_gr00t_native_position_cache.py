@@ -641,6 +641,8 @@ void submit_immediate_batch(Queue_t*q,const char*){
  }
 }
 struct RpuKernelGraph{static bool active;static void check_direct_immediate_dma_allowed(const char*){TORCH_CHECK(!active);}};bool RpuKernelGraph::active=false;
+namespace graph_dma{bool active(){return RpuKernelGraph::active;}}
+struct ScopedEagerAtomicBatch{ScopedEagerAtomicBatch(bool,int){}void submit(){}};
 struct SpmAllocator{
  static constexpr size_t SPM_PLANNING_BUDGET=8303708,ALIGN=256;
  struct AllocRequest{int64_t bytes;int first,last;};
@@ -652,6 +654,10 @@ struct SpmAllocator{
 }SPM_ALLOC;
 bool SpmAllocator::scratch=false;size_t SpmAllocator::available=SpmAllocator::SPM_PLANNING_BUDGET;int SpmAllocator::releases=0;
 void rpu_launch_gather_embedding_kernel(c10::Half*,int32_t*,uint32_t,int64_t,int64_t,int){throw std::runtime_error("prefix route must not gather");}
+void rpu_launch_ddr_broadcast_spm_dma_immediate(c10::Half*,int64_t,uint32_t,int);
+void rpu_launch_spm_copy_ddr_dma_immediate(uint32_t,c10::Half*,int64_t);
+void rpu_launch_ddr_broadcast_spm_dma(c10::Half*s,int64_t n,uint32_t d,int c){rpu_launch_ddr_broadcast_spm_dma_immediate(s,n,d,c);}
+void rpu_launch_spm_copy_ddr_dma(uint32_t s,c10::Half*d,int64_t n){rpu_launch_spm_copy_ddr_dma_immediate(s,d,n);}
 ''' + macros + '\n' + dma + '\n' + input_builder + r'''
 int main(){
  constexpr int64_t N=225,H=2048,L=49;constexpr size_t BYTES=N*H*2;

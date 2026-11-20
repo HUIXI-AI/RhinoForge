@@ -243,7 +243,7 @@ struct RpuQueueCache {
 };
 struct QueueLaunchState {
     bool broadcast_mode = true;
-    bool flush_icache = false;
+    bool flush_icache = true;
     bool operator!=(const QueueLaunchState& rhs) const {
         return broadcast_mode != rhs.broadcast_mode || flush_icache != rhs.flush_icache;
     }
@@ -278,9 +278,17 @@ struct Census {
 };
 struct Segment {
     size_t segment_id = 0, start_idx = 0, end_idx = 0;
+    std::vector<std::pair<size_t, size_t>> prologue_spans;
     std::vector<uint8_t> core_ids;
     QueueLaunchState queue_state;
     Census census;
+    template <typename Fn>
+    void for_each_node_index(Fn&& fn) const {
+        for (const auto& [b, e] : prologue_spans) {
+            for (size_t i = b; i < e; ++i) fn(i);
+        }
+        for (size_t i = start_idx; i < end_idx; ++i) fn(i);
+    }
 };
 struct SegmentResourceUse { size_t entries = 0, kd_bytes = 0, instr_bytes = 0; uint16_t active_streams = 0; };
 using SegmentResourceBudget = SegmentResourceUse;
@@ -318,6 +326,8 @@ struct RpuKernelGraph {
     explicit RpuKernelGraph(GraphRuntimePolicy policy = {}, bool single = false) : runtime_policy_(policy), require_single_segment_(single) {}
     std::vector<GraphNode> nodes_;
     std::vector<Segment> segments_;
+    std::vector<size_t> safe_split_boundaries_;
+    std::vector<std::pair<size_t, size_t>> preload_prologue_spans_;
     std::vector<int> kernels_;
     std::optional<GraphSignature> pending_signature_;
     bool has_built_signature_ = false;
@@ -461,20 +471,39 @@ int main(int argc, char** argv) {
         built.pending_signature_=GraphSignature{};
         built.build_segments_from_nodes(); assert(built.segments_.size()==1);
         const auto baseline=native_segment_resource_budget("rpu_causal_decoder",policy,false);
-        assert(baseline.entries==4096 && baseline.kd_bytes==(size_t{4}<<20));
-        assert(baseline.instr_bytes==(size_t{32}<<20));
+        assert(baseline.entries==65536 && baseline.kd_bytes==(size_t{8}<<20));
+        assert(baseline.instr_bytes==(size_t{64}<<20));
         assert(policy.lkn_max_batch_entries==65536 && policy.lkn_kd_buf_mb==8
                && policy.lkn_instr_buf_mb==64);
-        // The new ceiling cannot enlarge a smaller caller/SDK resource limit.
+        // The unified ceiling cannot enlarge a smaller caller/SDK resource limit.
         auto lower=policy; lower.lkn_max_batch_entries=1024;
         lower.lkn_kd_buf_mb=2; lower.lkn_instr_buf_mb=8;
         RpuKernelGraph small(lower); small.pending_signature_=sig;
         small.nodes_.assign(1025,kernel({0,1,2,3}));
-        small.build_segments_from_nodes(); assert(small.segments_.size()==3);
-        assert(small.segments_[0].end_idx==512 && small.segments_[1].end_idx==1024);
+        small.build_segments_from_nodes(); assert(small.segments_.size()==2);
+        assert(small.segments_[0].end_idx==1024 && small.segments_[1].end_idx==1025);
         const auto lower_budget=native_segment_resource_budget("rpu_causal_decoder",lower,false);
-        assert(lower_budget.kd_bytes==(size_t{1}<<20)
-               && lower_budget.instr_bytes==(size_t{4}<<20));
+        assert(lower_budget.kd_bytes==(size_t{2}<<20)
+               && lower_budget.instr_bytes==(size_t{8}<<20));
+        // Safe split boundaries + preload prologue replay on segment_id > 0.
+        test_native_budget=false; test_entry_budget=10;
+        RpuKernelGraph split_safe(policy);
+        split_safe.nodes_.assign(16, kernel({0,1,2,3}));
+        split_safe.preload_prologue_spans_={{0, 2}};
+        split_safe.safe_split_boundaries_={2, 7, 12};
+        split_safe.build_segments_from_nodes();
+        assert(split_safe.segments_.size()==3);
+        // Segment 0 covers [0, 7): cuts cleanly at safe boundary 7 before hitting 10.
+        assert(split_safe.segments_[0].prologue_spans.empty());
+        assert(split_safe.segments_[0].start_idx==0 && split_safe.segments_[0].end_idx==7);
+        // Segment 1 prepends prologue [0, 2) (2 entries), so body [7, 12) + 2 = 7 <= 10,
+        // and adding [12, 16) would reach 11 > 10 -> cuts cleanly at safe boundary 12!
+        assert((split_safe.segments_[1].prologue_spans==std::vector<std::pair<size_t,size_t>>{{0, 2}}));
+        assert(split_safe.segments_[1].start_idx==7 && split_safe.segments_[1].end_idx==12);
+        assert(split_safe.segments_[1].census.kernel_count==5);
+        assert((split_safe.segments_[2].prologue_spans==std::vector<std::pair<size_t,size_t>>{{0, 2}}));
+        assert(split_safe.segments_[2].start_idx==12 && split_safe.segments_[2].end_idx==16);
+        assert(split_safe.segments_[2].census.kernel_count==4);
     } else if (mode == "profile_fence") {
         test_native_budget=true; policy.execution_core_count=4;
         RpuKernelGraph graph(policy); graph.pending_signature_=causal_prefill_signature();
@@ -536,7 +565,7 @@ int main(int argc, char** argv) {
         auto fence = [](uint8_t self, uint8_t target) {
             auto node = barrier(); node.self_stream = self; node.target_stream = target; return node;
         };
-        auto other = kernel({0}); other.queue_state.flush_icache = true;
+        auto other = kernel({0}); other.queue_state.flush_icache = false;
         // A deferred burst stays open across an independent kernel and is
         // joined before the queue-state cut.
         graph.nodes_ = {kernel({0}), fence(2, 0), dma(1), kernel({0}), fence(0, 2), other};
@@ -565,7 +594,7 @@ int main(int argc, char** argv) {
         graph.nodes_ = {kernel({0}), kernel({0})};
         rejects([&] { graph.build_segments_from_nodes(); });
         test_entry_budget = 1000;
-        auto other = kernel({0}); other.queue_state.flush_icache = true;
+        auto other = kernel({0}); other.queue_state.flush_icache = false;
         graph.nodes_ = {kernel({0}), other};
         rejects([&] { graph.build_segments_from_nodes(); });
         graph.nodes_ = {branch()};
@@ -624,7 +653,7 @@ int main(int argc, char** argv) {
         graph.build_segments_from_nodes(); assert(graph.segments_.size()==2);
         assert(graph.segments_[0].end_idx==4 && graph.segments_[1].start_idx==4);
         test_entry_budget=1000;
-        auto other=kernel({0}); other.queue_state.flush_icache=true;
+        auto other=kernel({0}); other.queue_state.flush_icache=false;
         graph.nodes_={kernel({0}),branch(),other};
         graph.build_segments_from_nodes(); assert(graph.segments_.size()==2);
     } else if (mode == "admission") {

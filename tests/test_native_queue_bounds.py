@@ -78,7 +78,7 @@ struct GraphRuntimePolicy {
 };
 struct GraphSignature { std::string op_id_str; };
 struct QueueLaunchState {
-    bool broadcast_mode = true, flush_icache = false;
+    bool broadcast_mode = true, flush_icache = true;
     bool operator!=(const QueueLaunchState& rhs) const {
         return broadcast_mode != rhs.broadcast_mode || flush_icache != rhs.flush_icache;
     }
@@ -109,9 +109,17 @@ struct Census {
 };
 struct Segment {
     size_t segment_id=0, start_idx=0, end_idx=0;
+    std::vector<std::pair<size_t, size_t>> prologue_spans;
     std::vector<uint8_t> core_ids;
     QueueLaunchState queue_state;
     Census census;
+    template <typename Fn>
+    void for_each_node_index(Fn&& fn) const {
+        for (const auto& [b, e] : prologue_spans) {
+            for (size_t i = b; i < e; ++i) fn(i);
+        }
+        for (size_t i = start_idx; i < end_idx; ++i) fn(i);
+    }
 };
 struct SegmentResourceUse { size_t entries=0, kd_bytes=0, instr_bytes=0; uint16_t active_streams=0; };
 using SegmentResourceBudget = SegmentResourceUse;
@@ -130,6 +138,8 @@ struct RpuKernelGraph {
     GraphRuntimePolicy runtime_policy_;
     std::vector<GraphNode> nodes_;
     std::vector<Segment> segments_;
+    std::vector<size_t> safe_split_boundaries_;
+    std::vector<std::pair<size_t, size_t>> preload_prologue_spans_;
     std::vector<int> kernels_;
     std::optional<GraphSignature> pending_signature_;
     bool require_single_segment_ = false;

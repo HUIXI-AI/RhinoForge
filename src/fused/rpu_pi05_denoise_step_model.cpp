@@ -1763,7 +1763,7 @@ void Pi05DenoiseStepModel::set_adarms_table(const at::Tensor& table) {
                     && get_last_resolved_chunk_size() == 0,
                 "Pi0.5 AdaRMS table must be set after weights and before forward");
     TORCH_CHECK(table.defined() && table.dim() == 3 && table.size(0) > 0
-                    && table.size(0) * 1100 < 32000
+                    && table.size(0) * 1100 < 65536
                     && table.size(1) == 2 * num_layers() + 1
                     && table.size(2) == 3 * hidden_size()
                     && table.scalar_type() == at::kHalf
@@ -1813,7 +1813,7 @@ std::vector<int64_t> Pi05DenoiseStepModel::resolve_action_stage_domain(
         "RPU_PLANNER_REJECT:CAPABILITY: Pi0.5 denoise cache capacity does "
         "not cover the logical action rows");
     TORCH_CHECK(
-        num_steps > 0 && (!loop_mode || num_steps * 1100 < 32000),
+        num_steps > 0 && (!loop_mode || num_steps <= (65536 - 1) / 1100),
         "RPU_PLANNER_REJECT:CAPABILITY: invalid Pi0.5 denoise body count ",
         num_steps);
     TORCH_CHECK(
@@ -1900,7 +1900,7 @@ void Pi05DenoiseStepModel::restore_planned_route_profile(
     at::IntArrayRef descriptor, bool loop_mode, int64_t num_steps,
     int64_t prefix_len, int64_t cache_capacity) {
     TORCH_CHECK(
-        num_steps > 0 && (loop_mode ? num_steps <= (32000 - 1) / 1100 : num_steps == 1),
+        num_steps > 0 && (loop_mode ? num_steps <= (65536 - 1) / 1100 : num_steps == 1),
         "RPU_PLANNER_REJECT:EXACT_MISMATCH: invalid Pi0.5 denoise body count");
     TORCH_CHECK(
         prefix_len >= 0 && cache_capacity >= prefix_len + chunk_size_,
@@ -2653,10 +2653,9 @@ void Pi05DenoiseStepModel::denoise_loop_forward(
         && x_out.is_contiguous() && x_out.device().type() == at::kPrivateUse1,
         "denoise_loop_forward: x_out must match x0_rpu shape, fp16 contig rpu");
     TORCH_CHECK(num_steps >= 1, "num_steps must be >= 1");
-    // Node-count guard: a batch overflow is SILENT (build_batch return ignored).
-    // Cap is pending.size() <= 32768; budget ~1100 nodes/body with margin.
-    TORCH_CHECK(num_steps * 1100 < 32000,
-        "denoise_loop_forward: num_steps(", num_steps, ") * 1100 exceeds 32000 node cap");
+    // Node-count guard against the 65536 single-batch entry ceiling (~1100 nodes/body).
+    TORCH_CHECK(num_steps <= (65536 - 1) / 1100,
+        "denoise_loop_forward: num_steps(", num_steps, ") * 1100 exceeds 65536 node cap");
     TORCH_CHECK(prefix_len >= 0, "denoise_loop_forward: prefix_len must be >= 0");
     if (!k_caches.empty()) {
         const at::Tensor& k0 = k_caches[0];

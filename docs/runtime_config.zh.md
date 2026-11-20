@@ -97,6 +97,7 @@ Text/Vision、核数与 ACC 变体共用转换产物，运行参数不改变权�
 | `RPU_LOG_LEVEL` | `3`；十进制整数 `0..5`；无效值会告警并回退到 `3` | 原生扩展加载 / **IMPORT** | 进程日志级别：`0` 静默，最高 `5` trace。较高级别会增加输出，并可能暴露路径或请求 metadata。 |
 | `RPU_WARMUP` | `0`；整数；无效值变为 `0`，负数收窄为 `0` | Adapter 构造 / **MODEL** | 支持 warmup 的 adapter 的 warmup forward 次数。会增加启动工作，并可能消耗诊断预算。 |
 | `RPU_CAUSAL_PREFILL_PADDING_BUDGET` | `64`；非负十进制整数 | 符合条件的 causal prefill 规划 / **CALL**；新 plan 需重建 Graph | 通用 Qwen3/Llama planner 可选 padding 的最大行数。`0` 禁用可选 padding；plan 变化会改变 Graph signature。 |
+| `RPU_CONCURRENT_SAFE_SPM` | `0`；未设置、空、`0` 或 `1` | Fused preload 与 Graph 分段准备 / **CALL**；修改后需重建 Graph / 重载模型 | `1` 在与其他 RPU 进程并发共享设备时强制每次前向及每个分段重新加载常驻 SPM 缓冲与跨层操作数，不依赖跨 batch SPM 驻留；其他值报错。 |
 | `LKN_MAX_BATCH_ENTRIES` | `65536`；正十进制数；无效/空/零使用默认值；上限 `4194304` | Launch 初始化与 Graph 规划 / **IMPORT** | batch submission 的进程容量。过小会拒绝 Graph；过大则预留更多 host 内存。 |
 | `LKN_KD_BUF_MB` | `8`；正 MiB；无效/空/零使用默认值；上限 `256` | Launch 初始化与 Graph 规划 / **IMPORT** | 进程 command-buffer 容量。过小会拒绝 Graph；过大则增加内存占用。 |
 | `LKN_INSTR_BUF_MB` | `64`；正 MiB；无效/空/零使用默认值；上限 `1024` | Launch 初始化与 Graph 规划 / **IMPORT** | 进程 execution-buffer 容量。过小会拒绝 Graph；过大则增加内存占用。 |

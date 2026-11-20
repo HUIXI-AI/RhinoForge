@@ -743,8 +743,8 @@ public:
                     "RhinoVLA high precision requires the ordinary ten-step v3 loop");
         TORCH_CHECK(num_steps >= 1, "RhinoVLA denoise loop num_steps must be >= 1");
         // Compare before multiplying so an untrusted int64 step count cannot
-        // overflow the existing conservative graph-node budget.
-        TORCH_CHECK(num_steps <= (32000 - 1) / 1400,
+        // overflow the conservative 65536 single-batch graph-node budget.
+        TORCH_CHECK(num_steps <= (65536 - 1) / 1400,
                     "RhinoVLA denoise loop node budget exceeded: num_steps=",
                     num_steps);
         TORCH_CHECK(std::isfinite(dt) && dt != 0.0,

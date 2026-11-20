@@ -3559,6 +3559,23 @@ protected:
 
     void emit_rope_table_preload() {
         TORCH_INTERNAL_ASSERT(rope_spm_enabled_ && max_hw_ > 0);
+        size_t prologue_begin = 0;
+        const bool record_prologue =
+            !rope_tables_use_persistent_storage() &&
+            RpuKernelGraph::has_active() &&
+            RpuKernelGraph::active().state() == RpuKernelGraph::State::RECORDING;
+        if (record_prologue) {
+            prologue_begin = RpuKernelGraph::active().recorded_node_count();
+        }
+        auto finalize_prologue = c10::make_scope_exit([&] {
+            if (record_prologue && RpuKernelGraph::has_active() &&
+                RpuKernelGraph::active().state() ==
+                    RpuKernelGraph::State::RECORDING) {
+                RpuKernelGraph::active().mark_segment_preload_prologue(
+                    prologue_begin,
+                    RpuKernelGraph::active().recorded_node_count());
+            }
+        });
         const int64_t tbl_elems = max_hw_ * (orig_head_dim_ / 4);
         rpu_ddr_flush(freq_cos_.data_ptr<c10::Half>());
         rpu_ddr_flush(freq_sin_.data_ptr<c10::Half>());

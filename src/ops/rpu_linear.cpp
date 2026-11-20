@@ -3391,56 +3391,8 @@ void validate_parallel_linear_grid(size_t rows, size_t cols,
 //
 // Only used when no Graph is on the active stack: inside a capture, a replay
 // or a PASSTHROUGH suffix the launcher keeps its existing per-step behaviour.
-// The scope is per core count so a reduced-core call gets the reduced-core
-// SDK entry ceiling (segment_resource_budget).
-class EagerLinearBatch {
- public:
-  EagerLinearBatch(bool enabled, int num_cores) {
-    if (!enabled) return;
-    graph_ = &graph_for(num_cores);
-    graph_->begin();
-  }
-  EagerLinearBatch(const EagerLinearBatch&) = delete;
-  EagerLinearBatch& operator=(const EagerLinearBatch&) = delete;
-  // An exception between begin() and submit() leaves recorded, unexecuted
-  // nodes; abort() drops them and pops the scope so later eager work is not
-  // recorded into a dead Graph. It is idempotent after a failed end().
-  ~EagerLinearBatch() {
-    if (graph_ == nullptr) return;
-    try {
-      graph_->abort();
-    } catch (...) {
-    }
-  }
-  bool active() const { return graph_ != nullptr; }
-  void submit() {
-    RpuKernelGraph* graph = graph_;
-    graph_ = nullptr;
-    try {
-      graph->end();
-    } catch (...) {
-      // Report the end() failure, not a secondary abort() failure.
-      try {
-        graph->abort();
-      } catch (...) {
-      }
-      throw;
-    }
-  }
-
- private:
-  static RpuKernelGraph& graph_for(int num_cores) {
-    thread_local std::array<std::unique_ptr<RpuKernelGraph>, NUM_CORES> graphs;
-    auto& graph = graphs.at(static_cast<size_t>(num_cores - 1));
-    if (!graph) {
-      GraphRuntimePolicy policy;
-      policy.execution_core_count = num_cores;
-      graph = std::make_unique<RpuKernelGraph>(policy);
-    }
-    return *graph;
-  }
-  RpuKernelGraph* graph_ = nullptr;
-};
+// The scope is per core count so core/DMA channel admission matches num_cores.
+using EagerLinearBatch = ScopedEagerAtomicBatch;
 }
 
 // Public W4 DDR projection uses the same pgrp ABI as fused decoder projections.
@@ -3737,6 +3689,12 @@ void rpu_launch_linear_ddr_kernel(const at::Tensor &input, const at::Tensor &wei
               "M=", m, " K=", k, " N=", n, " (needs ", slack + row_bytes, " B",
               col_scatter ? ", already without the all-gather landing zone)" : ")");
   size_t m_chunk = col_scatter ? 1 : (free_bytes - slack) / row_bytes;
+  if (col_scatter_rows) {
+    const size_t flush_threshold = ScopedEagerAtomicBatch::default_flush_node_threshold();
+    const size_t max_rows_per_batch = std::max<size_t>(
+        1, flush_threshold / std::max<size_t>(1, static_cast<size_t>(num_cores)));
+    m_chunk = std::min(m_chunk, max_rows_per_batch);
+  }
   if (m_chunk > m) m_chunk = m;
   if (m_chunk > 65535) m_chunk = 65535;  // reg9 (local_m) / all_gather reg1 are uint16
 
@@ -3748,17 +3706,19 @@ void rpu_launch_linear_ddr_kernel(const at::Tensor &input, const at::Tensor &wei
       (partition == 0 || col_scatter || col_scatter_rows)
           ? 0
           : SPM_ALLOC.addr(0, SPM_ALLOC.alloc_temporary(m_chunk * n * a_dwidth));
-  // Eager col partition: the whole call is one SDK submission (see
-  // EagerLinearBatch) unless col_scatter_rows dispatches its own immediate
-  // QueueCache row-scatter batch. Declared after spm_scope, so every SPM
-  // temporary of this call outlives the batch, and after col_scatter /
-  // col_scatter_rows were chosen from the eager state.
+  // Eager col partition (including col_scatter_rows): run as one atomic
+  // one-shot SDK submission via EagerLinearBatch. Declared after spm_scope, so
+  // every SPM temporary of this call outlives the batch, and after col_scatter
+  // / col_scatter_rows were chosen from the eager state.
   EagerLinearBatch eager_batch(
-      partition != 0 && !col_scatter_rows && !RpuKernelGraph::has_active(),
+      partition != 0 && !RpuKernelGraph::has_active(),
       num_cores);
   uint32_t b_addr = 0;
   if (kernel_applies_bias) {
     b_addr = SPM_ALLOC.addr(0, SPM_ALLOC.alloc_temporary(local_n * a_dwidth));
+  }
+  auto emit_col_bias_upload = [&]() {
+    if (!kernel_applies_bias) return;
     // col partition: core c owns columns [c*local_n, (c+1)*local_n) of the bias
     //
     // The weight reaches the kernel as a REGISTER (w_addr), which REPLAY re-syncs
@@ -3778,7 +3738,8 @@ void rpu_launch_linear_ddr_kernel(const at::Tensor &input, const at::Tensor &wei
       rpu_launch_ddr_scatter_spm_dma(bp, local_n, local_n * a_dwidth,
                                      b_addr, num_cores);
     }
-  }
+  };
+  emit_col_bias_upload();
 
   // Row partition only: DDR staging for the strided input repack and for the
   // per-core partial sums on the way back. Both are host-touched, so both need
@@ -3796,14 +3757,26 @@ void rpu_launch_linear_ddr_kernel(const at::Tensor &input, const at::Tensor &wei
   }
 
   // Col input and fixed bias are published by their DDR->SPM wrappers in
-  // eager and Graph paths. Row repacking and its host bias addition still
-  // need publication here; mutable col bias was published before its DMA.
-  if (partition == 0) rpu_ddr_flush(xp);
+  // eager and Graph paths. Row repacking reads a device-produced input on the
+  // CPU, so acquire the logical range before memcpy even when the optional
+  // intra-device flush is disabled. Mutable col bias was published before DMA.
+  if (partition == 0) rpu_ddr_flush_force_sized(xp, input.nbytes());
   rpu_ddr_flush(wp);
   if (has_bias && partition == 0) rpu_ddr_flush(bp);
 
   for (size_t row0 = 0; row0 < m; row0 += m_chunk) {
     const size_t cur_m = (m - row0 < m_chunk) ? (m - row0) : m_chunk;
+    const size_t est_chunk_nodes =
+        (col_scatter_rows ? cur_m * static_cast<size_t>(num_cores) : 0) + 64;
+    if (eager_batch.active() &&
+        eager_batch.recorded_node_count() + est_chunk_nodes >
+            ScopedEagerAtomicBatch::default_flush_node_threshold()) {
+      eager_batch.flush_and_reopen();
+      emit_col_bias_upload();
+    }
+    EagerLinearBatch row_chunk_batch(
+        partition == 0 && !in_graph && !RpuKernelGraph::has_active(),
+        num_cores);
 
     if (partition == 0) {
       // core c gets the column slice [c*local_k, (c+1)*local_k) of every row
@@ -3874,7 +3847,7 @@ void rpu_launch_linear_ddr_kernel(const at::Tensor &input, const at::Tensor &wei
       if (col_scatter_rows) {
         // Core c holds row r's columns [c*local_n, (c+1)*local_n) at
         // y_addr + r*local_n; every row is the m == 1 scatter above.
-        rpu_launch_spm_scatter_rows_ddr_dma_immediate(
+        rpu_launch_spm_scatter_rows_ddr_dma(
             y_addr, yp + row0 * n, static_cast<int64_t>(cur_m),
             static_cast<int64_t>(local_n),
             static_cast<int64_t>(local_n * a_dwidth),
@@ -3900,6 +3873,9 @@ void rpu_launch_linear_ddr_kernel(const at::Tensor &input, const at::Tensor &wei
     // Row partition (eager only): per-core outputs are full-width PARTIAL SUMS.
     rpu_launch_spm_scatter_ddr_dma(y_addr, ys, cur_m * local_n,
                                    cur_m * local_n * a_dwidth, num_cores);
+    if (row_chunk_batch.active()) {
+      row_chunk_batch.submit();
+    }
     rpu_ddr_flush_force(ys);
 
     c10::Half* out = yp + row0 * n;
@@ -4192,6 +4168,7 @@ Tensor tts_codec_device_rows_to_cpu_nct(const Tensor& rows) {
 
 Tensor tts_codec_im2col_rows(const Tensor& rows, int64_t kernel,
                              int64_t dilation, int64_t left_padding) {
+  TORCH_CHECK(!graph_dma::active(), "tts_codec_im2col_rows: eager only");
   TORCH_CHECK(rows.device().type() == at::kPrivateUse1 &&
                   rows.scalar_type() == at::kHalf && rows.dim() == 2 &&
                   rows.is_contiguous() && kernel > 0 && dilation > 0 &&
@@ -4225,7 +4202,14 @@ Tensor tts_codec_im2col_rows(const Tensor& rows, int64_t kernel,
   const uint32_t column_spm = SPM_ALLOC.addr(0, column_off);
   auto* source = const_cast<c10::Half*>(rows.data_ptr<c10::Half>());
   auto* destination = patches.data_ptr<c10::Half>();
+  ScopedEagerAtomicBatch eager_batch(!RpuKernelGraph::has_active(), 1);
+  const size_t eager_flush_threshold =
+      ScopedEagerAtomicBatch::default_flush_node_threshold();
   for (int64_t row = 0; row < count; row += max_rows) {
+    if (eager_batch.active() &&
+        eager_batch.recorded_node_count() + 16 > eager_flush_threshold) {
+      eager_batch.flush_and_reopen();
+    }
     const int64_t chunk = std::min(count - row, max_rows);
     const int64_t segment = chunk + width - 1;
     const int64_t source_begin = row - left_padding;
@@ -4234,7 +4218,7 @@ Tensor tts_codec_im2col_rows(const Tensor& rows, int64_t kernel,
     rpu_launch_fill_spm_kernel(
         input_spm, segment * channels, c10::Half(0.0f), 1);
     if (valid_end > valid_begin) {
-      rpu_launch_ddr_broadcast_spm_dma_immediate(
+      rpu_launch_ddr_broadcast_spm_dma(
           source + valid_begin * channels,
           (valid_end - valid_begin) * channels,
           input_spm + (valid_begin - source_begin) * channels * sizeof(c10::Half),
@@ -4244,9 +4228,13 @@ Tensor tts_codec_im2col_rows(const Tensor& rows, int64_t kernel,
         input_off, column_off, 1, 1, static_cast<int>(segment),
         static_cast<int>(channels), 1, static_cast<int>(kernel),
         0, 0, 0, 0, 1, 1, 1, static_cast<int>(dilation), 1);
-    rpu_launch_spm_copy_ddr_dma_immediate(
+    rpu_launch_spm_copy_ddr_dma(
         column_spm, destination + row * kernel * channels,
         chunk * kernel * channels);
+  }
+  if (eager_batch.active()) {
+    eager_batch.submit();
+    rpu_ddr_flush(destination);
   }
   return patches;
 }
@@ -4259,6 +4247,7 @@ Tensor tts_codec_snake_rows(const Tensor& rows, const Tensor& alpha,
 
 Tensor tts_codec_layernorm_rows(const Tensor& rows, const Tensor& weight,
                                 const Tensor& bias, double eps) {
+  TORCH_CHECK(!graph_dma::active(), "tts_codec_layernorm_rows: eager only");
   const int64_t channels = rows.size(1);
   auto output = at::empty_like(rows);
   if (!SPM_ALLOC.is_initialized()) SPM_ALLOC.init();
@@ -4275,23 +4264,38 @@ Tensor tts_codec_layernorm_rows(const Tensor& rows, const Tensor& weight,
       0, SPM_ALLOC.alloc_temporary(channels * sizeof(c10::Half)));
   const uint32_t bias_spm = SPM_ALLOC.addr(
       0, SPM_ALLOC.alloc_temporary(channels * sizeof(c10::Half)));
-  rpu_launch_ddr_broadcast_spm_dma_immediate(
-      const_cast<c10::Half*>(weight.data_ptr<c10::Half>()),
-      channels, weight_spm, 1);
-  rpu_launch_ddr_broadcast_spm_dma_immediate(
-      const_cast<c10::Half*>(bias.data_ptr<c10::Half>()),
-      channels, bias_spm, 1);
+  ScopedEagerAtomicBatch eager_batch(!RpuKernelGraph::has_active(), 1);
+  auto emit_ln_params = [&]() {
+    rpu_launch_ddr_broadcast_spm_dma(
+        const_cast<c10::Half*>(weight.data_ptr<c10::Half>()),
+        channels, weight_spm, 1);
+    rpu_launch_ddr_broadcast_spm_dma(
+        const_cast<c10::Half*>(bias.data_ptr<c10::Half>()),
+        channels, bias_spm, 1);
+  };
+  emit_ln_params();
   auto* source = const_cast<c10::Half*>(rows.data_ptr<c10::Half>());
   auto* destination = output.data_ptr<c10::Half>();
+  const size_t eager_flush_threshold =
+      ScopedEagerAtomicBatch::default_flush_node_threshold();
   for (int64_t row = 0; row < rows.size(0); row += max_rows) {
+    if (eager_batch.active() &&
+        eager_batch.recorded_node_count() + 16 > eager_flush_threshold) {
+      eager_batch.flush_and_reopen();
+      emit_ln_params();
+    }
     const int64_t count = std::min(rows.size(0) - row, max_rows);
-    rpu_launch_ddr_broadcast_spm_dma_immediate(
+    rpu_launch_ddr_broadcast_spm_dma(
         source + row * channels, count * channels, input_spm, 1);
     rpu_launch_layernorm_spm_kernel(
         input_spm, output_spm, weight_spm, bias_spm,
         count, channels, eps, false, 0, 1);
-    rpu_launch_spm_copy_ddr_dma_immediate(
+    rpu_launch_spm_copy_ddr_dma(
         output_spm, destination + row * channels, count * channels);
+  }
+  if (eager_batch.active()) {
+    eager_batch.submit();
+    rpu_ddr_flush(destination);
   }
   return output;
 }
@@ -4867,24 +4871,35 @@ Tensor rpu_tts_codec_transpose_overlap(
   const uint32_t input_spm = alloc(input_elements), head = alloc(work_elements);
   const uint32_t tail = alloc(work_elements), sum = alloc(work_elements);
   const uint32_t output_spm = alloc(work_elements), bias_spm = alloc(padded);
-  if (bias.has_value()) {
-    rpu_launch_ddr_broadcast_spm_dma_immediate(
-        const_cast<c10::Half*>(bias->data_ptr<c10::Half>()), padded, bias_spm, 1);
-  }
+  ScopedEagerAtomicBatch eager_batch(!RpuKernelGraph::has_active(), 1);
+  auto emit_overlap_bias = [&]() {
+    if (bias.has_value()) {
+      rpu_launch_ddr_broadcast_spm_dma(
+          const_cast<c10::Half*>(bias->data_ptr<c10::Half>()), padded, bias_spm, 1);
+    }
+  };
+  emit_overlap_bias();
   auto output = at::empty({groups * stride, padded}, projected.options());
   auto* source = const_cast<c10::Half*>(projected.data_ptr<c10::Half>());
+  const size_t eager_flush_threshold =
+      ScopedEagerAtomicBatch::default_flush_node_threshold();
   for (int64_t start = 0; start < groups; start += tile) {
+    if (eager_batch.active() &&
+        eager_batch.recorded_node_count() + 24 > eager_flush_threshold) {
+      eager_batch.flush_and_reopen();
+      emit_overlap_bias();
+    }
     const int64_t n = std::min(tile, groups - start), elements = n * block;
     uint32_t result = input_spm;
     if (direct) {
-      rpu_launch_ddr_broadcast_spm_dma_immediate(source + start * block,
-                                                elements, input_spm, 1);
+      rpu_launch_ddr_broadcast_spm_dma(source + start * block,
+                                        elements, input_spm, 1);
     } else {
       // Reload the previous group at every tile boundary; pad only the sequence ends.
       rpu_launch_fill_spm_kernel(input_spm, (n + 1) * 2 * block, c10::Half(0.0f), 1);
       const int64_t begin = std::max<int64_t>(0, start - 1);
       const int64_t end = std::min(count, start + n);
-      rpu_launch_ddr_broadcast_spm_dma_immediate(
+      rpu_launch_ddr_broadcast_spm_dma(
           source + begin * 2 * block, (end - begin) * 2 * block,
           input_spm + (begin - start + 1) * 2 * block * sizeof(c10::Half), 1);
       rpu_launch_slice_spm_kernel(input_spm + 2 * block * sizeof(c10::Half), head,
@@ -4901,8 +4916,12 @@ Tensor rpu_tts_codec_transpose_overlap(
           c10::Half(1.0f), ValuOpType::ADD, false, 1);
       result = output_spm;
     }
-    rpu_launch_spm_copy_ddr_dma_immediate(
+    rpu_launch_spm_copy_ddr_dma(
         result, output.data_ptr<c10::Half>() + start * block, elements);
+  }
+  if (eager_batch.active()) {
+    eager_batch.submit();
+    rpu_ddr_flush(output.data_ptr<c10::Half>());
   }
   return output;
 }

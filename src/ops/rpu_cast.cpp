@@ -73,6 +73,8 @@ void rpu_launch_cast_uint8_fp16_kernel(uint32_t in_spm_addr,
 at::Tensor rpu_cast_uint8_fp16(const at::Tensor &input)
 {
     RECORD_FUNCTION("rpu::cast_uint8_fp16", {});
+    TORCH_CHECK(!graph_dma::active(),
+                "cast_uint8_fp16: eager only; use cast_uint8_fp16_into inside Graph capture");
     TORCH_CHECK(input.scalar_type() == at::kByte,
                 "cast_uint8_fp16: input must be uint8, got ", input.scalar_type());
     TORCH_CHECK(input.is_contiguous(), "cast_uint8_fp16: input must be contiguous");
@@ -94,16 +96,22 @@ at::Tensor rpu_cast_uint8_fp16(const at::Tensor &input)
     const uint32_t in_spm = SPM_ALLOC.addr(0, in_off);
     const uint32_t out_spm = SPM_ALLOC.addr(0, out_off);
 
-    // 1. uint8 DDR → SPM (immediate: build_batch + enqueu_batch(true) WAITS, so
-    //    SPM holds the input before the cast runs). Step 2 direct-launches on
-    //    the dedicated PASSTHROUGH kernel queue, isolated from this immediate
-    //    DMA QueueCache batch. The helper also consumes the completed one-shot
-    //    state before returning.
-    rpu_launch_ddr_spm_bytes_immediate(input.data_ptr(), n, in_spm);
-    // 2. cast SPM(uint8) → SPM(fp16).
-    rpu_launch_cast_uint8_fp16_kernel(in_spm, out_spm, n);
-    // 3. fp16 SPM → DDR.
-    rpu_launch_spm_copy_ddr_dma_immediate(out_spm, out.data_ptr<c10::Half>(), n);
+    const bool eager_batch = !graph_dma::active();
+    {
+        ScopedEagerAtomicBatch batch(eager_batch, /*num_cores=*/1);
+        // 1. uint8 DDR → SPM (reinterpreted as n/2 fp16 elements so the 16B-aligned
+        //    byte copy records into one atomic batch alongside the cast and writeback).
+        rpu_launch_ddr_broadcast_spm_dma(
+            reinterpret_cast<c10::Half *>(input.data_ptr()), n / 2, in_spm, /*num_cores=*/1);
+        // 2. cast SPM(uint8) → SPM(fp16).
+        rpu_launch_cast_uint8_fp16_kernel(in_spm, out_spm, n);
+        // 3. fp16 SPM → DDR.
+        rpu_launch_spm_copy_ddr_dma(out_spm, out.data_ptr<c10::Half>(), n);
+        if (eager_batch) {
+            batch.submit();
+            rpu_ddr_flush(out.data_ptr<c10::Half>());
+        }
+    }
 
     SPM_ALLOC.reset_temporary();
     return out;
@@ -115,7 +123,7 @@ at::Tensor rpu_cast_uint8_fp16(const at::Tensor &input)
 // one batch. Fixed graph DMAs bake the src/dst at BUILD, so the caller must pass persistent
 // stable-address buffers and refresh only their CONTENTS per frame (input via a flushed
 // upload; the graph runtime orders DDR→SPM→cast→SPM→DDR via segments — no hand barriers).
-// Outside a capture it falls back to the immediate path (same as rpu_cast_uint8_fp16).
+// Outside a capture it wraps the same 3 steps in a single ScopedEagerAtomicBatch.
 void rpu_cast_uint8_fp16_into(const at::Tensor &input, at::Tensor &output)
 {
     RECORD_FUNCTION("rpu::cast_uint8_fp16_into", {});
@@ -139,20 +147,17 @@ void rpu_cast_uint8_fp16_into(const at::Tensor &input, at::Tensor &output)
     const uint32_t in_spm = SPM_ALLOC.addr(0, in_off);
     const uint32_t out_spm = SPM_ALLOC.addr(0, out_off);
 
-    if (graph_dma::active()) {
-        // Graph path: fixed DMAs record as nodes (replayed in one batch). The uint8
-        // input is reinterpreted as n/2 fp16 elements so the fp16 broadcast helper moves
-        // exactly n bytes DDR→core-0 SPM (dtype-agnostic byte copy). Coherency: the
-        // caller flushes the input buffer via its per-frame upload; the output is
-        // consumed on-device by the following GEMM.
+    const bool eager_batch = !graph_dma::active();
+    {
+        ScopedEagerAtomicBatch batch(eager_batch, /*num_cores=*/1);
         rpu_launch_ddr_broadcast_spm_dma(
             reinterpret_cast<c10::Half *>(input.data_ptr()), n / 2, in_spm, /*num_cores=*/1);
         rpu_launch_cast_uint8_fp16_kernel(in_spm, out_spm, n);
         rpu_launch_spm_copy_ddr_dma(out_spm, output.data_ptr<c10::Half>(), n);
-    } else {
-        rpu_launch_ddr_spm_bytes_immediate(input.data_ptr(), n, in_spm);
-        rpu_launch_cast_uint8_fp16_kernel(in_spm, out_spm, n);
-        rpu_launch_spm_copy_ddr_dma_immediate(out_spm, output.data_ptr<c10::Half>(), n);
+        if (eager_batch) {
+            batch.submit();
+            rpu_ddr_flush(output.data_ptr<c10::Half>());
+        }
     }
 
     SPM_ALLOC.reset_temporary();

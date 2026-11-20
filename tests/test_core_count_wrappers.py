@@ -726,7 +726,10 @@ void rpu_launch_spm_scatter_ddr_dma_mutable(uint32_t src,const uint64_t* base,in
     ++mutable_writes;
     rpu_launch_spm_scatter_ddr_dma(src,reinterpret_cast<Half*>(*base+offset),count,stride,cores);
 }
-void rpu_launch_spm_scatter_rows_ddr_dma_immediate(uint32_t,Half* dst,int64_t rows,int64_t count,
+struct ScopedEagerAtomicBatch {
+    static size_t default_flush_node_threshold() noexcept { return 45000; }
+};
+void rpu_launch_spm_scatter_rows_ddr_dma(uint32_t,Half* dst,int64_t rows,int64_t count,
         int64_t spm_row_stride,int64_t ddr_row_stride,int64_t core_stride,int cores) {
     ++row_batches; assert(rows>0 && count>0 && spm_row_stride==count*2);
     assert(shard.size()==static_cast<size_t>(cores));

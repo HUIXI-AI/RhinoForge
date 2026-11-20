@@ -51,6 +51,7 @@ at::Tensor rpu_gr00t_precompute_adaln(
     const uint32_t result = SPM_ALLOC.addr(0, SPM_ALLOC.alloc_temporary(output * 2));
     auto table = at::empty({steps, layers, output}, cond.options());
     rpu_ddr_flush_force(cond.data_ptr<c10::Half>());
+    ScopedEagerAtomicBatch batch(/*enabled=*/true, cores);
     for (int64_t step = 0; step < steps; ++step) {
         rpu_launch_ddr_scatter_spm_dma(cond, step * h, h / cores,
                                      h / cores * 2, input, cores);
@@ -64,6 +65,8 @@ at::Tensor rpu_gr00t_precompute_adaln(
             rpu_launch_spm_copy_ddr_dma(result, table, (step * layers + layer) * output, output);
         }
     }
+    batch.submit();
+    rpu_ddr_flush(table.data_ptr<c10::Half>());
     return table;
 }
 
@@ -116,6 +119,7 @@ std::tuple<at::Tensor, at::Tensor> rpu_gr00t_precompute_time_glue(
     auto po1_table = at::empty({steps, output}, cond.options());
     rpu_ddr_flush_force(tau.data_ptr<c10::Half>());
     rpu_ddr_flush_force(cond.data_ptr<c10::Half>());
+    ScopedEagerAtomicBatch batch(/*enabled=*/true, /*num_cores=*/8);
     rpu_launch_ddr_broadcast_spm_dma(po1_bias, 0, output, bias, 1);
     for (int64_t step = 0; step < steps; ++step) {
         rpu_launch_ddr_broadcast_spm_dma(tau, step * horizon * h, horizon * h, input, 1);
@@ -130,5 +134,8 @@ std::tuple<at::Tensor, at::Tensor> rpu_gr00t_precompute_time_glue(
         rpu_launch_eltwise_binary_scalar_spm_kernel(scale, c10::Half(1.0), scale, h, ValuOpType::ADD);
         rpu_launch_spm_copy_ddr_dma(result, po1_table, step * output, output);
     }
+    batch.submit();
+    rpu_ddr_flush(tau_table.data_ptr<c10::Half>());
+    rpu_ddr_flush(po1_table.data_ptr<c10::Half>());
     return {tau_table, po1_table};
 }

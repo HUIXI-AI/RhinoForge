@@ -1797,3 +1797,58 @@ void rpu_launch_spm_scatter_rows_ddr_dma_immediate(uint32_t  spm_addr_unified,
     submit_immediate_batch(wq, caller);
     rpu_ddr_flush(ddr_base);
 }
+
+void rpu_launch_spm_scatter_rows_ddr_dma(uint32_t   spm_addr_unified,
+                                         c10::Half* ddr_base,
+                                         int64_t    rows,
+                                         int64_t    elements_per_core,
+                                         int64_t    spm_row_stride_bytes,
+                                         int64_t    ddr_row_stride_bytes,
+                                         int64_t    core_stride_bytes,
+                                         int        num_cores) {
+    if (!graph_dma::active()) {
+        rpu_launch_spm_scatter_rows_ddr_dma_immediate(
+            spm_addr_unified, ddr_base, rows, elements_per_core,
+            spm_row_stride_bytes, ddr_row_stride_bytes, core_stride_bytes,
+            num_cores);
+        return;
+    }
+    constexpr const char* caller = "spm_scatter_rows_ddr_dma";
+    TORCH_CHECK(ddr_base != nullptr, caller, ": null ddr_base");
+    TORCH_CHECK(num_cores >= 1 && num_cores <= 8,
+                caller, ": num_cores 1..8, got ", num_cores);
+    TORCH_CHECK(rows > 0 && elements_per_core > 0, caller,
+                ": rows and elements_per_core must be positive");
+    const size_t bytes =
+        static_cast<size_t>(elements_per_core) * sizeof(c10::Half);
+    TORCH_CHECK(bytes % 16 == 0 && spm_row_stride_bytes % 16 == 0 &&
+                    ddr_row_stride_bytes % 16 == 0 && core_stride_bytes % 16 == 0,
+                caller, ": bytes and strides must be 16-byte aligned");
+    TORCH_CHECK(bytes <= (8ULL << 20), caller, ": single-DMA cap is 8 MB, got ", bytes);
+    const uint32_t spm_base = SPM_ALLOC.addr(0, 0);
+    TORCH_CHECK(spm_addr_unified >= spm_base &&
+                    spm_row_stride_bytes >= static_cast<int64_t>(bytes) &&
+                    static_cast<uint64_t>(spm_addr_unified - spm_base) +
+                            static_cast<uint64_t>(rows - 1) *
+                                static_cast<uint64_t>(spm_row_stride_bytes) +
+                            bytes <= SpmAllocator::SPM_USABLE,
+                caller, ": SPM rows overlap or leave the core SPM");
+
+    rpu_ddr_flush(ddr_base);
+    const uint64_t ddr_abs = RpuGetDevAddr(ddr_base);
+    emit_scatter_pre_barriers(num_cores);
+    for (int c = 0; c < num_cores; ++c) {
+        for (int64_t r = 0; r < rows; ++r) {
+            graph_dma::emit_fixed(
+                spm_unified_to_per_core_abs(
+                    c, spm_addr_unified +
+                           static_cast<uint32_t>(r * spm_row_stride_bytes)),
+                ddr_abs + static_cast<uint64_t>(r) *
+                              static_cast<uint64_t>(ddr_row_stride_bytes) +
+                    static_cast<uint64_t>(c) *
+                        static_cast<uint64_t>(core_stride_bytes),
+                bytes, c);
+        }
+    }
+    emit_scatter_post_barriers(num_cores);
+}

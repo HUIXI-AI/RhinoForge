@@ -289,7 +289,7 @@ def _c(**counts: int) -> Counter[str]:
     return Counter({aliases[name]: value for name, value in counts.items()})
 
 
-# Exact source-level inventory, including the explicit GELU-ERF operator.
+# Exact source-level inventory of remaining immediate DMA escape hatches.
 IMMEDIATE_CALLERS: dict[tuple[str, str], Counter[str]] = {
     ("src/ops/rpu_all_gather.cpp", "rpu_all_gather_test"): _c(
         ddr_scatter=1, spm_copy=1
@@ -297,36 +297,11 @@ IMMEDIATE_CALLERS: dict[tuple[str, str], Counter[str]] = {
     ("src/ops/rpu_bmm.cpp", "rpu_bmm_spm_test"): _c(
         broadcast=2, spm_copy=1
     ),
-    ("src/ops/rpu_cast.cpp", "rpu_cast_uint8_fp16"): _c(
-        byte_copy=1, spm_copy=1
-    ),
-    ("src/ops/rpu_cast.cpp", "rpu_cast_uint8_fp16_into"): _c(
-        byte_copy=1, spm_copy=1
-    ),
     ("src/ops/rpu_cumsum.cpp", "rpu_cumsum_test"): _c(
         broadcast=1, spm_copy=1
     ),
     ("src/ops/rpu_eltwise_binary.cpp", "rpu_eltwise_bx1xc_test"): _c(
         broadcast=2, spm_copy=1
-    ),
-    ("src/ops/rpu_eltwise_unary.cpp", "rpu_gelu_erf"): _c(
-        broadcast=1, spm_copy=1
-    ),
-    ("src/ops/rpu_eltwise_unary.cpp", "rpu_launch_eltwise_unary_kernel"): _c(
-        broadcast=1, spm_copy=1
-    ),
-    ("src/ops/rpu_eltwise_unary.cpp", "rpu_gelu_erf"): _c(
-        broadcast=1, spm_copy=1
-    ),
-    ("src/ops/rpu_embedding.cpp", "rpu_gather_embedding"): _c(spm_copy=1),
-    ("src/ops/rpu_embedding.cpp", "rpu_assemble_inputs_embeds"): _c(
-        broadcast=1, spm_copy=1
-    ),
-    ("src/ops/rpu_embedding.cpp", "rpu_assemble_inputs_embeds_parts"): _c(
-        broadcast=1, spm_copy=1
-    ),
-    ("src/ops/rpu_embedding.cpp", "rpu_assemble_inputs_embeds_rev"): _c(
-        spm_copy=1
     ),
     ("src/ops/rpu_fast_pos_embed.cpp", "rpu_fast_pos_embed_interp_test"): _c(
         spm_copy=1
@@ -343,24 +318,8 @@ IMMEDIATE_CALLERS: dict[tuple[str, str], Counter[str]] = {
     ("src/ops/rpu_grouped_parallel_linear.cpp", "rpu_grouped_parallel_linear_test"): _c(
         broadcast=1, ddr_scatter=2, spm_scatter=1
     ),
-    ("src/ops/rpu_hyvla_merger.cpp", "stage_members"): _c(ddr_scatter=1),
-    ("src/ops/rpu_hyvla_merger.cpp", "rpu_hyvla_merger_pool"): _c(
-        spm_scatter=1
-    ),
-    ("src/ops/rpu_hyvla_merger.cpp", "rpu_hyvla_merger_combine"): _c(
-        spm_scatter=1
-    ),
     ("src/ops/rpu_l2norm.cpp", "rpu_l2norm_test"): _c(
         broadcast=1, spm_copy=1
-    ),
-    ("src/ops/rpu_linear.cpp", "tts_codec_im2col_rows"): _c(
-        broadcast=1, spm_copy=1
-    ),
-    ("src/ops/rpu_linear.cpp", "tts_codec_layernorm_rows"): _c(
-        broadcast=3, spm_copy=1
-    ),
-    ("src/ops/rpu_linear.cpp", "rpu_tts_codec_transpose_overlap"): _c(
-        broadcast=3, spm_copy=1
     ),
     ("src/ops/rpu_partial_mrope.cpp", "rpu_partial_mrope_test"): _c(
         broadcast=1, spm_copy=1, ddr_scatter=1, spm_scatter=1
@@ -799,14 +758,14 @@ def test_direct_dma_guards_precede_every_side_effect() -> None:
     unary_body = unary[begin:end]
     cold_guard = re.search(r"TORCH_CHECK\s*\(\s*!graph_dma::active\(\)", unary_body)
     assert cold_guard is not None
-    for effect in ("GET_KERNEL(id)", "SPM_ALLOC.init()", "SPM_ALLOC.alloc_temporary(", BROADCAST):
+    for effect in ("GET_KERNEL(id)", "SPM_ALLOC.init()", "SPM_ALLOC.alloc_temporary(", "rpu_launch_ddr_broadcast_spm_dma"):
         assert cold_guard.start() < unary_body.index(effect)
 
     _, begin, end = _function_span(unary, "rpu_gelu_erf")
     gelu_body = unary[begin:end]
     cold_guard = re.search(r"TORCH_CHECK\s*\(\s*!graph_dma::active\(\)", gelu_body)
     assert cold_guard is not None
-    for effect in ("at::empty(", "SPM_ALLOC.init()", "SPM_ALLOC.alloc_temporary(", BROADCAST, SPM_COPY):
+    for effect in ("at::empty(", "SPM_ALLOC.init()", "SPM_ALLOC.alloc_temporary(", "rpu_launch_ddr_broadcast_spm_dma", "rpu_launch_spm_copy_ddr_dma"):
         assert cold_guard.start() < gelu_body.index(effect)
 
     _, begin, end = _function_span(execute, "RpuKernelGraph::execute_data_node")
@@ -947,8 +906,8 @@ def test_immediate_dma_call_inventory_is_exact() -> None:
             +expected_bare
         ), api
 
-    assert sum(actual.values()) == 88
-    assert len(IMMEDIATE_CALLERS) == 40
+    assert sum(actual.values()) == 61
+    assert len(IMMEDIATE_CALLERS) == 26
     assert Counter(
         {
             api: sum(
@@ -960,11 +919,11 @@ def test_immediate_dma_call_inventory_is_exact() -> None:
         }
         ) == Counter(
         {
-            BROADCAST: 38,
-            SPM_COPY: 33,
-            BYTE_COPY: 2,
-            DDR_SCATTER: 9,
-            SPM_SCATTER: 6,
+            BROADCAST: 27,
+            SPM_COPY: 22,
+            BYTE_COPY: 0,
+            DDR_SCATTER: 8,
+            SPM_SCATTER: 4,
         }
     )
 
@@ -988,8 +947,15 @@ def test_assembled_prefix_batch_is_internal_and_failure_cleanup_is_bounded():
 
 def test_row_scatter_is_internal_to_the_eager_m1_column_writeback():
     sources = _sources()
-    helper = "rpu_launch_spm_scatter_rows_ddr_dma_immediate"
-    assert _count_by_file(sources, rf"\b{helper}\b") == Counter(
+    immediate_helper = "rpu_launch_spm_scatter_rows_ddr_dma_immediate"
+    graph_helper = "rpu_launch_spm_scatter_rows_ddr_dma"
+    assert _count_by_file(sources, rf"\b{immediate_helper}\b") == Counter(
+        {
+            "src/core/rpu_kernel_decls.h": 1,
+            "src/ops/rpu_memcpy.cpp": 2,
+        }
+    )
+    assert _count_by_file(sources, rf"\b{graph_helper}\b") == Counter(
         {
             "src/core/rpu_kernel_decls.h": 1,
             "src/ops/rpu_linear.cpp": 1,
@@ -998,10 +964,10 @@ def test_row_scatter_is_internal_to_the_eager_m1_column_writeback():
         }
     )
     _, begin, end = _function_span(sources["src/ops/rpu_linear.cpp"], "rpu_launch_linear_ddr_kernel")
-    assert helper in sources["src/ops/rpu_linear.cpp"][begin:end]
+    assert graph_helper in sources["src/ops/rpu_linear.cpp"][begin:end]
     _, begin, end = _function_span(sources["src/ops/rpu_linear_w8a8.cpp"], "rpu_linear_w8a8")
-    assert helper in sources["src/ops/rpu_linear_w8a8.cpp"][begin:end]
-    _, begin, end = _function_span(sources["src/ops/rpu_memcpy.cpp"], helper)
+    assert graph_helper in sources["src/ops/rpu_linear_w8a8.cpp"][begin:end]
+    _, begin, end = _function_span(sources["src/ops/rpu_memcpy.cpp"], immediate_helper)
     body = sources["src/ops/rpu_memcpy.cpp"][begin:end]
     assert "TORCH_CHECK(!graph_dma::active()" in body
     assert body.count("submit_immediate_batch(") == 1

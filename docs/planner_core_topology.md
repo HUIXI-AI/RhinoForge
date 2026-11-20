@@ -150,8 +150,9 @@ Graph kernels use contiguous spans within `[0,N)`. Queue prefixes cover the
 span; DMA-first/only segments use the owner's budget. DMA engine IDs must be in
 `0..N-1`. DDR-to-DDR copies use a separate synchronous queue and release their
 completed batch. This queue, immediate queues and retained queues have separate
-lifetimes. Ordinary Graph submissions allow at most 4096 entries for budgets
-four/six and 8192 for eight, also bounded by half the SDK's configured limit.
+lifetimes. Ordinary Graph submissions use the SDK batch envelope across four,
+six, and eight cores (up to 65536 entries and the configured KD/instruction
+buffer limits by default).
 These limits do not change planner chunks or operator cores.
 
 Residual rings reduce over the consumer count; partial producers clear all

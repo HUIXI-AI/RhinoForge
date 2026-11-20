@@ -532,10 +532,10 @@ void test_resource_budget_preserves_dma_fence(
         const ManagedDdrFixture& dma) {
     section("resource budget splits only after a cross-stream DMA fence");
 
-    // Graph runtime keeps half of a lowered SDK limit as its soft budget:
-    // SDK hard cap 16 -> automatic segment budget 8 entries.
+    // Graph runtime uses the configured SDK limit directly:
+    // SDK cap 8 -> automatic segment budget 8 entries.
     GraphRuntimePolicy runtime_policy;
-    runtime_policy.lkn_max_batch_entries = 16;
+    runtime_policy.lkn_max_batch_entries = 8;
 
     {
         RpuGraphCache cache(/*max_entries=*/16, runtime_policy);
@@ -592,7 +592,7 @@ void test_lingbot2_exact_graph_uses_only_sealed_sdk_budget(
         sig.op_id_str = graph_label;
         auto& graph = cache.get_or_create(sig);
         graph.begin(sig);
-        for (size_t index = 0; index < 8193; ++index) {
+        for (size_t index = 0; index < 65537; ++index) {
             graph.record_dma_fixed(
                 dma.addr(0x0000), dma.addr(0x0400), 64, 0);
         }
@@ -612,7 +612,7 @@ void test_lingbot2_exact_graph_uses_only_sealed_sdk_budget(
     EXPECT(segments_for(
                true, 262144, 64, 512,
                "qwen3_causal_decoder") == 2,
-           "ordinary/Qwen label keeps generic 8192-entry splitter");
+           "ordinary/Qwen label keeps generic 65536-entry splitter");
 
     EXPECT(segments_for(
                false, 262144, 64, 512,
@@ -644,7 +644,7 @@ void test_wall_oss_wrc_exact_graph_keeps_generic_entry_limit(
     section("Wall-OSS WRC exact signatures keep generic entry limit");
 
     GraphRuntimePolicy runtime_policy;
-    runtime_policy.lkn_max_batch_entries = 20000;
+    runtime_policy.lkn_max_batch_entries = 8192;
     const auto segments_for = [&](GraphSignature sig) {
         RpuGraphCache cache(/*max_entries=*/16, runtime_policy);
         auto& graph = cache.get_or_create(sig);

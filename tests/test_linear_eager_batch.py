@@ -17,9 +17,15 @@ ROOT = Path(__file__).resolve().parents[1]
 LINEAR = (ROOT / "src/ops/rpu_linear.cpp").read_text(encoding="utf-8")
 
 
+GRAPH_H = (ROOT / "src/graph/graph_runtime.h").read_text(encoding="utf-8")
+GRAPH_CPP = (ROOT / "src/graph/graph_runtime.cpp").read_text(encoding="utf-8")
+
+
 def _batch_class():
-    start = LINEAR.index("class EagerLinearBatch {")
-    return LINEAR[start:LINEAR.index("\n};\n", start) + 4]
+    h_start = GRAPH_H.index("class ScopedEagerAtomicBatch {")
+    h_decl = GRAPH_H[h_start:GRAPH_H.index("\n};", h_start) + 3]
+    cpp_start = GRAPH_CPP.index("ScopedEagerAtomicBatch::ScopedEagerAtomicBatch(")
+    return h_decl + "\n" + GRAPH_CPP[cpp_start:] + "\nusing EagerLinearBatch = ScopedEagerAtomicBatch;\n"
 
 
 def _launcher():
@@ -31,7 +37,7 @@ def test_batch_scope_is_eager_col_only_and_submits_after_the_loop():
     body = _launcher()
     guard = body.index("EagerLinearBatch eager_batch(")
     assert (
-        "partition != 0 && !col_scatter_rows && !RpuKernelGraph::has_active(),\n"
+        "partition != 0 && !RpuKernelGraph::has_active(),\n"
         "      num_cores);"
     ) in body
     # SPM temporaries are scoped before the batch, so they outlive end().
@@ -60,12 +66,16 @@ def test_batch_scope_aborts_on_every_failure_path(tmp_path):
 #include <string>
 #include <vector>
 #define NUM_CORES 8
+#define TORCH_CHECK(c, ...) do { if (!(c)) throw std::runtime_error("check"); } while (0)
+struct LknBatchCfg { uint32_t max_entries = 65536; };
+LknBatchCfg rpu_lkn_batch_config_at_load() { return {}; }
 struct GraphRuntimePolicy { int execution_core_count = 8; };
 std::vector<std::string> events;
 bool fail_end = false, fail_abort = false;
 struct RpuKernelGraph {
   GraphRuntimePolicy policy; bool open = false;
   explicit RpuKernelGraph(GraphRuntimePolicy p) : policy(p) {}
+  size_t recorded_node_count() const noexcept { return 0; }
   void begin() { assert(!open); open = true; events.push_back("begin" + std::to_string(policy.execution_core_count)); }
   void end() { assert(open); events.push_back("end"); if (fail_end) throw std::runtime_error("end"); open = false; }
   void abort() { events.push_back("abort"); open = false; if (fail_abort) throw std::runtime_error("abort"); }

@@ -6655,6 +6655,16 @@ void rpu_launch_spm_scatter_rows_ddr_dma_immediate(
     int64_t   core_stride_bytes,
     int       num_cores);
 
+void rpu_launch_spm_scatter_rows_ddr_dma(
+    uint32_t  spm_addr_unified,
+    c10::Half* ddr_base,
+    int64_t   rows,
+    int64_t   elements_per_core,
+    int64_t   spm_row_stride_bytes,
+    int64_t   ddr_row_stride_bytes,
+    int64_t   core_stride_bytes,
+    int       num_cores);
+
 // =============================================================================
 // DMA-based scatter primitives (graph-only). Replace the legacy kernel-based
 // `rpu_launch_ddr2spm_multicore_scatter_read_broadcast_write` and

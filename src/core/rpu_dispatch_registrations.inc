@@ -15,15 +15,10 @@ TORCH_LIBRARY(rpu, m) {
   m.def("qwenpi05_debug_flush_dumps", TORCH_FN(rpu_qwenpi05_debug_flush_dumps));
   m.def("spm_alloc_dump", [](const std::string& label) { SPM_ALLOC.dump(label.c_str()); });
 
-  m.def("qwen25vl_vision_set_wall_sorting_routes",
-        TORCH_FN(rpu_qwen25vl_vision_set_wall_sorting_routes));
-
   m.def("wall_oss_action_step_set_kv_owner_fanout(int handle, bool enabled) -> ()",
         TORCH_FN(rpu_wall_oss_action_step_set_kv_owner_fanout));
 
   m.def("wall_oss_action_step_set_weight_residency(int handle, Tensor core_major_bundle) -> ()");
-
-  m.def("wall_oss_action_step_set_wall_sorting_routes", TORCH_FN(rpu_wall_oss_action_step_set_wall_sorting_routes));
 
   m.def("causal_decoder_set_wall_prefill_routes",
         TORCH_FN(rpu_causal_decoder_set_wall_prefill_routes));

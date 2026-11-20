@@ -553,7 +553,7 @@ commit_semantic_spm_producer_yield_after_kernel_enqueue() noexcept {
 void RpuKernelGraph::enqueue(::rhino_lkn::Kernel_t& kernel,
                              const std::vector<uint16_t>& grid_dims,
                              const std::vector<uint8_t>& core_ids) {
-    QueueLaunchState default_state;  // broadcast=true, flush_icache=false
+    QueueLaunchState default_state;  // broadcast=true, flush_icache=true
     enqueue(kernel, grid_dims, core_ids, default_state);
 }
 
@@ -672,6 +672,8 @@ void RpuKernelGraph::enqueue(::rhino_lkn::Kernel_t& kernel,
 
             kernels_.clear();
             nodes_.clear();
+            safe_split_boundaries_.clear();
+            preload_prologue_spans_.clear();
             pending_kernel_id_.reset();
             pending_kernel_name_.reset();
             replayable_ = false;
@@ -827,6 +829,8 @@ void RpuKernelGraph::sync_point() {
 
     kernels_.clear();
     nodes_.clear();
+    safe_split_boundaries_.clear();
+    preload_prologue_spans_.clear();
     // 清理 pending kernel id/name：防御性修复，避免 sync_point 在
     // get_kernel 和 enqueue 之间被调用时留下悬空的 pending 状态。
     pending_kernel_id_.reset();
@@ -1139,17 +1143,17 @@ static bool siglip_should_isolate_patch_embed_kernel(
            label.find("_1core_") != std::string::npos;
 }
 
-// Keep replay batches comfortably below both the SDK's declared limits and a
-// smaller execution envelope. Entry count alone is insufficient because
-// instruction and kd footprints vary by kernel, so mirror Queue_t::build_batch's
-// exact accounting here.
+// Match the SDK's declared single-batch resource limits across entry count,
+// KD command buffer, and 4 KiB-aligned instruction buffer footprints via
+// Queue_t::build_batch's exact accounting (`query_launch_footprint` + stream
+// completion syncs + 16-byte batch tail).
 //
-// The SDK defaults are 65536 entries / 8 MiB kd / 64 MiB instructions.  These
-// budgets intentionally retain at least 2x headroom for firmware behavior not
-// covered by build_batch's host-side checks.  If a process lowers an LKN limit,
-// use half of that configured value as well.  A single indivisible node or
-// fenced multi-stream DMA burst may exceed the soft budget; the SDK's hard
-// build_batch guard remains the final authority for those cases.
+// The standard SDK defaults are 65536 entries / 8 MiB kd / 64 MiB instructions
+// across all core counts (1..8 cores).  If a caller/environment configures a
+// smaller LKN limit, honor that exact limit directly without artificial
+// halving.  A single indivisible node or fenced multi-stream DMA burst may
+// exceed a lowered soft test budget; the SDK's hard build_batch guard remains
+// the final authority for hardware capacity.
 struct SegmentResourceBudget {
     size_t entries;
     size_t kd_bytes;
@@ -1219,7 +1223,8 @@ static bool causal_14b_c4_initial_prefill_needs_small_segments(
 
 static SegmentResourceBudget segment_resource_budget(
         const std::string& graph_label,
-        const GraphRuntimePolicy& runtime_policy, bool require_single_segment) {
+        const GraphRuntimePolicy& runtime_policy,
+        bool require_single_segment = false) {
     constexpr size_t kMiB = 1u << 20;
     const size_t sdk_entries = runtime_policy.lkn_max_batch_entries;
     const size_t sdk_kd = runtime_policy.lkn_kd_buf_mb * kMiB;
@@ -1229,15 +1234,12 @@ static SegmentResourceBudget segment_resource_budget(
     if (require_single_segment) {
         TORCH_CHECK(runtime_policy.execution_core_count == 8,
                     "Single-segment opt-in requires the eight-core queue profile");
-        return {std::min<size_t>(65536, sdk_entries / 2),
-                std::min<size_t>(32 * kMiB, sdk_kd / 2),
-                std::min<size_t>(256 * kMiB, sdk_instr / 2)};
     }
-    // The exact LingBot profile that shipped as one SDK batch retains only its
-    // sealed envelope. The legacy 27B text owner's retained decode also uses
-    // its SDK envelope: splitting rebuilds all but the final batch on REPLAY.
-    // The owner binds this cold policy before construction; graph labels alone
-    // never enlarge a budget, and all three SDK resource ceilings still apply.
+    // Sealed LingBot2 Z2 and Qwen3.5 27B cold owners may configure enlarged
+    // >65536 LKN envelopes. Ordinary and single-segment graphs across 1..8
+    // cores use the full standard SDK batch ceiling (65536 entries / up to
+    // 32 MiB KD / up to 256 MiB instructions, or any smaller configured LKN
+    // limit) without legacy 4096/8192 or half-SDK caps.
     if (lingbot2_exact_graph_owns_sdk_budget(
             graph_label, sdk_budget,
             runtime_policy.lingbot2_multiview_spm_z2) ||
@@ -1246,13 +1248,10 @@ static SegmentResourceBudget segment_resource_budget(
          graph_label == "rpu_qwen3_5")) {
         return sdk_budget;
     }
-    // Reduced-core execution uses a conservative per-segment entry budget.
-    const size_t entry_ceiling =
-        runtime_policy.execution_core_count < 8 ? 4096 : 8192;
     return {
-        std::max<size_t>(1, std::min(entry_ceiling, sdk_entries / 2)),
-        std::max<size_t>(16, std::min<size_t>(4 * kMiB, sdk_kd / 2)),
-        std::max<size_t>(4096, std::min<size_t>(32 * kMiB, sdk_instr / 2)),
+        std::max<size_t>(1, std::min<size_t>(65536, sdk_entries)),
+        std::max<size_t>(16, std::min<size_t>(32 * kMiB, sdk_kd)),
+        std::max<size_t>(4096, std::min<size_t>(256 * kMiB, sdk_instr)),
     };
 }
 
@@ -1378,8 +1377,9 @@ void RpuKernelGraph::build_segments_from_nodes() {
     //   4. SDK footprint 达到共享安全预算 — 在跨 stream DMA fence 完整闭合的
     //      边界贪心切段，避免大图虽 build_batch rc=0 却在硬件静默错算。
     constexpr size_t kNoOpenSeg = std::numeric_limits<size_t>::max();
-    SegmentResourceBudget resource_budget =
+    const SegmentResourceBudget hard_sdk_budget =
         segment_resource_budget(graph_label, runtime_policy_, require_single_segment_);
+    SegmentResourceBudget resource_budget = hard_sdk_budget;
     // Exact C4/40-layer/H5120 initial P192, planned in 32-row chunks, also
     // produced timeout reports and a large first-logit discrepancy at 4096
     // entries despite an SDK success return. Reducing
@@ -1406,9 +1406,103 @@ void RpuKernelGraph::build_segments_from_nodes() {
     // across that entire burst prevents an automatic cut inside its fence.
     std::vector<uint8_t> pending_streams;
 
+    struct SafeSplitCheckpoint {
+        size_t node_idx = kNoOpenSeg;
+        uint8_t max_num_cores = 0;
+        SegmentResourceUse resources;
+    };
+    SafeSplitCheckpoint last_safe_split;
+    SafeSplitCheckpoint last_fence_closed_fit;
+    size_t next_safe_boundary_cursor = 0;
+
+    bool has_valid_prologue =
+        !require_single_segment_ && !preload_prologue_spans_.empty();
+    SegmentResourceUse prologue_resources;
+    uint8_t prologue_max_cores = 0;
+    size_t prologue_max_end = 0;
+    if (has_valid_prologue) {
+        size_t prev_end = 0;
+        for (const auto& [span_begin, span_end] : preload_prologue_spans_) {
+            if (span_end <= span_begin || span_begin < prev_end ||
+                span_end > nodes_.size()) {
+                has_valid_prologue = false;
+                break;
+            }
+            prev_end = span_end;
+            prologue_max_end = span_end;
+            std::vector<uint8_t> prologue_pending;
+            for (size_t p = span_begin; p < span_end; ++p) {
+                const auto& pn = nodes_[p];
+                if (pn.kind == GraphNodeKind::Branch &&
+                    pn.as_branch().is_physical_manifest_metadata()) {
+                    continue;
+                }
+                if (pn.kind != GraphNodeKind::Kernel &&
+                    pn.kind != GraphNodeKind::Dma &&
+                    pn.kind != GraphNodeKind::Barrier) {
+                    has_valid_prologue = false;
+                    break;
+                }
+                const SegmentResourceUse pu = segment_node_resources(pn, kernels_);
+                prologue_resources.entries += pu.entries;
+                prologue_resources.kd_bytes +=
+                    pu.kd_bytes + segment_new_completion_bytes(prologue_resources, pu);
+                prologue_resources.active_streams |= pu.active_streams;
+                prologue_resources.instr_bytes += pu.instr_bytes;
+                if (pn.kind == GraphNodeKind::Kernel) {
+                    if (pn.as_kernel().queue_state != QueueLaunchState{}) {
+                        has_valid_prologue = false;
+                        break;
+                    }
+                    prologue_max_cores = std::max(
+                        prologue_max_cores,
+                        validated_kernel_core_extent(runtime_policy_,
+                                                     pn.as_kernel().core_ids));
+                } else if (pn.kind == GraphNodeKind::Dma) {
+                    const uint8_t ch = pn.as_dma().channel;
+                    prologue_max_cores =
+                        std::max<uint8_t>(prologue_max_cores, static_cast<uint8_t>(ch + 1));
+                    const uint8_t s = static_cast<uint8_t>(ch * 2);
+                    if (s != 0 && std::find(prologue_pending.begin(),
+                                            prologue_pending.end(), s) ==
+                                      prologue_pending.end()) {
+                        prologue_pending.push_back(s);
+                    }
+                } else if (pn.kind == GraphNodeKind::Barrier) {
+                    const auto& b = pn.as_barrier_node();
+                    if (b.self_stream == 0) {
+                        prologue_pending.erase(
+                            std::remove(prologue_pending.begin(),
+                                        prologue_pending.end(), b.target_stream),
+                            prologue_pending.end());
+                    } else if (b.target_stream == 0 && b.self_stream != 0 &&
+                               std::find(prologue_pending.begin(),
+                                         prologue_pending.end(), b.self_stream) ==
+                                   prologue_pending.end()) {
+                        prologue_pending.push_back(b.self_stream);
+                    }
+                }
+            }
+            if (!has_valid_prologue || !prologue_pending.empty()) {
+                has_valid_prologue = false;
+                break;
+            }
+        }
+        if (has_valid_prologue &&
+            (prologue_resources.entries >= resource_budget.entries ||
+             segment_would_exceed(prologue_resources, SegmentResourceUse{},
+                                  resource_budget))) {
+            has_valid_prologue = false;
+        }
+    }
+
     auto resource_reset = [&]() {
-        seg_resources = SegmentResourceUse{};
+        seg_resources = (!segments_.empty() && has_valid_prologue)
+            ? prologue_resources
+            : SegmentResourceUse{};
         pending_streams.clear();
+        last_safe_split.node_idx = kNoOpenSeg;
+        last_fence_closed_fit.node_idx = kNoOpenSeg;
     };
 
     auto mark_pending_stream = [&](uint8_t stream) {
@@ -1461,6 +1555,12 @@ void RpuKernelGraph::build_segments_from_nodes() {
         seg.segment_id = segments_.size();
         seg.start_idx = seg_start;
         seg.end_idx = end_exclusive;
+        if (seg.segment_id > 0 && has_valid_prologue &&
+            seg.start_idx >= prologue_max_end &&
+            !(seg_queue_state != QueueLaunchState{})) {
+            seg.prologue_spans = preload_prologue_spans_;
+            seg_max_num_cores = std::max(seg_max_num_cores, prologue_max_cores);
+        }
         const uint8_t n = seg_max_num_cores == 0
             ? static_cast<uint8_t>(runtime_policy_.execution_core_count)
             : seg_max_num_cores;
@@ -1471,6 +1571,8 @@ void RpuKernelGraph::build_segments_from_nodes() {
         seg.census.start_idx = seg.start_idx;
         seg.census.end_idx = seg.end_idx;
         seg.census.core_count = seg.core_ids.size();
+        // Keep GraphSegmentCensus strictly over [start_idx, end_idx) so
+        // manifest_metadata_count() == (end_idx - start_idx) - (K + D + B).
         for (size_t j = seg.start_idx; j < seg.end_idx; ++j) {
             switch (nodes_[j].kind) {
             case GraphNodeKind::Kernel: ++seg.census.kernel_count; break;
@@ -1495,7 +1597,82 @@ void RpuKernelGraph::build_segments_from_nodes() {
         resource_reset();
     };
 
+    size_t current_idx_rewind_target = kNoOpenSeg;
+    auto rewind_to_checkpoint = [&](const SafeSplitCheckpoint& ckpt) -> bool {
+        const size_t cut_idx = ckpt.node_idx;
+        seg_max_num_cores = ckpt.max_num_cores;
+        seg_resources = ckpt.resources;
+        close_segment(cut_idx);
+        ++resource_split_count;
+        next_safe_boundary_cursor = static_cast<size_t>(
+            std::upper_bound(safe_split_boundaries_.begin(),
+                             safe_split_boundaries_.end(), cut_idx) -
+            safe_split_boundaries_.begin());
+        current_idx_rewind_target = cut_idx;
+        return true;
+    };
+
+    // Unwind an open segment that overflowed resource_budget while an unjoined
+    // cross-stream DMA fence prevented cutting mid-burst, once the fence closes.
+    auto split_overflowed_segment_if_needed = [&](size_t current_end_idx) -> bool {
+        if (seg_start == kNoOpenSeg || !pending_streams.empty() ||
+            !segment_would_exceed(seg_resources, SegmentResourceUse{},
+                                  resource_budget)) {
+            return false;
+        }
+        if (last_safe_split.node_idx != kNoOpenSeg &&
+            last_safe_split.node_idx > seg_start &&
+            last_safe_split.node_idx < current_end_idx) {
+            return rewind_to_checkpoint(last_safe_split);
+        }
+        if (segment_would_exceed(seg_resources, SegmentResourceUse{},
+                                 hard_sdk_budget) &&
+            last_fence_closed_fit.node_idx != kNoOpenSeg &&
+            last_fence_closed_fit.node_idx > seg_start &&
+            last_fence_closed_fit.node_idx < current_end_idx) {
+            return rewind_to_checkpoint(last_fence_closed_fit);
+        }
+        return false;
+    };
+
+    auto perform_resource_split = [&](size_t current_idx) -> bool {
+        if (last_safe_split.node_idx != kNoOpenSeg &&
+            last_safe_split.node_idx > seg_start &&
+            last_safe_split.node_idx < current_idx) {
+            return rewind_to_checkpoint(last_safe_split);
+        }
+        if (segment_would_exceed(seg_resources, SegmentResourceUse{},
+                                 hard_sdk_budget) &&
+            last_fence_closed_fit.node_idx != kNoOpenSeg &&
+            last_fence_closed_fit.node_idx > seg_start &&
+            last_fence_closed_fit.node_idx < current_idx) {
+            return rewind_to_checkpoint(last_fence_closed_fit);
+        }
+        close_segment(current_idx);
+        ++resource_split_count;
+        return false;
+    };
+
     for (size_t i = 0; i < nodes_.size(); ++i) {
+        const bool fence_closed_and_within_budget =
+            seg_start != kNoOpenSeg && i > seg_start &&
+            pending_streams.empty() &&
+            !segment_would_exceed(seg_resources, SegmentResourceUse{},
+                                  resource_budget);
+        if (fence_closed_and_within_budget) {
+            last_fence_closed_fit = {i, seg_max_num_cores, seg_resources};
+        }
+        while (next_safe_boundary_cursor < safe_split_boundaries_.size() &&
+               safe_split_boundaries_[next_safe_boundary_cursor] < i) {
+            ++next_safe_boundary_cursor;
+        }
+        if (next_safe_boundary_cursor < safe_split_boundaries_.size() &&
+            safe_split_boundaries_[next_safe_boundary_cursor] == i) {
+            if (fence_closed_and_within_budget) {
+                last_safe_split = {i, seg_max_num_cores, seg_resources};
+            }
+            ++next_safe_boundary_cursor;
+        }
         switch (nodes_[i].kind) {
         case GraphNodeKind::Kernel: {
             auto& kn = nodes_[i].as_kernel();
@@ -1506,6 +1683,10 @@ void RpuKernelGraph::build_segments_from_nodes() {
                     graph_label, kn,
                     runtime_policy_.siglip_isolate_patch_embed)) {
                 check_fence_closed("isolated kernel", i);
+                if (split_overflowed_segment_if_needed(i)) {
+                    i = current_idx_rewind_target - 1;
+                    continue;
+                }
                 close_segment(i);
                 seg_start = i;
                 seg_max_num_cores = kn_num;
@@ -1520,8 +1701,10 @@ void RpuKernelGraph::build_segments_from_nodes() {
             if (seg_start != kNoOpenSeg && pending_streams.empty() &&
                 segment_would_exceed(seg_resources, node_resources,
                                      resource_budget)) {
-                close_segment(i);
-                ++resource_split_count;
+                if (perform_resource_split(i)) {
+                    i = current_idx_rewind_target - 1;
+                    continue;
+                }
             }
 
             if (seg_start == kNoOpenSeg) {
@@ -1530,6 +1713,10 @@ void RpuKernelGraph::build_segments_from_nodes() {
                 seg_queue_state = kn.queue_state;
             } else if (seg_queue_state != kn.queue_state) {
                 check_fence_closed("queue-state change", i);
+                if (split_overflowed_segment_if_needed(i)) {
+                    i = current_idx_rewind_target - 1;
+                    continue;
+                }
                 close_segment(i);
                 seg_start = i;
                 seg_max_num_cores = kn_num;
@@ -1538,6 +1725,10 @@ void RpuKernelGraph::build_segments_from_nodes() {
                 seg_max_num_cores = kn_num;
             }
             account_node(nodes_[i], node_resources);
+            if (split_overflowed_segment_if_needed(i + 1)) {
+                i = current_idx_rewind_target - 1;
+                continue;
+            }
             // else: extend current segment
             break;
         }
@@ -1548,8 +1739,10 @@ void RpuKernelGraph::build_segments_from_nodes() {
             if (seg_start != kNoOpenSeg && pending_streams.empty() &&
                 segment_would_exceed(seg_resources, node_resources,
                                      resource_budget)) {
-                close_segment(i);
-                ++resource_split_count;
+                if (perform_resource_split(i)) {
+                    i = current_idx_rewind_target - 1;
+                    continue;
+                }
             }
             // DMA engines share the driver's allocated core prefix. Endpoints
             // retain the physical eight-controller memory layout, but a DMA
@@ -1566,6 +1759,10 @@ void RpuKernelGraph::build_segments_from_nodes() {
                     static_cast<uint8_t>(nodes_[i].as_dma().channel + 1));
             }
             account_node(nodes_[i], node_resources);
+            if (split_overflowed_segment_if_needed(i + 1)) {
+                i = current_idx_rewind_target - 1;
+                continue;
+            }
             // else: extend current segment
             break;
         }
@@ -1580,6 +1777,10 @@ void RpuKernelGraph::build_segments_from_nodes() {
             // 其它 data node (Memcpy / Memset / ChildGraph / Branch /
             // HostCallback / Tier3Oneshot) 按段边界处理,跟原 v3.0 语义一致。
             check_fence_closed("data node", i);
+            if (split_overflowed_segment_if_needed(i)) {
+                i = current_idx_rewind_target - 1;
+                continue;
+            }
             if (nodes_[i].kind == GraphNodeKind::ChildGraph) {
                 const auto& child = nodes_[i].as_child_graph().child;
                 TORCH_CHECK(child, "Graph BUILD contains a null child graph");
@@ -1598,7 +1799,7 @@ void RpuKernelGraph::build_segments_from_nodes() {
         TORCH_CHECK(peak_entries <= resource_budget.entries
                     && peak_kd_bytes <= resource_budget.kd_bytes
                     && peak_instr_bytes <= resource_budget.instr_bytes,
-                    "Single-segment Graph exceeds its SDK-half safety budget: ", graph_label);
+                    "Single-segment Graph exceeds its SDK resource budget: ", graph_label);
     }
 
     if (resource_split_count > 0 && log_at(3)) {
@@ -1814,15 +2015,16 @@ void RpuKernelGraph::capture_segment_batch_snapshot(
         candidate->core_ids = seg.core_ids;
         candidate->graph_lifetime_id = graph_lifetime_id_;
         candidate->build_generation = build_generation_;
+        candidate->prologue_spans = seg.prologue_spans;
         candidate->start_idx = seg.start_idx;
         candidate->end_idx = seg.end_idx;
         candidate->broadcast_mode = seg.queue_state.broadcast_mode;
         candidate->flush_icache = seg.queue_state.flush_icache;
-        for (size_t i = seg.start_idx; i < seg.end_idx; ++i) {
-            if (nodes_[i].kind != GraphNodeKind::Dma) continue;
+        seg.for_each_node_index([&](size_t i) {
+            if (nodes_[i].kind != GraphNodeKind::Dma) return;
             const auto& dma = nodes_[i].as_dma();
             candidate->dmas.push_back({i, dma.variant, dma.bytes, dma.channel});
-        }
+        });
         if (batch_snapshot_bridge().capture(slot.queue.get(),
                                             &candidate->image) == 0 &&
             candidate->image) {
@@ -1939,13 +2141,13 @@ uint32_t RpuKernelGraph::prepare_segment_queue(
     if (preflight.isActive()) preflight.before("rpu_graph::prepare_dma_requests");
     // Validate the whole segment before appending SDK work. This also covers
     // fallback rebuilds and a compute-first segment with later DMA engines.
-    for (size_t i = seg.start_idx; i < seg.end_idx; ++i) {
+    seg.for_each_node_index([&](size_t i) {
         if (nodes_[i].kind == GraphNodeKind::Dma) {
             validate_graph_dma_channel(nodes_[i].as_dma().channel,
                                        seg.core_ids.size(),
                                        "prepare_segment_queue");
         }
-    }
+    });
     // P2 改造:
     // - Kernel 走 add_kernel_mutable (regs 后续可通过 sync_mutable_params 重刷)。
     // - Mutable DMA 走 add_dma_kernel_mutable (返回的 slot 索引按 SDK 内部
@@ -1967,14 +2169,18 @@ uint32_t RpuKernelGraph::prepare_segment_queue(
     };
     std::vector<PreparedDmaResolution> dma_resolutions;
     std::vector<RpuDeviceDmaEndpointRequest> endpoint_requests;
-    dma_resolutions.reserve(seg.census.dma_count);
-    endpoint_requests.reserve(seg.census.dma_count * 2);
+    size_t total_segment_dma_count = 0;
+    seg.for_each_node_index([&](size_t i) {
+        if (nodes_[i].kind == GraphNodeKind::Dma) ++total_segment_dma_count;
+    });
+    dma_resolutions.reserve(total_segment_dma_count);
+    endpoint_requests.reserve(total_segment_dma_count * 2);
 
     // Resolve the complete DMA envelope before touching Queue_t.  Besides
     // reducing thousands of registry lock acquisitions to one per segment,
     // this makes a stale final endpoint fail before an earlier kernel or DMA
     // has been appended to the SDK batch.
-    for (size_t i = seg.start_idx; i < seg.end_idx; ++i) {
+    seg.for_each_node_index([&](size_t i) {
         auto& node = nodes_[i];
         switch (node.kind) {
         case GraphNodeKind::Kernel:
@@ -2027,7 +2233,7 @@ uint32_t RpuKernelGraph::prepare_segment_queue(
                         static_cast<int>(node.kind), " in segment at node ",
                         i, " (only Kernel / Dma / Barrier allowed)");
         }
-    }
+    });
 
     preflight.end();
     at::RecordFunction resolve(at::RecordScope::FUNCTION);
@@ -2051,8 +2257,8 @@ uint32_t RpuKernelGraph::prepare_segment_queue(
     if (retain_replay_state) {
         prepared_fixed_table =
             std::make_shared<Segment::PreparedFixedDmaTable>();
-        prepared_mutable_dmas.reserve(seg.census.dma_count);
-        prepared_fixed_table->bindings.reserve(seg.census.dma_count);
+        prepared_mutable_dmas.reserve(total_segment_dma_count);
+        prepared_fixed_table->bindings.reserve(total_segment_dma_count);
     }
     uint32_t next_mutable_dma_id = 0;
     size_t next_dma_resolution = 0;
@@ -2061,7 +2267,7 @@ uint32_t RpuKernelGraph::prepare_segment_queue(
     wq.set_enable_hw_perf(hw_perf_enabled);
     wq.set_broadcast_mode(seg.queue_state.broadcast_mode);
     wq.set_flush_icache(seg.queue_state.flush_icache);
-    for (size_t i = seg.start_idx; i < seg.end_idx; ++i) {
+    seg.for_each_node_index([&](size_t i) {
         auto& node = nodes_[i];
         switch (node.kind) {
         case GraphNodeKind::Kernel: {
@@ -2163,7 +2369,7 @@ uint32_t RpuKernelGraph::prepare_segment_queue(
                         "prepare_segment_queue: validated segment topology "
                         "changed before emission at node ", i);
         }
-    }
+    });
     TORCH_CHECK(next_dma_resolution == dma_resolutions.size(),
                 "prepare_segment_queue: DMA resolution count drift");
     append.end();
@@ -2430,6 +2636,7 @@ uint32_t RpuKernelGraph::prepare_segment_queue(
             captured.fixed_dma_table == seg.fixed_dma_table &&
             captured.graph_lifetime_id == graph_lifetime_id_ &&
             captured.build_generation == build_generation_ &&
+            captured.prologue_spans == seg.prologue_spans &&
             captured.start_idx == seg.start_idx &&
             captured.end_idx == seg.end_idx &&
             captured.core_ids == seg.core_ids &&
@@ -2447,7 +2654,11 @@ uint32_t RpuKernelGraph::prepare_segment_queue(
                 requests.reserve(captured.dmas.size() * 2);
                 size_t dma_index = 0;
                 size_t mutable_index = 0;
-                for (size_t i = seg.start_idx; i < seg.end_idx; ++i) {
+                std::vector<size_t> seg_node_indices;
+                seg.for_each_node_index([&](size_t idx) {
+                    seg_node_indices.push_back(idx);
+                });
+                for (size_t i : seg_node_indices) {
                     const auto& node = nodes_[i];
                     if (node.kind == GraphNodeKind::Kernel ||
                         node.kind == GraphNodeKind::Barrier) continue;
@@ -2669,11 +2880,14 @@ bool RpuKernelGraph::capture_segment_kernel_register_tokens(
         tokens.emplace_back(kernel_idx, token);
         return true;
     };
-    for (size_t i = seg.start_idx; i < seg.end_idx; ++i) {
-        if (nodes_[i].kind != GraphNodeKind::Kernel) continue;
-        if (!append_current_token(nodes_[i].as_kernel().kernel_idx)) return false;
-    }
-    return true;
+    bool token_ok = true;
+    seg.for_each_node_index([&](size_t i) {
+        if (!token_ok || nodes_[i].kind != GraphNodeKind::Kernel) return;
+        if (!append_current_token(nodes_[i].as_kernel().kernel_idx)) {
+            token_ok = false;
+        }
+    });
+    return token_ok;
 }
 
 RpuKernelGraph::KernelTokenScan RpuKernelGraph::scan_kernel_register_tokens(

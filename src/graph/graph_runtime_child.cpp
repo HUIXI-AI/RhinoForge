@@ -724,6 +724,33 @@ void RpuKernelGraph::replace_window_with_child(
     first = nodes_.erase(first, last);
     nodes_.insert(first, std::move(node));
 
+    const size_t removed_delta = (end_idx - start_idx) - 1;
+    if (!safe_split_boundaries_.empty()) {
+        std::vector<size_t> updated_boundaries;
+        updated_boundaries.reserve(safe_split_boundaries_.size());
+        for (size_t b : safe_split_boundaries_) {
+            if (b > start_idx && b < end_idx) continue;
+            const size_t mapped = (b >= end_idx) ? (b - removed_delta) : b;
+            if (updated_boundaries.empty() || updated_boundaries.back() < mapped) {
+                updated_boundaries.push_back(mapped);
+            }
+        }
+        safe_split_boundaries_.swap(updated_boundaries);
+    }
+    if (!preload_prologue_spans_.empty()) {
+        std::vector<std::pair<size_t, size_t>> updated_spans;
+        updated_spans.reserve(preload_prologue_spans_.size());
+        for (const auto& [b, e] : preload_prologue_spans_) {
+            if (e <= start_idx) {
+                updated_spans.emplace_back(b, e);
+            } else if (b >= end_idx) {
+                updated_spans.emplace_back(b - removed_delta, e - removed_delta);
+            }
+            // Any span overlapping the collapsed child window is dropped.
+        }
+        preload_prologue_spans_.swap(updated_spans);
+    }
+
     release_prepared_queues();
     build_segments_from_nodes();
     size_t kernels = 0;

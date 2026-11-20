@@ -330,9 +330,9 @@ void LingbotDenoiseModel::unroll_forward(
         "num_steps(", num_steps, ") must match set_action_weights num_steps(", num_steps_, ")");
     const int64_t cs = chunk_size_, kp = k_comb_pad_, h = hidden_size();
 
-    // Node-count guard (graph_runtime silently drops on batch overflow; cap 32768).
-    TORCH_CHECK(num_steps * 1300 < 32000,
-        "denoise unroll (", num_steps, " bodies) would approach the 32768 batch-item cap");
+    // Node-count guard against the 65536 single-batch entry ceiling.
+    TORCH_CHECK(num_steps <= (65536 - 1) / 1300,
+        "denoise unroll (", num_steps, " bodies) would approach the 65536 batch-item cap");
 
     TORCH_CHECK(x0_rpu.dim() == 3 && x0_rpu.size(0) == 1 && x0_rpu.size(1) == cs
         && x0_rpu.size(2) == kp && x0_rpu.scalar_type() == at::kHalf

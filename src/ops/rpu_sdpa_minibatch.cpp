@@ -274,7 +274,7 @@ void rpu_launch_sdpa_spm_minibatch_kernel(
 
     auto* wq = GET_QUEUE(core_num);
     wq->set_broadcast_mode(true);
-    wq->set_flush_icache(false);
+    wq->set_flush_icache(true);
     wq->enqueu_kernel(*kernel, {grid_dim_x, grid_dim_y, grid_dim_z}, core_list);
 }
 
@@ -349,6 +349,6 @@ void rpu_launch_lingbot2_vision_sdpa_spm_kernel(
         rpu_set_scm_u32_checked(kernel, kv_base + 2, a[2], "Lingbot2 Vision V transpose");
     }
     queue->set_broadcast_mode(true);
-    queue->set_flush_icache(false);
+    queue->set_flush_icache(true);
     queue->enqueu_kernel(*kernel, {6, 2, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
 }

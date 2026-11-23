@@ -12,7 +12,10 @@ def test_codec_linear_route_and_fresh_operands(tmp_path):
     harness = r'''
 #include <ATen/ATen.h>
 #include <cassert>
+#include <deque>
 using at::Tensor;
+struct TtsCodecResidualBatch{std::deque<uint64_t> destinations;};
+TtsCodecResidualBatch* tts_codec_batch=nullptr;
 int eager=0,batches=0,owners=0;
 struct RpuKernelGraph {
  static inline bool enabled=false;
@@ -20,7 +23,9 @@ struct RpuKernelGraph {
  static RpuKernelGraph& active(){static RpuKernelGraph g;return g;}
  void keep_alive(const Tensor&t){assert(enabled&&t.defined());++owners;}
 };
+bool tts_codec_private_batch_active(){return tts_codec_batch&&RpuKernelGraph::enabled;}
 template<typename Emit>void tts_codec_submit_tile(const Tensor&,const Tensor&,Emit emit){
+ if(tts_codec_private_batch_active()){owners=2;emit();return;}
  assert(!RpuKernelGraph::enabled);RpuKernelGraph::enabled=true;owners=2;
  emit();++batches;RpuKernelGraph::enabled=false;
 }
@@ -43,6 +48,7 @@ void rpu_launch_linear_ddr_kernel(const Tensor&x,const Tensor&w,Tensor&y,const T
  bool has,int p,const uint64_t*dst,int64_t off,const uint64_t*bp,int c,const Tensor&s,bool acc){
  assert(RpuKernelGraph::enabled&&owners==(has?4:3)&&p==1&&c==8&&acc&&!s.defined());
  assert(dst&&*dst==RpuGetDevAddr(y.data_ptr())&&off==0&&!bp);
+ if(tts_codec_private_batch_active())assert(dst==&tts_codec_batch->destinations.back());
  y.copy_(reference(x,w,has?c10::optional<Tensor>(b):c10::nullopt));
 }
 '''
@@ -59,6 +65,15 @@ int main(){
   assert(at::equal(tts_codec_linear_rows(x,w,optional),reference(x,w,optional))&&at::equal(y,saved));
  }
  auto x=at::ones({2,16},at::kHalf),w=at::ones({128,16},at::kHalf);
+ TtsCodecResidualBatch batch;tts_codec_batch=&batch;RpuKernelGraph::enabled=true;
+ auto first=tts_codec_linear_rows(x,w,c10::nullopt);
+ auto* address=&batch.destinations.front();
+ for(int i=0;i<10000;++i)batch.destinations.push_back(i);
+ auto second=tts_codec_linear_rows(x+1,w,c10::nullopt);
+ assert(*address==RpuGetDevAddr(first.data_ptr())&&batch.destinations.back()==RpuGetDevAddr(second.data_ptr()));
+ assert(at::equal(first,reference(x,w,c10::nullopt))&&at::equal(second,reference(x+1,w,c10::nullopt)));
+ tts_codec_batch=nullptr;RpuKernelGraph::enabled=false;
+
  for(int mode=0;mode<5;++mode){
   int before=batches;bool rejected=false;RpuKernelGraph::enabled=mode==0;
   try{tts_codec_linear_rows(mode==1?x.narrow(0,0,0):mode==2?x.to(at::kFloat):x,

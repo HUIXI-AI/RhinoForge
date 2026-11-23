@@ -7,31 +7,73 @@ import torch
 
 def test_tile_graph_completes_before_retirement_and_aborts(tmp_path):
     source = (Path(__file__).resolve().parents[1] / "src/ops/rpu_linear.cpp").read_text()
-    helper = "template <typename Emit>" + source.split(
-        "template <typename Emit>", 1)[1].split("Tensor tts_codec_cpu_nct_to_device_rows(", 1)[0]
+    helper = "struct TtsCodecResidualBatch {" + source.split(
+        "struct TtsCodecResidualBatch {", 1)[1].split("Tensor tts_codec_cpu_nct_to_device_rows(", 1)[0]
     harness = r'''
 #include <cassert>
 #include <stdexcept>
+#include <deque>
+#include <vector>
+#include <cstdint>
+#define TORCH_CHECK(condition, ...) if(!(condition))throw std::runtime_error("check")
 struct Tensor{};
 struct RpuKernelGraph{
- static inline bool active=false,fail_end=false;
+ static inline RpuKernelGraph* current=nullptr;
+ static inline bool fail_end=false,fail_abort=false;
  static inline int owners=0,ends=0,aborts=0;
- void begin(){assert(!active);active=true;owners=0;}
- void keep_alive(const Tensor&){assert(active);++owners;}
- void end(){assert(active&&owners==2);if(fail_end)throw std::runtime_error("end");++ends;active=false;}
- void abort(){assert(active);++aborts;active=false;}
- ~RpuKernelGraph(){assert(!active);}
+ static inline std::vector<std::pair<int,int>> barriers;
+ static bool has_active(){return current;}
+ static RpuKernelGraph& active(){assert(current);return *current;}
+ void begin(){assert(!current);current=this;owners=0;barriers.clear();}
+ void keep_alive(const Tensor&){assert(current==this);++owners;}
+ void record_barrier(int a,int b){assert(current==this);barriers.emplace_back(a,b);}
+ void end(){assert(current==this&&owners>=2);if(fail_end)throw std::runtime_error("end");++ends;current=nullptr;}
+ void abort(){assert(current==this);++aborts;current=nullptr;if(fail_abort)throw std::runtime_error("abort");}
+ ~RpuKernelGraph(){assert(!current);}
 };
 '''
     cases = r'''
 int main(){
  Tensor x,y;
- tts_codec_submit_tile(x,y,[]{assert(RpuKernelGraph::active);});
+ tts_codec_submit_tile(x,y,[]{assert(RpuKernelGraph::has_active());});
  assert(RpuKernelGraph::ends==1);
  try{tts_codec_submit_tile(x,y,[]{throw std::runtime_error("emit");});assert(false);}catch(const std::runtime_error&){}
  RpuKernelGraph::fail_end=true;
  try{tts_codec_submit_tile(x,y,[]{});assert(false);}catch(const std::runtime_error&){}
- assert(RpuKernelGraph::aborts==2&&!RpuKernelGraph::active);
+ assert(RpuKernelGraph::aborts==2&&!RpuKernelGraph::has_active());
+ RpuKernelGraph::fail_end=false;
+ auto run=[&]{
+  assert(tts_codec_private_batch_active());
+  auto& slots=tts_codec_batch->destinations;
+  slots.push_back(42);const uint64_t* first=&slots.front();
+  for(int i=0;i<10000;++i)slots.push_back(i);
+  assert(*first==42);
+  for(int i=0;i<3;++i)tts_codec_submit_tile(x,y,[]{});
+  assert(RpuKernelGraph::ends==1&&RpuKernelGraph::owners==7);
+  assert(RpuKernelGraph::barriers.size()==63);
+  for(int i=0;i<3;++i)for(int c=1;c<8;++c){
+   assert(RpuKernelGraph::barriers[i*21+c-1]==std::make_pair(0,c*2));
+   assert(RpuKernelGraph::barriers[i*21+7+c-1]==std::make_pair(c*2,0));
+   assert(RpuKernelGraph::barriers[i*21+14+c-1]==std::make_pair(0,c*2));
+  }
+  return y;
+ };
+ tts_codec_run_residual_batch(true,x,run);
+ assert(RpuKernelGraph::ends==2&&!tts_codec_batch&&!RpuKernelGraph::has_active());
+ int before=RpuKernelGraph::ends;
+ tts_codec_run_residual_batch(false,x,[&]{assert(!tts_codec_batch);return y;});
+ assert(RpuKernelGraph::ends==before);
+ for(bool fail_end:{false,true}){
+  RpuKernelGraph::fail_end=fail_end;
+  try{tts_codec_run_residual_batch(true,x,[&]()->Tensor{
+   if(!fail_end)throw std::runtime_error("emit");return y;
+  });assert(false);}catch(const std::runtime_error&){}
+  assert(!tts_codec_batch&&!RpuKernelGraph::has_active());
+ }
+ assert(RpuKernelGraph::aborts==4);
+ RpuKernelGraph::fail_abort=true;
+ try{tts_codec_run_residual_batch(true,x,[&]{return y;});assert(false);}catch(const std::runtime_error&){}
+ assert(!tts_codec_batch&&!RpuKernelGraph::has_active());
 }
 '''
     cpp, exe = tmp_path / "tile.cpp", tmp_path / "tile"

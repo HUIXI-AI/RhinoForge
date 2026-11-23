@@ -312,6 +312,13 @@ Start with the [Qwen3 speech guide](../docs/qwen3_audio.md) and retain these con
   using fixed codec tokens and speech content, not a bitwise FP32 assertion.
   Do not use eager legacy LocalSPM LayerNorm inside a model that already owns
   the arenas: ConvNeXt migration needs framework-owned SPM and lifecycle planning.
+- Complete device-resident codec residual units use a one-shot Graph only for
+  2–32768 rows and at most 8 Mi elements. Larger inputs retain tiled RPU execution.
+  Keep all intermediate tensors and mutable Linear destination slots alive until
+  end/abort. Before reusing scratch, join all DMA streams to stream 0, fan out,
+  then join again so resource segmentation has a closed boundary. Bias remains a
+  separate FP16 add. Validate fixed-token 31/64-frame outputs and driver submission
+  counts when changing this boundary; resident-call counters are not submissions.
 - CPU codec matrix multiplication and adjacent-block overlap-add preserve output
   lengths. Keep thread settings caller-controlled and check retained outputs, input changes and close/reload
   when changing component handoffs.

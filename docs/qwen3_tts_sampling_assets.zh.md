@@ -60,15 +60,19 @@ export LD_LIBRARY_PATH="$RHINO_LAUNCH_ROOT/lib:${LD_LIBRARY_PATH:-}"
 不要将 `tts_sampling_unified.ref` 配置到 `RPU_KERNEL_LIB_PATH` 或
 `RPU_KERNEL_LIB_PATH_EXPANSION`。它是模型专用采样资产，不是 runtime 主算子库。
 
-客户机器同时运行其他应用时，建议从 4 个 Torch CPU 线程开始，并在导入 Torch 前设置：
+本分支在客户 Genie 竞争环境、CPU 20–23、CPUWeight=400 下，已验证 2 个 Torch
+计算线程可以降低 CPU 消耗并保持五文本输出一致。此配置可先在导入 Torch 前设置：
 
 ```bash
-export OMP_NUM_THREADS=4
-export OPENBLAS_NUM_THREADS=4
+export OMP_NUM_THREADS=2
+export MKL_NUM_THREADS=2
+export OPENBLAS_NUM_THREADS=2
 export OMP_WAIT_POLICY=PASSIVE
 ```
 
-线程数会影响竞争场景中的 CPU 占用和 RTF，应在客户真实并行负载下复测。
+线程数由调用方设置，库不会修改应用的全局线程配置。2 个计算线程不代表整个进程只有
+2 个线程，也不代表独占 CPU。不同并行负载应对比 2/4 线程的 CPU 核秒、RTF 和输出；
+本轮 1 线程未通过同波形对照，暂不推荐。
 
 ## 3. 运行模型
 
@@ -93,7 +97,7 @@ import soundfile as sf
 import torch
 from rpu_backend.api import Qwen3TTSModel
 
-torch.set_num_threads(4)
+torch.set_num_threads(2)
 torch.set_num_interop_threads(1)
 
 with Qwen3TTSModel.from_pretrained(
@@ -189,3 +193,8 @@ assert stats["codec_convolutions"].get("decoder_stage_resident_calls", 0) > 0
 Predictor 使用一个 15 步 Graph，代替原来的 8 步和 7 步两个 Graph；Codec 前三个阶段
 通过设备张量衔接，减少两处 CPU 往返。驻留调用计数用于证明新路径已执行，不代表硬件
 提交次数；主机扩展注册检查也不能替代实际合成验证。
+
+
+完整驻留的 Codec 残差单元现在按受限范围合批执行。超出合批资源上限的输入继续使用
+原有 RPU 分块路径。中间 FP16 计算顺序保持一致；本轮无需更新 runtime 或两个采样资产，
+需要更新并重新构建 RhinoForge 主机扩展。

@@ -188,6 +188,9 @@ def test_complete_residual_keeps_legacy_affine_contract(tmp_path):
 using at::Tensor;
 int64_t CeilDiv(int64_t x,int64_t y){return (x+y-1)/y;}
 struct RpuKernelGraph{static bool has_active(){return false;}};
+template<typename Run>Tensor tts_codec_run_residual_batch(bool,const Tensor&,Run run){return run();}
+Tensor tts_codec_bias_rows(const Tensor&x,const Tensor&b){return at::add(x,b);}
+
 void check_tts_codec_device_half(const Tensor&t,c10::IntArrayRef shape,const char*){
  TORCH_CHECK(t.scalar_type()==at::kHalf && t.is_contiguous() && t.sizes().equals(shape));
 }

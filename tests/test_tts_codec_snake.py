@@ -9,16 +9,28 @@ def test_snake_resident_tiles_tail_and_ownership(tmp_path):
     source = (Path(__file__).resolve().parents[1] / "src/ops/rpu_linear.cpp").read_text()
     function = "Tensor tts_codec_snake_rows(" + source.split(
         "Tensor tts_codec_snake_rows(", 1)[1].split("Tensor tts_codec_layernorm_rows(", 1)[0]
+    function += "Tensor tts_codec_bias_rows(" + source.split(
+        "Tensor tts_codec_bias_rows(", 1)[1].split("Tensor tts_codec_linear_rows(", 1)[0]
     function = function.replace("at::kPrivateUse1", "at::kCPU")
     harness = r'''
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
 #include <cassert>
 using at::Tensor;
+bool private_batch=false;
+bool tts_codec_private_batch_active(){return private_batch;}
+constexpr size_t kTtsCodecIm2colBudget=4ULL<<20;
 enum class ValuOpType {ADD,MUL,SIN};
 enum class GeluMode {NONE};
 int submissions=0,broadcasts=0;
-struct RpuKernelGraph {static bool has_active(){return false;}};
+struct RpuKernelGraph {
+ static bool has_active(){return false;}
+ static RpuKernelGraph& active(){static RpuKernelGraph g;return g;}
+ void keep_alive(const Tensor&t){assert(t.defined());}
+};
+void check_tts_codec_device_half(const Tensor&t,c10::IntArrayRef shape,const char*){
+ TORCH_CHECK(t.scalar_type()==at::kHalf&&t.is_contiguous()&&t.sizes().equals(shape));
+}
 struct SpmAllocator {
  static inline uint32_t offset=0;
  static inline size_t budget=4ULL<<20;
@@ -42,7 +54,8 @@ void rpu_launch_spm_scatter_ddr_dma(uint32_t a,c10::Half*p,int64_t n,int64_t str
  for(int c=0;c<cores;++c)at::from_blob(p+c*stride/2,{n},at::kHalf).copy_(region(c,a,n));
 }
 void rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(uint32_t a,uint32_t b,uint32_t o,int64_t n,int64_t k,c10::Half,ValuOpType op,bool,int cores){
- assert(op==ValuOpType::MUL);for(int c=0;c<cores;++c)region(c,o,n*k).view({n,k}).copy_(region(c,b,n*k).view({n,k})*region(c,a,k));
+ for(int c=0;c<cores;++c){auto rows=region(c,b,n*k).view({n,k}),bias=region(c,a,k);
+ region(c,o,n*k).view({n,k}).copy_(op==ValuOpType::MUL?rows*bias:rows+bias);}
 }
 void rpu_launch_eltwise_unary_spm_kernel(uint32_t a,uint32_t b,int64_t n,ValuOpType op,GeluMode,int cores){
  assert(op==ValuOpType::SIN);for(int c=0;c<cores;++c)region(c,b,n).copy_(at::sin(region(c,a,n)));
@@ -67,6 +80,15 @@ int main(){
   a.add_(1);v=at::sin(x*a);expected=x+(v*v)*s;
   assert(at::equal(tts_codec_snake_rows(x,a,s),expected));
  }
+ for(bool batch:{false,true})for(int c:{128,256,768})for(int n:{1,9,4097,32768}){
+  private_batch=batch;
+  auto x=at::randn({n,c}).to(at::kHalf),b=at::randn({c}).to(at::kHalf),saved=x.clone();
+  auto expected=x+b,y=tts_codec_bias_rows(x,b);
+  assert(at::equal(y,expected)&&at::equal(x,saved));
+  b.add_(1);auto fresh=tts_codec_bias_rows(x+1,b);
+  assert(at::equal(fresh,x+1+b)&&at::equal(y,expected));
+ }
+ private_batch=false;
  auto x=at::ones({9,128},at::kHalf),a=at::ones({128},at::kHalf);
  for(int mode:{0,1,2,3}){
   int before=submissions;bool rejected=false;

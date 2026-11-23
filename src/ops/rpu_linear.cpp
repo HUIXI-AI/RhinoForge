@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdint>
+#include <deque>
 #include <utility>
 #include <vector>   // for vector
 
@@ -3929,8 +3930,52 @@ namespace {
 constexpr int64_t kTtsCodecLayerNormRows = 16;
 constexpr size_t kTtsCodecIm2colBudget = 4ULL << 20;
 
+struct TtsCodecResidualBatch {
+  std::deque<uint64_t> destinations;
+  RpuKernelGraph graph;
+};
+thread_local TtsCodecResidualBatch* tts_codec_batch = nullptr;
+
+bool tts_codec_private_batch_active() {
+  return tts_codec_batch && RpuKernelGraph::has_active() &&
+      &RpuKernelGraph::active() == &tts_codec_batch->graph;
+}
+
+template <typename Run>
+Tensor tts_codec_run_residual_batch(bool enabled, const Tensor& affine, Run run) {
+  if (!enabled) return run();
+  TORCH_CHECK(!RpuKernelGraph::has_active() && !tts_codec_batch,
+              "TTS codec residual batch cannot nest");
+  TtsCodecResidualBatch batch;
+  batch.graph.begin();
+  tts_codec_batch = &batch;
+  try {
+    batch.graph.keep_alive(affine);
+    auto output = run();
+    batch.graph.keep_alive(output);
+    batch.graph.end();
+    tts_codec_batch = nullptr;
+    return output;
+  } catch (...) {
+    tts_codec_batch = nullptr;
+    batch.graph.abort();
+    throw;
+  }
+}
+
 template <typename Emit>
 void tts_codec_submit_tile(const Tensor& input, const Tensor& output, Emit emit) {
+  if (tts_codec_private_batch_active()) {
+    auto& graph = tts_codec_batch->graph;
+    graph.keep_alive(input);
+    graph.keep_alive(output);
+    emit();
+    // Scratch offsets may be reused by the next helper on every core.
+    for (int core = 1; core < 8; ++core) graph.record_barrier(0, core * 2);
+    for (int core = 1; core < 8; ++core) graph.record_barrier(core * 2, 0);
+    for (int core = 1; core < 8; ++core) graph.record_barrier(0, core * 2);
+    return;
+  }
   RpuKernelGraph graph;
   graph.begin();
   try {
@@ -3972,7 +4017,7 @@ Tensor tts_codec_device_rows_to_cpu_nct(const Tensor& rows) {
 
 Tensor tts_codec_im2col_rows(const Tensor& rows, int64_t kernel,
                              int64_t dilation, int64_t left_padding) {
-  TORCH_CHECK(!RpuKernelGraph::has_active() &&
+  TORCH_CHECK((!RpuKernelGraph::has_active() || tts_codec_private_batch_active()) &&
                   rows.device().type() == at::kPrivateUse1 &&
                   rows.scalar_type() == at::kHalf && rows.dim() == 2 &&
                   rows.is_contiguous() && kernel > 0 && dilation > 0 &&
@@ -4039,7 +4084,7 @@ Tensor tts_codec_im2col_rows(const Tensor& rows, int64_t kernel,
 
 Tensor tts_codec_snake_rows(const Tensor& rows, const Tensor& alpha,
                             const Tensor& scale) {
-  TORCH_CHECK(!RpuKernelGraph::has_active() &&
+  TORCH_CHECK((!RpuKernelGraph::has_active() || tts_codec_private_batch_active()) &&
                   rows.device().type() == at::kPrivateUse1 &&
                   rows.scalar_type() == at::kHalf && rows.dim() == 2 &&
                   rows.is_contiguous() && rows.size(0) > 0 &&
@@ -4158,9 +4203,46 @@ void check_tts_codec_device_half(const Tensor& tensor,
               name, " has invalid device FP16 geometry");
 }
 
+Tensor tts_codec_bias_rows(const Tensor& rows, const Tensor& bias) {
+  if (!tts_codec_private_batch_active()) return at::add(rows, bias);
+  const int64_t channels = rows.size(1);
+  check_tts_codec_device_half(bias, {channels}, "TTS codec residual bias");
+  TORCH_CHECK(bias.device() == rows.device(), "TTS codec residual bias device mismatch");
+  SpmAllocator::ScopedTemporary temporary;
+  const size_t budget = std::min(SPM_ALLOC.free_space(), kTtsCodecIm2colBudget);
+  const size_t fixed = channels * sizeof(c10::Half) + 512;
+  const size_t per_row = 2 * channels * sizeof(c10::Half);
+  TORCH_CHECK(budget >= fixed + per_row, "TTS codec bias has insufficient free SPM");
+  const int64_t tile = std::min<int64_t>(512, (budget - fixed) / per_row);
+  auto alloc = [](size_t n) {
+    return SPM_ALLOC.addr(0, SPM_ALLOC.alloc_temporary(n * sizeof(c10::Half)));
+  };
+  const uint32_t input_spm = alloc(tile * channels), output_spm = alloc(tile * channels);
+  const uint32_t bias_spm = alloc(channels);
+  auto output = at::empty_like(rows);
+  tts_codec_submit_tile(rows, output, [&] {
+    RpuKernelGraph::active().keep_alive(bias);
+    for (int64_t start = 0; start < rows.size(0);) {
+      const int cores = static_cast<int>(std::min<int64_t>(8, rows.size(0) - start));
+      const int64_t count = std::min(tile, (rows.size(0) - start) / cores);
+      const int64_t elements = count * channels;
+      if (start == 0)
+        rpu_launch_ddr_broadcast_spm_dma(bias.data_ptr<c10::Half>(), channels, bias_spm, cores);
+      rpu_launch_ddr_scatter_spm_dma(rows.data_ptr<c10::Half>() + start * channels,
+          elements, elements * sizeof(c10::Half), input_spm, cores);
+      rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(bias_spm, input_spm, output_spm,
+          count, channels, c10::Half(1.0f), ValuOpType::ADD, false, cores);
+      rpu_launch_spm_scatter_ddr_dma(output_spm, output.data_ptr<c10::Half>() + start * channels,
+          elements, elements * sizeof(c10::Half), cores);
+      start += count * cores;
+    }
+  });
+  return output;
+}
+
 Tensor tts_codec_linear_rows(const Tensor& rows, const Tensor& weight,
                              const c10::optional<Tensor>& bias) {
-  TORCH_CHECK(!RpuKernelGraph::has_active() && rows.dim() == 2 &&
+  TORCH_CHECK((!RpuKernelGraph::has_active() || tts_codec_private_batch_active()) && rows.dim() == 2 &&
                   rows.size(0) > 0 && rows.size(0) <= 255 * 1920 && weight.dim() == 2,
               "TTS codec Linear requires bounded eager rows");
   check_tts_codec_device_half(rows, {rows.size(0), weight.size(1)}, "TTS codec Linear input");
@@ -4177,11 +4259,16 @@ Tensor tts_codec_linear_rows(const Tensor& rows, const Tensor& weight,
   }
   auto output = at::empty({rows.size(0), weight.size(0)}, rows.options());
   const uint64_t destination = RpuGetDevAddr(output.data_ptr<c10::Half>());
+  const uint64_t* live_destination = &destination;
+  if (tts_codec_private_batch_active()) {
+    tts_codec_batch->destinations.push_back(destination);
+    live_destination = &tts_codec_batch->destinations.back();
+  }
   tts_codec_submit_tile(rows, output, [&] {
     RpuKernelGraph::active().keep_alive(weight);
     if (bias.has_value()) RpuKernelGraph::active().keep_alive(*bias);
     rpu_launch_linear_ddr_kernel(rows, weight, output, bias.value_or(Tensor{}),
-        bias.has_value(), 1, &destination, 0, nullptr, 8, {}, true);
+        bias.has_value(), 1, live_destination, 0, nullptr, 8, {}, true);
   });
   return output;
 }
@@ -4272,22 +4359,27 @@ static Tensor tts_codec_residual_unit_impl(
   auto hidden = resident ? input : tts_codec_cpu_nct_to_device_rows(input, first_weight);
   const auto residual = !resident && complete && padded != channels
       ? tts_codec_cpu_nct_to_device_rows(input, first_weight, padded) : hidden;
-  if (complete) {
+  // shortcut: cap rows and retained DDR intermediates; expand after resource validation.
+  return tts_codec_run_residual_batch(
+      complete && resident && input.size(0) > 1 && input.size(0) <= 32768 &&
+          input.numel() <= (8LL << 20), affine, [&] {
+    if (complete) {
+      hidden = tts_codec_snake_rows(
+          hidden, channel(4).narrow(0, 0, row_channels),
+          channel(5).narrow(0, 0, row_channels));
+    }
+    auto patches = tts_codec_im2col_rows(hidden, 7, dilation, 6 * dilation);
+    hidden = tts_codec_linear_rows(patches, first_weight, c10::nullopt);
+    hidden = tts_codec_bias_rows(hidden, channel(0));
     hidden = tts_codec_snake_rows(
-        hidden, channel(4).narrow(0, 0, row_channels),
-        channel(5).narrow(0, 0, row_channels));
-  }
-  auto patches = tts_codec_im2col_rows(hidden, 7, dilation, 6 * dilation);
-  hidden = tts_codec_linear_rows(patches, first_weight, c10::nullopt);
-  hidden = at::add(hidden, channel(0));
-  hidden = tts_codec_snake_rows(
-      hidden, channel(1), channel(2));
-  hidden = tts_codec_linear_rows(hidden, second_weight, c10::nullopt);
-  hidden = at::add(hidden, channel(3));
-  if (complete) {
-    hidden = at::add(hidden, residual);
-  }
-  return resident ? hidden : tts_codec_device_rows_to_cpu_nct(hidden.narrow(1, 0, channels));
+        hidden, channel(1), channel(2));
+    hidden = tts_codec_linear_rows(hidden, second_weight, c10::nullopt);
+    hidden = tts_codec_bias_rows(hidden, channel(3));
+    if (complete) {
+      hidden = at::add(hidden, residual);
+    }
+    return resident ? hidden : tts_codec_device_rows_to_cpu_nct(hidden.narrow(1, 0, channels));
+  });
 }
 
 Tensor rpu_tts_codec_residual_unit(

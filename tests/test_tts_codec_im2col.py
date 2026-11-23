@@ -15,6 +15,7 @@ def test_im2col_batched_tiles_padding_dilation_and_ownership(tmp_path):
 #include <ATen/Parallel.h>
 #include <cassert>
 using at::Tensor;
+bool tts_codec_private_batch_active(){return false;}
 constexpr size_t kTtsCodecIm2colBudget=4ULL<<20;
 struct RpuKernelGraph {static inline bool active=false;static bool has_active(){return active;}};
 int submits=0;

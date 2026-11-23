@@ -11,6 +11,7 @@ class TtsPredictorGroup {
     std::vector<GraphSignature> groups_;
     RpuGraphCache* cache_ = nullptr;
     std::vector<at::Tensor> owners_;
+    std::array<at::Tensor, 15> embedding_outputs_;
     bool failed_ = false;
 public:
     explicit TtsPredictorGroup(std::string path);

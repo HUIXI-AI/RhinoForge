@@ -181,8 +181,11 @@ Start with the [Qwen3 speech guide](../docs/qwen3_audio.md) and retain these con
   columns before transforming the first convolution weight, and crop only at stage
   exit. Preserve the original per-unit weights for older-extension CPU boundaries.
   With `tts_codec_decoder_stage_rows`, pass owned contiguous FP16 device rows
-  between stages 1–3; stage 3 crops its padded channels and returns CPU NCT before
-  stage 4. Keep each helper's eager completion and temporary-SPM lifetime intact;
+  between stages 1–3. With native `tts_codec_resident_stages=4`, compact stage 3
+  from 256 to 192 channels with bounded SPM slices and pass contiguous device rows
+  into stage 4, preserving its original 192-channel weights. Older native builds
+  retain the stage 3→4 CPU boundary. Keep each helper's eager completion and
+  temporary-SPM lifetime intact;
   do not place the whole chain inside a Graph with stack-owned mutable DMA slots.
   The optional `tts_codec_conv_transpose1d_device_post` boundary reuses shared-DDR
   conversion helpers and the existing projection/overlap math. Validate the full

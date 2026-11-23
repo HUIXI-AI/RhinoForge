@@ -33,6 +33,16 @@ static at::Tensor tts_sampling_checked_packed_result(const at::Tensor& packed) {
     return result;
 }
 
+static at::Tensor tts_sampling_embedding_output(
+        const at::Tensor& logits, const at::Tensor& reusable) {
+    if (!reusable.defined()) return at::empty({1, 1, 1024}, logits.options());
+    TORCH_CHECK(reusable.device() == logits.device() &&
+                    reusable.scalar_type() == at::kHalf && reusable.is_contiguous() &&
+                    reusable.sizes().equals({1, 1, 1024}),
+                "invalid TTS group embedding output buffer");
+    return reusable;
+}
+
 // Experimental host wrapper; operator assets remain outside the repository.
 class TtsSamplingExperiment {
     using Kernel = rhino_lkn::Kernel_t;
@@ -129,13 +139,15 @@ public:
         reserved_frames_ = frames;
         reserved_index_ = next_index_ = 0;
     }
-    at::Tensor run(const at::Tensor& logits, const at::Tensor& table, int index) {
+    at::Tensor run(const at::Tensor& logits, const at::Tensor& table, int index,
+                   const at::Tensor& reusable_output = {}) {
         using namespace rhino_lkn;
         TORCH_CHECK(index == next_index_ && index >= 0 && index < 15 && logits.sizes().equals({1,1,2048}) &&
                     table.sizes().equals({2048,1024}) &&
                     logits.scalar_type() == at::kHalf && table.scalar_type() == at::kHalf &&
                     logits.device().is_privateuseone() && table.device() == logits.device(),
                     "invalid TTS sampler tensor profile");
+        auto output = tts_sampling_embedding_output(logits, reusable_output);
         const auto logits_buffer = buffer(logits);
         const auto table_buffer = buffer(table);
         if (!packed_result_.defined())
@@ -159,7 +171,6 @@ public:
             {{4,8192},{6,12288},{22,12320}}, {{2,12288},{4,0x110000}}};
         const auto address = table_buffer.root->get_rpu_addr() + table_buffer.offset;
         TORCH_CHECK(!(address & 255) && (address >> 8) <= UINT32_MAX, "invalid embedding DDR alignment");
-        auto output = at::empty({1, 1, 1024}, logits.options());
         const auto output_buffer = buffer(output);
         auto* graph = RpuKernelGraph::has_active() ? &RpuKernelGraph::active() : nullptr;
         std::unique_ptr<Queue_t> queue;

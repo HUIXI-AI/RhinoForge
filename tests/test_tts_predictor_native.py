@@ -67,6 +67,20 @@ at::Tensor rpu_causal_decoder_tts_predictor_logits(int64_t){return current_logit
 '''
     cases = r'''
 int main(){
+ auto logits_template=at::zeros({1,1,2048},at::kHalf);
+ auto reusable=at::zeros({1,1,1024},at::kHalf);
+ assert(tts_sampling_embedding_output(logits_template,reusable).is_same(reusable));
+ auto fresh=tts_sampling_embedding_output(logits_template,{});fresh.fill_(1);auto held=fresh.clone();
+ auto next=tts_sampling_embedding_output(logits_template,{});
+ assert(fresh.data_ptr()!=next.data_ptr());
+ next.fill_(3);assert(at::equal(fresh,held));
+ for(int bad=0;bad<4;++bad){
+  bool rejected=false;
+  auto invalid=bad==0?reusable.to(at::kFloat):bad==1?reusable.narrow(2,0,1023):
+      bad==2?at::empty({1,1,2048},at::kHalf).slice(2,0,2048,2):reusable.squeeze(0);
+  try{tts_sampling_embedding_output(logits_template,invalid);}catch(const c10::Error&){rejected=true;}
+  assert(rejected);
+ }
  auto valid=at::ones({15,2048},at::kHalf);
  auto ids=at::zeros({15,8},at::kInt);
  ids.select(1,0).copy_(at::arange(15,at::kInt));

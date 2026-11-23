@@ -672,7 +672,11 @@ gets a 16,384-entry ceiling; SDK headroom and KD/instruction limits still apply.
 Other Graphs retain their existing budgets. After initial single-step preparation,
 the two step Graphs are retired and replaced by the group Graph. Native owners
 without the typed `tts_predictor_group_15` policy retain the 8-step + 7-step route.
-The single-forward prefill shortcut is disabled in this mode; ordinary group replay retains physical-plan and DMA validation. Configuration
+The group owns 15 separate embedding output buffers and reuses them only after
+the preceding batch completes. This avoids 15 output allocations per later frame
+while preserving independently owned CPU token results.
+The single-forward prefill shortcut is disabled in this mode; ordinary group replay
+retains physical-plan and DMA validation. Configuration
 changes or external cache retirement require a model reload. `execution_stats()`
 reports Predictor `group_hw_submits_total`; use before/after differences, not the
 cumulative value, to count submissions for a request. Clear Graphs before retiring
@@ -701,7 +705,10 @@ first SnakeBeta and final residual addition in device FP16; older extensions
 retain the CPU FP32 boundary for those two operations.
 With `tts_codec_decoder_stage_rows`, the first three decoder stages pass owned
 FP16 device rows directly, removing two inter-stage CPU conversion/upload pairs.
-Stage 3 crops its padded channels and returns CPU FP32 NCT for stage 4.
+Extensions advertising `tts_codec_resident_stages=4` also compact stage 3 from
+256 padded channels to 192 on RPU and keep the stage 3→4 boundary on device.
+Stage 4 returns independently owned CPU FP32 NCT; older extensions keep the
+stage 3→4 CPU boundary. The original 192-channel stage 4 weights are unchanged.
 `codec_convolutions.decoder_stage_resident_calls` counts these stage invocations;
 it does not count hardware submissions. Older extensions retain CPU boundaries.
 With `tts_codec_conv1d_spm_bias`, standalone Conv1d uses a retained FP16 device

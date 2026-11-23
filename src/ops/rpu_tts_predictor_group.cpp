@@ -28,6 +28,7 @@ void TtsPredictorGroup::retire(RpuGraphCache& cache) {
     failed_ = true;
     sampler_.reset();
     owners_.clear();
+    embedding_outputs_ = {};
 }
 
 at::Tensor TtsPredictorGroup::generate(int64_t handle, const at::Tensor& input,
@@ -93,6 +94,9 @@ at::Tensor TtsPredictorGroup::generate(int64_t handle, const at::Tensor& input,
     }
     sampler_->reset();
     sampler_->prepare_graph(keys[0].options());
+    // Each deferred decoder step needs its own embedding until the group completes.
+    for (auto& output : embedding_outputs_)
+        if (!output.defined()) output = at::empty({1, 1, 1024}, keys[0].options());
     // The exact cold owner selects one group; legacy owners keep two batches.
     for (int start = 0; start < steps; start += group_steps) {
         const auto& group = groups_[start / group_steps];
@@ -114,7 +118,8 @@ at::Tensor TtsPredictorGroup::generate(int64_t handle, const at::Tensor& input,
                 graph.keep_alive(raw);
                 auto logits = rpu_causal_decoder_tts_predictor_logits(handle);
                 graph.record_barrier(0, 0);
-                hidden = sampler_->run(logits, embeddings[std::min(index, 13)], index);
+                hidden = sampler_->run(logits, embeddings[std::min(index, 13)], index,
+                                       embedding_outputs_[index]);
                 graph.record_barrier(0, 0);
             }
             graph.end();

@@ -18,7 +18,7 @@ def test_transpose_device_post_boundary_and_owned_output(tmp_path):
         "Tensor tts_codec_cpu_nct_to_device_rows(", 1)[1].split("Tensor tts_codec_im2col_rows(", 1)[0]
     function = "Tensor rpu_tts_codec_conv_transpose1d_device_post(" + source.split(
         "Tensor rpu_tts_codec_conv_transpose1d_device_post(", 1)[1].split(
-        "static Tensor tts_codec_decoder_stage_impl(", 1)[0]
+        "static Tensor tts_codec_compact_stage3_rows(", 1)[0]
     harness = r'''
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
@@ -98,6 +98,7 @@ Tensor tts_codec_cpu_nct_to_device_rows(const Tensor&x,const Tensor&,int64_t=0){
 Tensor tts_codec_device_rows_to_cpu_nct(const Tensor&x){
  ++downloads;return x.t().unsqueeze(0).to(at::kFloat).contiguous();
 }
+Tensor tts_codec_compact_stage3_rows(const Tensor&x){return x.narrow(1,0,192).contiguous();}
 Tensor tts_codec_snake_rows(const Tensor&x,const Tensor&,const Tensor&){++snakes;return x+1;}
 Tensor tts_codec_linear_rows(const Tensor&x,const Tensor&w,const c10::optional<Tensor>&){
  ++linears;return at::zeros({x.size(0),w.size(0)},x.options());
@@ -151,12 +152,19 @@ int main(){
  reference=rpu_tts_codec_decoder_stage(reference,b[0],b[1],b[2],first,affine,second,384,10,5);
  reference=rpu_tts_codec_decoder_stage(reference,c[0],c[1],c[2],first,affine,second,192,8,4);
  assert(at::equal(final,reference)&&at::equal(final,held_final));
+ auto compact=run(rows,c,192,8,4,true,true);
+ assert(compact.dim()==2&&compact.size(1)==192&&compact.is_contiguous());
+ auto fourth=parameters(192,96,6);u=uploads;d=downloads;
+ auto full=run(compact,fourth,96,6,3,true,false);
+ assert(uploads==u&&downloads==d+1);
+ auto fourth_ref=rpu_tts_codec_decoder_stage(final,fourth[0],fourth[1],fourth[2],first,affine,second,96,6,3);
+ assert(at::equal(full,fourth_ref));
  int launches=snakes;
  for(int fault=0;fault<3;++fault){
   rejected=false;
   try {
    if(fault==0)run(input,a,768,16,8,true,true);
-   if(fault==1)run(rows,c,192,8,4,true,true);
+   if(fault==1)run(compact,fourth,96,6,3,true,true);
    if(fault==2)run(rows.t(),c,192,8,4,true,false);
   }catch(const c10::Error&){rejected=true;}
   assert(rejected&&snakes==launches);

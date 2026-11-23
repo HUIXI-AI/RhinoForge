@@ -4675,6 +4675,40 @@ Tensor rpu_tts_codec_conv_transpose1d_device_post(
   return tts_codec_device_rows_to_cpu_nct(output.narrow(1, 0, channels));
 }
 
+static Tensor tts_codec_compact_stage3_rows(const Tensor& rows) {
+  TORCH_CHECK(!RpuKernelGraph::has_active() &&
+                  rows.device().type() == at::kPrivateUse1 &&
+                  rows.scalar_type() == at::kHalf && rows.is_contiguous() &&
+                  rows.dim() == 2 && rows.size(1) == 256 &&
+                  rows.size(0) > 0 && rows.size(0) <= 255 * 640,
+              "TTS codec stage3 compaction expects bounded FP16 [rows,256]");
+  if (!SPM_ALLOC.is_initialized()) SPM_ALLOC.init();
+  SpmAllocator::ScopedTemporary temporary;
+  const size_t budget = std::min<size_t>(SPM_ALLOC.free_space(), 4ULL << 20);
+  TORCH_CHECK(budget >= 512 + (256 + 192) * sizeof(c10::Half),
+              "TTS codec stage3 compaction has insufficient free SPM");
+  const int64_t tile = std::min<int64_t>(4096,
+      (budget - 512) / ((256 + 192) * sizeof(c10::Half)));
+  const uint32_t input_spm = SPM_ALLOC.addr(0,
+      SPM_ALLOC.alloc_temporary(tile * 256 * sizeof(c10::Half)));
+  const uint32_t output_spm = SPM_ALLOC.addr(0,
+      SPM_ALLOC.alloc_temporary(tile * 192 * sizeof(c10::Half)));
+  auto output = at::empty({rows.size(0), 192}, rows.options());
+  tts_codec_submit_tile(rows, output, [&] {
+    for (int64_t start = 0; start < rows.size(0); start += tile) {
+      const int64_t count = std::min(tile, rows.size(0) - start);
+      rpu_launch_ddr_broadcast_spm_dma(
+          rows.data_ptr<c10::Half>() + start * 256, count * 256, input_spm, 1);
+      rpu_launch_slice_spm_kernel(input_spm, output_spm,
+          {count, 256}, {count, 192}, {0, 0}, 1);
+      rpu_launch_spm_copy_ddr_dma(output_spm,
+          output.data_ptr<c10::Half>() + start * 192, count * 192);
+      RpuKernelGraph::active().record_barrier(0, 0);
+    }
+  });
+  return output;
+}
+
 static Tensor tts_codec_decoder_stage_impl(
     const Tensor& input, const Tensor& snake_affine,
     const Tensor& transpose_weight, const c10::optional<Tensor>& transpose_bias,
@@ -4728,7 +4762,8 @@ static Tensor tts_codec_decoder_stage_impl(
         index == 0 ? 1 : index == 1 ? 3 : 9, channels, true, true,
         padded_rows);
   }
-  return output_rows ? rows : tts_codec_device_rows_to_cpu_nct(rows.narrow(1, 0, channels));
+  if (output_rows) return channels == 192 ? tts_codec_compact_stage3_rows(rows) : rows;
+  return tts_codec_device_rows_to_cpu_nct(rows.narrow(1, 0, channels));
 }
 
 Tensor rpu_tts_codec_decoder_stage(
@@ -4749,8 +4784,9 @@ Tensor rpu_tts_codec_decoder_stage_rows(
     bool input_rows, bool output_rows) {
   TORCH_CHECK((channels == 768 && !input_rows && output_rows) ||
                   (channels == 384 && input_rows && output_rows) ||
-                  (channels == 192 && input_rows && !output_rows),
-              "TTS resident decoder supports only the first three stage boundaries");
+                  (channels == 192 && input_rows) ||
+                  (channels == 96 && input_rows && !output_rows),
+              "TTS resident decoder received an unsupported stage boundary");
   return tts_codec_decoder_stage_impl(input, snake_affine, transpose_weight,
       transpose_bias, first_weights, affines, second_weights, channels, kernel, stride,
       input_rows, output_rows);

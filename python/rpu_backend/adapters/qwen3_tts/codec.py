@@ -452,6 +452,8 @@ def install_rpu_convolutions(decoder, restore, stats):
 
     stage_native = getattr(torch.ops.rpu, "tts_codec_decoder_stage", None)
     resident_native = getattr(torch.ops.rpu, "tts_codec_decoder_stage_rows", None)
+    from rpu_backend.graph import _runtime
+    resident_stages = getattr(_runtime._cpp_ext, "tts_codec_resident_stages", 3)
     if (stage_native is not None and complete_residuals and fused_residuals and
             hasattr(torch.ops.rpu, "tts_codec_residual_unit_padded_rows")):
         geometries = ((1, 1536, 768, 16, 8), (2, 768, 384, 10, 5),
@@ -471,13 +473,13 @@ def install_rpu_convolutions(decoder, restore, stats):
                         transpose_weight=transpose_weight, transpose_bias=transpose_bias,
                         first=first, affine=affine, second=second, channels=channels,
                         kernel=kernel, stride=stride, index=index):
-                resident = resident_native is not None and index <= 3
+                resident = resident_native is not None and index <= resident_stages
                 native = resident_native if resident else stage_native
                 output = native(
                     hidden,
                     snake_affine, transpose_weight, transpose_bias,
                     list(first), list(affine), list(second), channels, kernel, stride,
-                    *((index > 1, index < 3) if resident else ()))
+                    *((index > 1, index < resident_stages) if resident else ()))
                 stats["standalone_snake_calls"] += 1
                 stats["transposed_calls"] += 1
                 stats["calls"] += 6

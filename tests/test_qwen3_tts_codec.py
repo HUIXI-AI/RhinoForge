@@ -330,7 +330,14 @@ def test_resident_stage_keeps_three_units_on_device_and_restores(monkeypatch, pa
 
 
 @pytest.mark.parametrize("resident", [False, True])
-def test_decoder_stage_keeps_snake_transpose_and_residuals_on_device(monkeypatch, resident):
+@pytest.mark.parametrize("resident_stages", [3, 4])
+def test_decoder_stage_keeps_snake_transpose_and_residuals_on_device(monkeypatch, resident, resident_stages):
+    from rpu_backend.graph import _runtime
+    import types
+    extension = types.SimpleNamespace()
+    if resident_stages == 4:
+        extension.tts_codec_resident_stages = 4
+    monkeypatch.setattr(_runtime, "_cpp_ext", extension)
     from rpu_backend.runtime import weights
     decoder = _paired_decoder()
     for index, in_channels in enumerate((1536, 768, 384, 192), start=1):
@@ -374,7 +381,7 @@ def test_decoder_stage_keeps_snake_transpose_and_residuals_on_device(monkeypatch
     def rows(hidden, snake, transpose, bias, first, affine, second,
              channels, kernel, stride, input_rows, output_rows):
         assert input_rows == (channels != 768)
-        assert output_rows == (channels != 192)
+        assert output_rows == (channels != (192 if resident_stages == 3 else 96))
         nct = hidden.T.unsqueeze(0).float() if input_rows else hidden
         output = stage(nct, snake, transpose, bias, first, affine, second,
                        channels, kernel, stride)
@@ -390,13 +397,13 @@ def test_decoder_stage_keeps_snake_transpose_and_residuals_on_device(monkeypatch
             (384, 192, 8, 4), (192, 96, 6, 3)), start=1):
         output = decoder.decoder[index](output)
         length = (length + 1) * stride
-        on_device = resident and index < 3
+        on_device = resident and index < resident_stages
         assert output.shape == ((length, channels) if on_device else (1, channels, length))
         assert output.dtype == (torch.float16 if on_device else torch.float32)
     assert calls == [(1536, 768, 16, 8), (768, 384, 10, 5),
                      (384, 192, 8, 4), (192, 96, 6, 3)]
     assert stats["decoder_stage_calls"] == 4
-    assert stats["decoder_stage_resident_calls"] == (3 if resident else 0)
+    assert stats["decoder_stage_resident_calls"] == (resident_stages if resident else 0)
     assert stats["standalone_snake_calls"] == stats["transposed_calls"] == 4
     assert stats["paired_calls"] == 12 and stats["calls"] == 24
 

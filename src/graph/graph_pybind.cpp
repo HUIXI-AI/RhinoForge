@@ -41,6 +41,7 @@ namespace py = pybind11;
 namespace graph_pybind {
 
 void add_bindings(py::module_& m) {
+    m.attr("tts_codec_resident_stages") = 4;
     py::class_<TtsTalkerSampler>(m, "TtsTalkerSampler")
         .def(py::init<std::string>())
         .def("reset", &TtsTalkerSampler::reset)

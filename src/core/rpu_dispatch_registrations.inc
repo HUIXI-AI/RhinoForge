@@ -223,6 +223,8 @@ TORCH_LIBRARY(rpu, m) {
         TORCH_FN(rpu_tts_codec_conv_transpose1d_device_post));
   m.def("tts_codec_decoder_stage(Tensor input, Tensor snake_affine, Tensor transpose_weight, Tensor? transpose_bias, Tensor[] first_weights, Tensor[] affines, Tensor[] second_weights, int channels, int kernel, int stride) -> Tensor",
         TORCH_FN(rpu_tts_codec_decoder_stage));
+  m.def("tts_codec_decoder_stage_rows(Tensor input, Tensor snake_affine, Tensor transpose_weight, Tensor? transpose_bias, Tensor[] first_weights, Tensor[] affines, Tensor[] second_weights, int channels, int kernel, int stride, bool input_rows, bool output_rows) -> Tensor",
+        TORCH_FN(rpu_tts_codec_decoder_stage_rows));
   // SDPA unified layout: [batch, seq_len, heads, head_dim] instead of standard [batch, heads, seq_len, head_dim]
   m.def("scaled_dot_product_attention_unified(Tensor query, Tensor key, Tensor value, Tensor? attn_mask=None, float dropout_p=0.0, bool is_causal=False, float? scale=None, bool enable_gqa=False) -> Tensor");
   // Fused QKV Attention (SPM版本，减少DDR搬运)

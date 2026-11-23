@@ -77,6 +77,8 @@ struct GraphRuntimePolicy {
     // Official uniform-quantized 27B owner; its Text/Vision lifecycle reserves
     // four arenas. This does not inherit the legacy text-only loading policy.
     bool qwen35_dense_27b_sdk_budget = false;
+    // Exact TP8 Predictor owner: fifteen dependent steps in one bounded batch.
+    bool tts_predictor_group_15 = false;
 };
 
 // =============================================================================
@@ -668,6 +670,7 @@ public:
 
     size_t size() const { return entries_.size(); }
     size_t max_entries() const { return max_entries_; }
+    const GraphRuntimePolicy& runtime_policy() const { return runtime_policy_; }
 
     void touch_entry(const GraphSignature& sig, bool replay);
 

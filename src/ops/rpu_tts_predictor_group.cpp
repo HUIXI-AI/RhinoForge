@@ -59,10 +59,12 @@ at::Tensor TtsPredictorGroup::generate(int64_t handle, const at::Tensor& input,
     if (execution_len > 2) half = at::constant_pad_nd(half, {0,0,0,execution_len-2}, 0);
     auto hidden = half.to(keys[0].device());
     const int steps = std::getenv("RPU_TTS_SAMPLING_TWO_STEP") ? 2 : 15;
+    const int group_steps = cache.runtime_policy().tts_predictor_group_15 ? 15 : 8;
     auto signature = prefill;
     signature.op_id_str = "qwen3_tts_predictor_group";
     signature.dyn_dims.push_back(reinterpret_cast<int64_t>(this));
     signature.dyn_dims.push_back(steps);
+    signature.dyn_dims.push_back(group_steps);
     signature.dyn_dims.push_back(execution_len);
     signature.dyn_dims.insert(signature.dyn_dims.end(), prefill_descriptor.begin(), prefill_descriptor.end());
     signature.dyn_dims.insert(signature.dyn_dims.end(), decode_descriptor.begin(), decode_descriptor.end());
@@ -74,7 +76,7 @@ at::Tensor TtsPredictorGroup::generate(int64_t handle, const at::Tensor& input,
         cache.evict(prefill);
         cache.evict(decode);
         signature_ = signature;
-        for (int start = 0; start < steps; start += 8) {
+        for (int start = 0; start < steps; start += group_steps) {
             auto group = signature;
             group.dyn_dims.push_back(start);
             groups_.push_back(std::move(group));
@@ -91,9 +93,9 @@ at::Tensor TtsPredictorGroup::generate(int64_t handle, const at::Tensor& input,
     }
     sampler_->reset();
     sampler_->prepare_graph(keys[0].options());
-    // Keep both prepared queues below the framework's conservative entry budget.
-    for (int start = 0; start < steps; start += 8) {
-        const auto& group = groups_[start / 8];
+    // The exact cold owner selects one group; legacy owners keep two batches.
+    for (int start = 0; start < steps; start += group_steps) {
+        const auto& group = groups_[start / group_steps];
         auto& graph = cache.get_or_create(group);
         const auto submissions_before = graph.debug_stats().hw_batch_submit_total;
         try {
@@ -101,7 +103,7 @@ at::Tensor TtsPredictorGroup::generate(int64_t handle, const at::Tensor& input,
             const bool replay = graph.state() == RpuKernelGraph::State::REPLAYING;
             // A group is not the single-forward stream required by checked decode replay.
             graph.record_barrier(0, 0);
-            for (int index = start; index < std::min(start + 8, steps); ++index) {
+            for (int index = start; index < std::min(start + group_steps, steps); ++index) {
                 const auto begin = graph.op_stream_stamp();
                 auto raw = rpu_causal_decoder_forward(handle, hidden, keys, values,
                     std::nullopt, index == 0 ? 0 : index + 1, true,

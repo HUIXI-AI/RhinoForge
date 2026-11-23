@@ -268,7 +268,12 @@ class Qwen3TTSModel:
             raise RuntimeError("TTS requires its cold six-arena Graph plan")
         talker = self._wrapper.model.talker
         for name, core in (("talker", talker.model), ("predictor", talker.code_predictor.model)):
-            graph = GraphCache(runtime_policy=self._graph_runtime_policy)
+            policy = self._graph_runtime_policy
+            if name == "predictor" and os.environ.get("RPU_TTS_PREDICTOR_GROUP") == "1":
+                from dataclasses import replace
+                policy = replace(policy, tts_predictor_group_15=True,
+                                 provenance=policy.provenance + ("owner:tts_predictor_group_15=1",))
+            graph = GraphCache(runtime_policy=policy)
             handle = torch.ops.rpu.causal_decoder_create()
             part = {"handle": handle, "graph": graph, "calls": 0, "tokens": 0,
                     "capacity": getattr(self, "_max_seq_len", 512) if name == "talker" else 32, "layers": len(core.layers),

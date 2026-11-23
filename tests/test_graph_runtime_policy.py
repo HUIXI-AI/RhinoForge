@@ -65,6 +65,22 @@ def runtime_module(monkeypatch):
     return module
 
 
+def test_tts_predictor_budget_is_cold_and_requires_its_owner(runtime_module):
+    policy_type = runtime_module.GraphRuntimePolicy
+    policy = policy_type.from_environment(graph_arena_count=6, tts_predictor_group_15=True)
+    assert policy._native().options["tts_predictor_group_15"] is True
+    assert "tts_predictor_group_15" not in policy_type.from_environment()._native().options
+    with pytest.raises(FrozenInstanceError):
+        policy.tts_predictor_group_15 = False
+    for overrides in ({"graph_arena_count": 0}, {"execution_core_count": 4},
+                      {"lingbot2_multiview_spm_z2": True}):
+        args = {"graph_arena_count": 6, "tts_predictor_group_15": True, **overrides}
+        with pytest.raises(ValueError, match="TTS Predictor"):
+            policy_type.from_environment(**args)
+    with pytest.raises(TypeError, match="tts_predictor_group_15"):
+        policy_type.from_environment(graph_arena_count=6, tts_predictor_group_15=1)
+
+
 def test_graph_policy_is_frozen_at_cache_creation(runtime_module, monkeypatch):
     monkeypatch.setenv("RPU_FASTREPLAY_SKIP_SYNC", "1")
     monkeypatch.setenv("RPU_WALL_OSS_FAST_REPLAY", "on")

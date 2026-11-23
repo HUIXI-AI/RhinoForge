@@ -665,12 +665,14 @@ submissions, and its FP16 sampling is not seed-equivalent to the default FP32 pa
 
 With matching experimental assets, set `RPU_TTS_PREDICTOR_GROUP=1` and
 `RPU_TTS_SAMPLING_EXPERIMENT=<asset-directory>` before loading to opt into grouped
-Predictor execution. Decoder, sampling and embedding are recorded into two retained
-Graphs (8 steps + 7 steps), each checked to submit one hardware batch per invocation.
-This preserves the framework's conservative batch budget rather than increasing it.
-After initial single-step preparation, the two step Graphs are retired and replaced
-by these two group Graphs. The single-forward prefill shortcut is disabled in this
-mode; ordinary group replay retains physical-plan and DMA validation. Configuration
+Predictor execution. With the matching native extension, its cold TP8/six-arena
+owner policy records decoder, sampling and embedding into one retained 15-step
+Graph, checked to submit one hardware batch per invocation. Only this exact Graph
+gets a 16,384-entry ceiling; SDK headroom and KD/instruction limits still apply.
+Other Graphs retain their existing budgets. After initial single-step preparation,
+the two step Graphs are retired and replaced by the group Graph. Native owners
+without the typed `tts_predictor_group_15` policy retain the 8-step + 7-step route.
+The single-forward prefill shortcut is disabled in this mode; ordinary group replay retains physical-plan and DMA validation. Configuration
 changes or external cache retirement require a model reload. `execution_stats()`
 reports Predictor `group_hw_submits_total`; use before/after differences, not the
 cumulative value, to count submissions for a request. Clear Graphs before retiring
@@ -697,6 +699,11 @@ also keep their intermediate SnakeBeta and first bias on RPU in FP16.
 With `tts_codec_residual_unit_complete`, the pairs also execute the
 first SnakeBeta and final residual addition in device FP16; older extensions
 retain the CPU FP32 boundary for those two operations.
+With `tts_codec_decoder_stage_rows`, the first three decoder stages pass owned
+FP16 device rows directly, removing two inter-stage CPU conversion/upload pairs.
+Stage 3 crops its padded channels and returns CPU FP32 NCT for stage 4.
+`codec_convolutions.decoder_stage_resident_calls` counts these stage invocations;
+it does not count hardware submissions. Older extensions retain CPU boundaries.
 With `tts_codec_conv1d_spm_bias`, standalone Conv1d uses a retained FP16 device
 bias in its Linear projection, instead of adding CPU FP32 bias afterward. Select
 `codec_backend="cpu"` to restore

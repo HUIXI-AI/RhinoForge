@@ -180,6 +180,10 @@ Start with the [Qwen3 speech guide](../docs/qwen3_audio.md) and retain these con
   chains in zero-padded 256/128-channel rows too: pad each kernel position's input
   columns before transforming the first convolution weight, and crop only at stage
   exit. Preserve the original per-unit weights for older-extension CPU boundaries.
+  With `tts_codec_decoder_stage_rows`, pass owned contiguous FP16 device rows
+  between stages 1–3; stage 3 crops its padded channels and returns CPU NCT before
+  stage 4. Keep each helper's eager completion and temporary-SPM lifetime intact;
+  do not place the whole chain inside a Graph with stack-owned mutable DMA slots.
   The optional `tts_codec_conv_transpose1d_device_post` boundary reuses shared-DDR
   conversion helpers and the existing projection/overlap math. Validate the full
   geometry before upload, and return independently owned CPU FP32 NCT storage.
@@ -219,8 +223,10 @@ Start with the [Qwen3 speech guide](../docs/qwen3_audio.md) and retain these con
   sized table sections from the versioned `tts_sampling_tables.bin`; point both
   sampling asset environment variables at that same two-file directory.
 - The optional TTS Predictor group path records decoder, sampler and embedding
-  directly into 8-step and 7-step Graphs under the existing batch budget. Retire
-  the old two step Graphs first; keep Programs, per-invocation mutable DMA slots
+  into one 15-step Graph under its typed cold TP8/six-arena owner policy. Raise
+  only `qwen3_tts_predictor_group`'s entry ceiling to 16,384; retain SDK headroom
+  and KD/instruction limits. Other owners retain 8-step + 7-step grouping.
+  Include group length in the signature and retire the old two step Graphs first; keep Programs, per-invocation mutable DMA slots
   and managed initialization/noise buffers alive until group retirement. Disable
   the single-forward prefill shortcut at installation, and do not use it to skip
   a group stream. Check the **delta** of `hw_batch_submit_total` around each end;

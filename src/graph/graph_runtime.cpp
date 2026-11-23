@@ -1265,6 +1265,13 @@ void validate_graph_runtime_policy(
         "GraphRuntimePolicy dense 27B requires four arenas and no legacy owner");
     const auto defer_mode = static_cast<uint8_t>(
         runtime_policy.host_op_defer_mode);
+    TORCH_CHECK(!runtime_policy.tts_predictor_group_15 ||
+                    (runtime_policy.execution_core_count == 8 &&
+                     runtime_policy.graph_arena_count == 6 &&
+                     !runtime_policy.qwen35_legacy_27b_sdk_budget &&
+                     !runtime_policy.qwen35_dense_27b_sdk_budget &&
+                     !runtime_policy.lingbot2_multiview_spm_z2),
+                "TTS Predictor group requires its TP8 six-arena owner");
     TORCH_CHECK(
         defer_mode <= static_cast<uint8_t>(GraphHostOpDeferMode::ForceOn),
         "GraphRuntimePolicy host-op defer mode is invalid: ", defer_mode);

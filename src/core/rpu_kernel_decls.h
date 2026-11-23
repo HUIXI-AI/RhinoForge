@@ -207,6 +207,12 @@ at::Tensor rpu_tts_codec_decoder_stage(
     const at::Tensor& transpose_weight, const c10::optional<at::Tensor>& transpose_bias,
     at::TensorList first_weights, at::TensorList affines,
     at::TensorList second_weights, int64_t channels, int64_t kernel, int64_t stride);
+at::Tensor rpu_tts_codec_decoder_stage_rows(
+    const at::Tensor& input, const at::Tensor& snake_affine,
+    const at::Tensor& transpose_weight, const c10::optional<at::Tensor>& transpose_bias,
+    at::TensorList first_weights, at::TensorList affines,
+    at::TensorList second_weights, int64_t channels, int64_t kernel, int64_t stride,
+    bool input_rows, bool output_rows);
 at::Tensor rpu_tts_codec_transpose_overlap(
     const at::Tensor& projected, const c10::optional<at::Tensor>& bias,
     int64_t channels, int64_t kernel, int64_t stride);

@@ -148,7 +148,8 @@ void add_bindings(py::module_& m) {
                  int execution_core_count,
                  size_t graph_arena_count,
                  GraphBatchSnapshotMode batch_snapshot_mode,
-                 bool qwen35_dense_27b_sdk_budget) {
+                 bool qwen35_dense_27b_sdk_budget,
+                 bool tts_predictor_group_15) {
                  GraphRuntimePolicy result;
                  result.fast_replay_skip_sync = fast_replay_skip_sync;
                  result.force_oneshot_on_replay = force_oneshot_on_replay;
@@ -168,6 +169,7 @@ void add_bindings(py::module_& m) {
                  result.graph_arena_count = graph_arena_count;
                  result.batch_snapshot_mode = batch_snapshot_mode;
                  result.qwen35_dense_27b_sdk_budget = qwen35_dense_27b_sdk_budget;
+                 result.tts_predictor_group_15 = tts_predictor_group_15;
                  validate_graph_runtime_policy(result);
                  return result;
              }),
@@ -185,7 +187,8 @@ void add_bindings(py::module_& m) {
              py::arg("execution_core_count") = 8,
              py::arg("graph_arena_count") = 0,
              py::arg("batch_snapshot_mode") = GraphBatchSnapshotMode::Auto,
-             py::arg("qwen35_dense_27b_sdk_budget") = false)
+             py::arg("qwen35_dense_27b_sdk_budget") = false,
+             py::arg("tts_predictor_group_15") = false)
         .def("prepare_arenas", &prepare_graph_runtime_arenas);
 
     py::class_<GraphSegmentCensus>(m, "GraphSegmentCensus")

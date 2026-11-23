@@ -344,8 +344,11 @@ With `tts_codec_residual_unit_padded_rows`, the 192/96-channel stages also keep
 their three units on device using zero-padded 256/128-channel rows. Pad once at
 stage entry and crop once at exit; each first convolution pads the input channels
 within every kernel position. Older extensions retain the previous CPU boundaries.
-These paths require
-a rebuilt RhinoForge extension, not a changed runtime package.
+With `tts_codec_decoder_stage_rows`, stages 1 and 2 also pass owned FP16 device
+rows directly to the following stage, removing two CPU conversion/upload pairs.
+Stage 3 returns CPU NCT after cropping 256 padded channels to 192; stage 4 keeps
+its existing boundary. This changes transport, not arithmetic or submission count.
+These paths require a rebuilt RhinoForge extension, not a changed runtime package.
 The matching extension also uses `tts_codec_conv1d_spm`, `tts_codec_snake` and
 `tts_codec_convnext_block` for convolution preparation, standalone SnakeBeta,
 and ConvNeXt normalization/GELU/residual arithmetic. CPU still orchestrates eager

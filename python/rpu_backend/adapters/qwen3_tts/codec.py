@@ -305,6 +305,7 @@ def install_rpu_convolutions(decoder, restore, stats):
     stats["transposed_calls"] = 0
     stats["decoder_stages"] = 0
     stats["decoder_stage_calls"] = 0
+    stats["decoder_stage_resident_calls"] = 0
     transpose_parameters = {}
     if device_post or hasattr(torch.ops.rpu, "tts_codec_conv_transpose1d"):
         for module, bias in zip(transposed, transpose_biases):
@@ -450,6 +451,7 @@ def install_rpu_convolutions(decoder, restore, stats):
             stage.forward = types.MethodType(forward, stage)
 
     stage_native = getattr(torch.ops.rpu, "tts_codec_decoder_stage", None)
+    resident_native = getattr(torch.ops.rpu, "tts_codec_decoder_stage_rows", None)
     if (stage_native is not None and complete_residuals and fused_residuals and
             hasattr(torch.ops.rpu, "tts_codec_residual_unit_padded_rows")):
         geometries = ((1, 1536, 768, 16, 8), (2, 768, 384, 10, 5),
@@ -468,16 +470,20 @@ def install_rpu_convolutions(decoder, restore, stats):
             def forward(owner, hidden, snake_affine=snake_affines[snake],
                         transpose_weight=transpose_weight, transpose_bias=transpose_bias,
                         first=first, affine=affine, second=second, channels=channels,
-                        kernel=kernel, stride=stride):
-                output = torch.ops.rpu.tts_codec_decoder_stage(
+                        kernel=kernel, stride=stride, index=index):
+                resident = resident_native is not None and index <= 3
+                native = resident_native if resident else stage_native
+                output = native(
                     hidden,
                     snake_affine, transpose_weight, transpose_bias,
-                    list(first), list(affine), list(second), channels, kernel, stride)
+                    list(first), list(affine), list(second), channels, kernel, stride,
+                    *((index > 1, index < 3) if resident else ()))
                 stats["standalone_snake_calls"] += 1
                 stats["transposed_calls"] += 1
                 stats["calls"] += 6
                 stats["paired_calls"] += 3
                 stats["decoder_stage_calls"] += 1
+                stats["decoder_stage_resident_calls"] += int(resident)
                 return output
 
             restore.append((stage, stage.forward))

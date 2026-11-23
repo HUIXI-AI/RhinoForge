@@ -18,7 +18,7 @@ def test_transpose_device_post_boundary_and_owned_output(tmp_path):
         "Tensor tts_codec_cpu_nct_to_device_rows(", 1)[1].split("Tensor tts_codec_im2col_rows(", 1)[0]
     function = "Tensor rpu_tts_codec_conv_transpose1d_device_post(" + source.split(
         "Tensor rpu_tts_codec_conv_transpose1d_device_post(", 1)[1].split(
-        "Tensor rpu_tts_codec_decoder_stage(", 1)[0]
+        "static Tensor tts_codec_decoder_stage_impl(", 1)[0]
     harness = r'''
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
@@ -78,9 +78,10 @@ int main(){
 
 def test_decoder_stage_has_one_host_boundary_and_three_residuals(tmp_path):
     source = (ROOT / "src/ops/rpu_linear.cpp").read_text()
-    function = "Tensor rpu_tts_codec_decoder_stage(" + source.split(
-        "Tensor rpu_tts_codec_decoder_stage(", 1)[1].split(
+    function = "static Tensor tts_codec_decoder_stage_impl(" + source.split(
+        "static Tensor tts_codec_decoder_stage_impl(", 1)[1].split(
         "Tensor rpu_tts_codec_transpose_overlap(", 1)[0]
+    function = function.replace("at::kPrivateUse1", "at::kCPU")
     harness = r'''
 #include <ATen/ATen.h>
 #include <cassert>
@@ -105,7 +106,7 @@ Tensor rpu_tts_codec_transpose_overlap(const Tensor&x,const c10::optional<Tensor
  int64_t c,int64_t,int64_t s){++overlaps;return at::zeros({(x.size(0)+1)*s,CeilDiv(c,128)*128},x.options());}
 Tensor tts_codec_residual_unit_impl(const Tensor&x,const Tensor&,const Tensor&,const Tensor&,
  int64_t d,int64_t c,bool complete,bool resident,bool padded){
- int step=residuals%3;assert(complete&&resident&&padded&&c==96&&d==(step==0?1:step==1?3:9));
+ int step=residuals%3;assert(complete&&resident&&padded==(c==96||c==192)&&d==(step==0?1:step==1?3:9));
  ++residuals;return x+d;
 }
 '''
@@ -129,6 +130,37 @@ int main(){
  RpuKernelGraph::active=true;rejected=false;
  try{rpu_tts_codec_decoder_stage(x,snake,tw,bias,first,affine,second,96,6,3);}
  catch(const c10::Error&){rejected=true;}assert(rejected&&uploads==before);
+ RpuKernelGraph::active=false;
+ auto input=at::randn({1,1536,2});
+ auto parameters=[](int in,int out,int kernel){
+  int pi=CeilDiv(in,128)*128,po=CeilDiv(out,128)*128;
+  return std::vector<Tensor>{at::ones({2,pi},at::kHalf),at::zeros({kernel*po,in},at::kHalf),at::zeros({po},at::kHalf)};
+ };
+ auto a=parameters(1536,768,16),b=parameters(768,384,10),c=parameters(384,192,8);
+ auto run=[&](Tensor value,const std::vector<Tensor>&p,int channels,int kernel,int stride,bool ri,bool ro){
+  return rpu_tts_codec_decoder_stage_rows(value,p[0],p[1],p[2],first,affine,second,channels,kernel,stride,ri,ro);
+ };
+ int u=uploads,d=downloads;
+ auto rows=run(input,a,768,16,8,false,true);
+ assert(rows.dim()==2&&rows.size(1)==768&&rows.is_contiguous());
+ rows=run(rows,b,384,10,5,true,true);
+ auto final=run(rows,c,192,8,4,true,false);
+ assert(uploads-u==1&&downloads-d==1&&final.size(1)==192);
+ auto held_final=final.clone();
+ auto reference=rpu_tts_codec_decoder_stage(input,a[0],a[1],a[2],first,affine,second,768,16,8);
+ reference=rpu_tts_codec_decoder_stage(reference,b[0],b[1],b[2],first,affine,second,384,10,5);
+ reference=rpu_tts_codec_decoder_stage(reference,c[0],c[1],c[2],first,affine,second,192,8,4);
+ assert(at::equal(final,reference)&&at::equal(final,held_final));
+ int launches=snakes;
+ for(int fault=0;fault<3;++fault){
+  rejected=false;
+  try {
+   if(fault==0)run(input,a,768,16,8,true,true);
+   if(fault==1)run(rows,c,192,8,4,true,true);
+   if(fault==2)run(rows.t(),c,192,8,4,true,false);
+  }catch(const c10::Error&){rejected=true;}
+  assert(rejected&&snakes==launches);
+ }
 }
 '''
     cpp, exe = tmp_path / "stage.cpp", tmp_path / "stage"

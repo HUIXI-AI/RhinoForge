@@ -1210,8 +1210,11 @@ static SegmentResourceBudget segment_resource_budget(
         return sdk_budget;
     }
     // Reduced-core execution uses a conservative per-segment entry budget.
-    const size_t entry_ceiling =
-        runtime_policy.execution_core_count < 8 ? 4096 : 8192;
+    const bool tts_group = runtime_policy.tts_predictor_group_15 &&
+        runtime_policy.execution_core_count == 8 &&
+        graph_label == "qwen3_tts_predictor_group";
+    const size_t entry_ceiling = runtime_policy.execution_core_count < 8
+        ? 4096 : tts_group ? 16384 : 8192;
     return {
         std::max<size_t>(1, std::min(entry_ceiling, sdk_entries / 2)),
         std::max<size_t>(16, std::min<size_t>(4 * kMiB, sdk_kd / 2)),

@@ -108,6 +108,7 @@ class GraphRuntimePolicy:
     graph_arena_count: int = 0
     batch_snapshot_mode: str = "auto"
     qwen35_dense_27b_sdk_budget: bool = False
+    tts_predictor_group_15: bool = False
 
     def __post_init__(self) -> None:
         if self.batch_snapshot_mode not in ("auto", "off"):
@@ -121,6 +122,7 @@ class GraphRuntimePolicy:
             "fmb_deep_fast_replay",
             "qwen35_legacy_27b_sdk_budget",
             "qwen35_dense_27b_sdk_budget",
+            "tts_predictor_group_15",
         ):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"{name} must be bool")
@@ -149,6 +151,11 @@ class GraphRuntimePolicy:
         if self.qwen35_dense_27b_sdk_budget and (
                 self.qwen35_legacy_27b_sdk_budget or self.graph_arena_count != 4):
             raise ValueError("dense 27B requires its four-arena plan and no legacy owner")
+        if self.tts_predictor_group_15 and (
+                self.execution_core_count != 8 or self.graph_arena_count != 6 or
+                self.qwen35_legacy_27b_sdk_budget or self.qwen35_dense_27b_sdk_budget or
+                self.lingbot2_multiview_spm_z2):
+            raise ValueError("TTS Predictor group requires its TP8 six-arena owner")
 
     @classmethod
     def from_environment(
@@ -158,6 +165,7 @@ class GraphRuntimePolicy:
         graph_arena_count: int = 0,
         batch_snapshot_mode: str = "auto",
         qwen35_dense_27b_sdk_budget: bool = False,
+        tts_predictor_group_15: bool = False,
     ) -> "GraphRuntimePolicy":
         if type(qwen35_legacy_27b_sdk_budget) is not bool:
             raise TypeError("qwen35_legacy_27b_sdk_budget override must be bool")
@@ -203,6 +211,7 @@ class GraphRuntimePolicy:
             graph_arena_count=graph_arena_count,
             batch_snapshot_mode=batch_snapshot_mode,
             qwen35_dense_27b_sdk_budget=qwen35_dense_27b_sdk_budget,
+            tts_predictor_group_15=tts_predictor_group_15,
             provenance=(
                 skip_sync_src,
                 force_oneshot_src,
@@ -215,7 +224,8 @@ class GraphRuntimePolicy:
                 f"owner:qwen35_legacy_27b_sdk_budget={int(qwen35_legacy_27b_sdk_budget)}",
             ) + (("owner:execution_core_count",) if execution_core_count != 8 else ())
             + ((f"owner:graph_arena_count={graph_arena_count}",) if graph_arena_count else ())
-            + (("owner:qwen35_dense_27b_sdk_budget=1",) if qwen35_dense_27b_sdk_budget else ()),
+            + (("owner:qwen35_dense_27b_sdk_budget=1",) if qwen35_dense_27b_sdk_budget else ())
+            + (("owner:tts_predictor_group_15=1",) if tts_predictor_group_15 else ()),
         )
 
     def prepare_arenas(self) -> bool:
@@ -246,6 +256,8 @@ class GraphRuntimePolicy:
         }
         if self.qwen35_dense_27b_sdk_budget:
             snapshot_args["qwen35_dense_27b_sdk_budget"] = True
+        if self.tts_predictor_group_15:
+            snapshot_args["tts_predictor_group_15"] = True
         return _cpp_ext.GraphRuntimePolicy(
             self.fast_replay_skip_sync,
             self.force_oneshot_on_replay,

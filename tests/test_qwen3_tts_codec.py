@@ -329,7 +329,8 @@ def test_resident_stage_keeps_three_units_on_device_and_restores(monkeypatch, pa
     assert all(module.forward == forward for module, forward in original.items())
 
 
-def test_decoder_stage_keeps_snake_transpose_and_residuals_on_device(monkeypatch):
+@pytest.mark.parametrize("resident", [False, True])
+def test_decoder_stage_keeps_snake_transpose_and_residuals_on_device(monkeypatch, resident):
     from rpu_backend.runtime import weights
     decoder = _paired_decoder()
     for index, in_channels in enumerate((1536, 768, 384, 192), start=1):
@@ -370,16 +371,32 @@ def test_decoder_stage_keeps_snake_transpose_and_residuals_on_device(monkeypatch
         calls.append((hidden.shape[1], channels, kernel, stride))
         return hidden.new_zeros(1, channels, (hidden.shape[-1] + 1) * stride)
     monkeypatch.setattr(torch.ops.rpu, "tts_codec_decoder_stage", stage, raising=False)
+    def rows(hidden, snake, transpose, bias, first, affine, second,
+             channels, kernel, stride, input_rows, output_rows):
+        assert input_rows == (channels != 768)
+        assert output_rows == (channels != 192)
+        nct = hidden.T.unsqueeze(0).float() if input_rows else hidden
+        output = stage(nct, snake, transpose, bias, first, affine, second,
+                       channels, kernel, stride)
+        return output.squeeze(0).T.contiguous().half() if output_rows else output
+    monkeypatch.setattr(torch.ops.rpu, "tts_codec_decoder_stage_rows",
+                        rows if resident else None, raising=False)
     restore, stats = [], {"calls": 0}
     install_rpu_convolutions(decoder, restore, stats)
+    output = torch.randn(1, 1536, 3)
+    length = 3
     for index, (in_channels, channels, kernel, stride) in enumerate((
             (1536, 768, 16, 8), (768, 384, 10, 5),
             (384, 192, 8, 4), (192, 96, 6, 3)), start=1):
-        output = decoder.decoder[index](torch.randn(1, in_channels, 3))
-        assert output.shape == (1, channels, 4 * stride)
+        output = decoder.decoder[index](output)
+        length = (length + 1) * stride
+        on_device = resident and index < 3
+        assert output.shape == ((length, channels) if on_device else (1, channels, length))
+        assert output.dtype == (torch.float16 if on_device else torch.float32)
     assert calls == [(1536, 768, 16, 8), (768, 384, 10, 5),
                      (384, 192, 8, 4), (192, 96, 6, 3)]
     assert stats["decoder_stage_calls"] == 4
+    assert stats["decoder_stage_resident_calls"] == (3 if resident else 0)
     assert stats["standalone_snake_calls"] == stats["transposed_calls"] == 4
     assert stats["paired_calls"] == 12 and stats["calls"] == 24
 

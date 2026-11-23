@@ -148,3 +148,44 @@ print(json.dumps({
 | RPU 设备忙 | 停止占用 `/dev/rpu` 的其他推理服务，取得平台设备锁后再运行；测试完成后恢复业务服务 |
 
 完整模型准备、输入范围和流式接口见 [Qwen3 ASR / TTS 使用指南](qwen3_audio.zh.md)。
+
+## 5. Predictor 合批与 Codec 驻留优化的物料变更
+
+本节对应代码提交 `4613ffb`，相对于统一两文件资产版本 `295a961`。
+**本轮没有新增或修改设备算子资产；升级需要同时更新 RhinoForge Python 代码与主机扩展。**
+
+| 物料 | 本轮变化 | 升级要求 |
+|---|---|---|
+| RhinoForge Python 代码 | 已修改 Predictor 冷配置及 Codec 阶段接线 | 使用包含 `4613ffb` 的版本 |
+| `rpu_backend.so` 主机扩展 | 已修改 Graph 预算、Predictor 合批和 Codec 驻留封装及注册 | 从匹配源码重新编译，随 Python 代码一起更新 |
+| `tts_sampling_unified.ref` | 未变，仍为 26,392 B | 沿用第 1 节 SHA256 对应文件 |
+| `tts_sampling_tables.bin` | 未变，仍为 22,064 B | 沿用第 1 节 SHA256 对应文件 |
+| runtime v1.2.0、Rhino Launch、主算子库及扩展算子库 | 未变 | 沿用原运行依赖，无需替换 |
+| 驱动、设备 API、固件 | 本轮未修改 | 本轮优化不要求升级这些物料 |
+| 模型权重、准备后的 `qwen_tts` 源码、参考音频 | 未变 | 沿用已验证的输入物料 |
+
+新增的 `tts_codec_decoder_stage_rows` 是 RhinoForge 主机侧调度封装，复用已有设备算子，
+不是需要交付的新 `.ref` 算子。Predictor 的 15 步合批也复用原有采样资产。
+资产仍然只有上述两个文件，两个 SHA256 均未变化。
+
+第 2 节的三个 `RPU_TTS_*` 环境变量保持不变，没有新增必设环境变量。仅替换 Python
+文件或继续加载旧 `rpu_backend.so`，不能完整启用本轮优化。使用匹配源码完成重新构建，
+并从新进程加载完整安装包；不要在构建进行中覆盖源码或混用新旧构建产物。
+
+在导入 `rpu_backend` 后、加载模型前，检查主机扩展注册：
+
+```python
+assert hasattr(torch.ops.rpu, "tts_codec_decoder_stage_rows"), "请更新匹配的 RhinoForge 主机扩展"
+```
+
+按第 3 节完成一次合成、取得 `stats` 后，再确认实际执行路径：
+
+```python
+assert stats["components"]["predictor"]["graph_size"] == 1
+assert stats["components"]["predictor"]["graph_invariant_ok"]
+assert stats["codec_convolutions"].get("decoder_stage_resident_calls", 0) > 0
+```
+
+Predictor 使用一个 15 步 Graph，代替原来的 8 步和 7 步两个 Graph；Codec 前三个阶段
+通过设备张量衔接，减少两处 CPU 往返。驻留调用计数用于证明新路径已执行，不代表硬件
+提交次数；主机扩展注册检查也不能替代实际合成验证。

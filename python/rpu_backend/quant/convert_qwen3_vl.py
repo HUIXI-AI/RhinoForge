@@ -31,20 +31,6 @@ LIGHTNAV_W8_VISION_PROFILE = "lightnav_0_4b_w8a16_text_vision_v1"
 LIGHTNAV_PARITY_PROFILE = "lightnav_0_4b_w8a16_o_proj_0_3_v1"
 LIGHTNAV_ACTIVATION_PROFILE = "lightnav_0_4b_w8a16_text_activation_v1"
 LIGHTNAV_ACTIVATION_VISION_PROFILE = "lightnav_0_4b_w8a16_text_vision_activation_v1"
-LIGHTNAV_ACTIVATION_LOGIT_BIAS = {
-    "152408": 0.0625,
-    "152346": -0.0390625,
-    "151873": 0.03125,
-    "152162": 0.078125,
-    "152115": 0.015625,
-}
-LIGHTNAV_ACTIVATION_VISION_LOGIT_BIAS = {
-    "152376": 0.015625,
-    "152162": 0.0625,
-    "152115": 0.078125,
-    "151941": 0.046875,
-    "151820": 0.09375,
-}
 QUANT_CONFIG = {
     "method": "w8a16",
     "profile": PROFILE,
@@ -129,13 +115,9 @@ def lightnav_activation_quant_config(*, vision: bool = False) -> dict:
         profile=LIGHTNAV_ACTIVATION_VISION_PROFILE if vision else LIGHTNAV_ACTIVATION_PROFILE,
         calibration="activation_second_moment_v1",
         activation_blend=0.25,
-        constrained_logit_bias=(
-            LIGHTNAV_ACTIVATION_VISION_LOGIT_BIAS if vision
-            else LIGHTNAV_ACTIVATION_LOGIT_BIAS
-        ),
     )
     if vision:
-        result["vision_encoder_range_scale"] = 1.0
+        result["vision_encoder_range_scale"] = 1.04
     return result
 
 

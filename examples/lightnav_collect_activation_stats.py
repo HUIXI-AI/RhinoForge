@@ -195,7 +195,8 @@ def load_model_and_processing(checkpoint: Path):
     bundle = _make_bundle(
         model, processor, data_processor, torch.device("cpu"), placeholder_positions, params,
     )
-    return model, data_processor, bundle
+    bundle.slowfast_tiers = None
+    return model, processor, data_processor, bundle
 
 
 def main(argv=None) -> int:
@@ -250,7 +251,7 @@ def main(argv=None) -> int:
     from lightnav.inference.samples import build_tracking_sample
     from safetensors.torch import save_file
 
-    model, data_processor, bundle = load_model_and_processing(checkpoint)
+    model, _, data_processor, bundle = load_model_and_processing(checkpoint)
     frames = load_frames(image_paths, tuple(bundle.video_size))
     moments = ActivationMoments()
     handles = moments.register(model)

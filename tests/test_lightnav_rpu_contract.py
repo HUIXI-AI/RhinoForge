@@ -58,7 +58,9 @@ def test_benchmark_contract_fixes_five_tokens_and_history_set():
     assert BENCHMARK.parse_histories("9") == (9,)
     with pytest.raises(argparse.ArgumentTypeError, match="positive values"):
         BENCHMARK.parse_histories("9,0")
-    assert 'rpu_execution={"prefill": {"fast_replay": True}}' in EXAMPLE_PATH.read_text()
+    source = EXAMPLE_PATH.read_text()
+    assert '"vision": {"linear_acc32": args.vision_acc32}' in source
+    assert '"prefill": {"fast_replay": True}' in source
 
 
 def test_episode_runner_disables_redundant_nine_frame_prefetch(monkeypatch):
@@ -78,13 +80,15 @@ def test_episode_runner_disables_redundant_nine_frame_prefetch(monkeypatch):
             self.clears += 1
 
     graph_cache = GraphCache()
+    bundle = types.SimpleNamespace(slowfast_tiers=[{"mode": "dense"}])
     results = INFERENCE.infer_episode(
-        object(), object(), object(), object(), list(range(12)), "track",
+        object(), object(), object(), bundle, list(range(12)), "track",
         object(), object(), [f"frame-{index}" for index in range(12)],
         history_frames=9, prefill_graph_cache=graph_cache,
     )
 
     assert len(results) == 12
+    assert bundle.slowfast_tiers is None
     assert graph_cache.clears == 10
     assert calls[9:] == [(9, 0, False), (9, 1, False), (9, 2, False)]
 
@@ -204,18 +208,16 @@ def test_benchmark_adds_current_frame_and_only_caches_history():
     assert history_only.get_pooled_segment(current_key) is None
 
 
-def test_prepare_prompt_trims_answer_and_marks_video_tokens():
+def test_prepare_prompt_trims_answer_without_overriding_hf_positions():
     inputs = {
         "input_ids": torch.tensor([7, 151656, 9, 10]),
         "attention_mask": torch.ones(4, dtype=torch.bool),
         "labels": torch.tensor([-100, -100, -100, 10]),
     }
-    input_ids, attention_mask, token_types = BENCHMARK._prepare_prompt(
-        inputs, 151656,
-    )
+    input_ids, attention_mask, token_types = BENCHMARK._prepare_prompt(inputs)
     assert tuple(input_ids.shape) == (1, 3)
     assert attention_mask.all()
-    assert token_types.tolist() == [[0, 2, 0]]
+    assert token_types is None
 
 
 def test_vision_cache_reassembles_repeat_and_sliding_windows(monkeypatch):

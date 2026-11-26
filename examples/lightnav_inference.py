@@ -61,10 +61,13 @@ def load_frames(paths, video_size):
 
 def infer_episode(model, processor, data_processor, bundle, frames, instruction,
                   vision_cache, lm_cache, image_names, history_draft=False,
-                  history_frames=9, prefill_graph_cache=None):
+                  history_frames=9, prefill_graph_cache=None, progress=True):
     """Slide a window of at most history_frames past frames plus the current one."""
     if type(history_frames) is not int or history_frames < 0:
         raise ValueError("history_frames must be a nonnegative integer")
+    if getattr(bundle, "slowfast_tiers", None):
+        # A bounded recent-frame window is a different input policy from SlowFast.
+        bundle.slowfast_tiers = None
     results = []
     draft = None
     for index, name in enumerate(image_names):
@@ -100,12 +103,13 @@ def infer_episode(model, processor, data_processor, bundle, frames, instruction,
         results.append(result)
         if history_draft:
             draft = tokens
-        if "final_instruction" in row:
+        if progress and "final_instruction" in row:
             print(f"Final instruction for frame {index}:\n{row['final_instruction']}", flush=True)
-        print(
-            f"[{index + 1}/{len(image_names)}] {name}: {tokens} "
-            f"({frame_total_ms:.1f} ms)", flush=True,
-        )
+        if progress:
+            print(
+                f"[{index + 1}/{len(image_names)}] {name}: {tokens} "
+                f"({frame_total_ms:.1f} ms)", flush=True,
+            )
     return results
 
 
@@ -123,6 +127,7 @@ def main(argv=None) -> int:
     parser.add_argument("--check-config", action="store_true", help="validate paths without loading Torch/RPU")
     parser.add_argument("--constrained-head", action="store_true", help="use the action-token allowlist")
     parser.add_argument("--history-draft", action="store_true", help="verify the previous output as a draft")
+    parser.add_argument("--vision-acc32", action="store_true", help="use FP32 accumulation in Vision linear layers")
     args = parser.parse_args(argv)
     if args.history_frames < 0:
         parser.error("--history-frames must be nonnegative")
@@ -184,7 +189,10 @@ def main(argv=None) -> int:
     frames = load_frames(paths, tuple(bundle.video_size))
     model = RPUModelForConditionalGeneration.from_pretrained(
         checkpoint, dtype=torch.float16, device="rpu",
-        rpu_execution={"prefill": {"fast_replay": True}},
+        rpu_execution={
+            "prefill": {"fast_replay": True},
+            "vision": {"linear_acc32": args.vision_acc32},
+        },
         local_files_only=True, trust_remote_code=False,
     )
     try:

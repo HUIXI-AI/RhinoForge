@@ -31,8 +31,8 @@
 当前请求执行完整 Prefill；Graph 复用只减少建图和内核调度开销，不复用上一请求的文本
 结果。
 
-Text W8 使用输入激活二阶矩校准，Vision W8 使用 1.0 编码器范围。五位置动作语法
-head 使用随 checkpoint 固化的校准参数，输出仍为标准的 5 个动作 token。
+Text W8 使用输入激活二阶矩校准，Vision W8 使用 1.04 编码器范围。五位置动作语法
+head 不使用固定 token bias，输出仍为标准的 5 个动作 token。
 
 ## 环境准备
 
@@ -76,6 +76,21 @@ python examples/lightnav_collect_activation_stats.py \
 `--teacher-output` 必须是同一图片序列的 FP16 推理结果，每个指定帧必须恰好有 5 个
 token。统计文件是外部模型资产，仓库的 `*.safetensors` 规则会忽略它；不要强制加入 Git。
 
+若输入是客户 PTQ 数据目录（每个子目录包含连续的 `image_*.jpg` 或 `image_*.png`，以及 `action.json`），
+直接使用原模型记录的 5 个动作 token 采集全部 episode：
+
+```bash
+python examples/lightnav_collect_ptq_activation_stats.py \
+  --input-root /path/to/hx_ptq_data \
+  --checkpoint /path/to/LightNav-0 \
+  --lightnav-source /path/to/LightNav-0-source \
+  --output /outside/the/repository/lightnav_activation_moments.safetensors
+```
+
+脚本固定采用 9 帧历史加 1 帧当前画面的口径，每个 episode 选取中间帧作为一条校准
+样本；若中间帧前不足 9 帧，则使用当时已有的全部历史。统计文件仍是外部模型资产，
+不提交到 Git。
+
 从原始 FP16 checkpoint 生成全 Text W8 + Vision W8 配置：
 
 ```bash
@@ -115,6 +130,26 @@ python examples/lightnav_inference.py \
 
 `--constrained-head` 对应 LightNav 五位置动作语法，也是下表性能的测试条件。若应用使用
 完整词表解码，必须单独验证输出和性能。
+
+## 客户 PTQ 数据离线评测
+
+下面的命令对每个 episode 从第一帧开始运行真实滑窗，并逐帧比较 `action.json` 中原始
+LightNav-0 的 5 个动作 token：
+
+```bash
+python examples/lightnav_ptq_evaluate.py \
+  --input-root /path/to/hx_ptq_data \
+  --checkpoint /path/to/LightNav-0-activation-vision-w8a16 \
+  --lightnav-source /path/to/LightNav-0-source \
+  --output /outside/the/repository/ptq_evaluation.json
+```
+
+报告同时给出逐位置 token 一致率、稳态视觉缓存命中/缺失分布，以及准备、Vision、
+Prefill、Decode 5 token、整帧耗时的中位数、平均值和 P95。前 9 帧按已有历史逐步增长；稳定态从零基
+`frame_index=10`（第 11 张图）开始，排除 `frame_index=9` 首次完整窗口的 Graph
+构建。4 Hz 的离线性能门槛是稳定态平均整帧耗时不超过
+250 ms。原模型闭环成功率为 91%，允许掉点 8 个百分点时，量化模型闭环成功率门槛为
+83%；离线 token 一致率不能替代闭环仿真结果。
 
 ## 性能
 

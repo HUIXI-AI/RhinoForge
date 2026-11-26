@@ -35,8 +35,8 @@ kernel-dispatch overhead; it does not reuse text results from the previous
 request.
 
 Text W8 uses input-activation second moments, and Vision W8 uses an encoder
-range scale of 1.0. The five-position grammar head uses calibration parameters
-stored in the checkpoint and still returns the standard five action tokens.
+range scale of 1.04. The five-position grammar head has no fixed token bias and
+still returns the standard five action tokens.
 
 ## Environment
 
@@ -88,6 +88,23 @@ with exactly five tokens for every selected frame. The statistics file is an
 external model asset covered by the repository's `*.safetensors` ignore rule;
 do not force-add it to Git.
 
+For the customer PTQ directory (each child contains contiguous `image_*.jpg`
+or `image_*.png` files and `action.json`), collect all episodes directly from the five original
+model action tokens:
+
+```bash
+python examples/lightnav_collect_ptq_activation_stats.py \
+  --input-root /path/to/hx_ptq_data \
+  --checkpoint /path/to/LightNav-0 \
+  --lightnav-source /path/to/LightNav-0-source \
+  --output /outside/the/repository/lightnav_activation_moments.safetensors
+```
+
+The script fixes the input contract at nine history frames plus the current
+frame and selects the middle frame of each episode as one calibration sample.
+If fewer than nine prior frames exist, it uses all available history. The
+statistics remain an external model asset and must not be committed to Git.
+
 Create the full Text-W8 + Vision-W8 checkpoint from the original FP16 checkpoint:
 
 ```bash
@@ -133,6 +150,31 @@ resizing of all images.
 `--constrained-head` selects the LightNav five-position action grammar and is a
 condition of the performance result below. Applications that use full-vocabulary
 decoding must validate output and performance separately.
+
+## Evaluate customer PTQ episodes
+
+The following command runs the real sliding window from the first frame of
+every episode and compares all five generated action tokens with the original
+LightNav-0 tokens in `action.json`:
+
+```bash
+python examples/lightnav_ptq_evaluate.py \
+  --input-root /path/to/hx_ptq_data \
+  --checkpoint /path/to/LightNav-0-activation-vision-w8a16 \
+  --lightnav-source /path/to/LightNav-0-source \
+  --output /outside/the/repository/ptq_evaluation.json
+```
+
+The report includes per-position token agreement, steady Vision-cache hit/miss
+patterns, and median, mean, and P95 timings for Prepare, Vision, Prefill,
+Decode 5, and the complete frame. The
+first nine frames grow the available history. Steady timing starts at zero-based
+`frame_index=10` (the eleventh image), after excluding the first full-window
+Graph build at `frame_index=9`. The offline 4 Hz
+gate is a steady mean frame time no greater than 250 ms. With a 91% original
+closed-loop success rate and an allowed drop of eight percentage points, the
+quantized model must reach at least 83% in closed-loop simulation. Offline token
+agreement does not replace that closed-loop result.
 
 ## Performance
 

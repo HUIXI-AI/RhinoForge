@@ -116,9 +116,7 @@ def _pool_one_tubelet(entry, unit, factor, merge_size, pool):
     )
 
 
-def _prepare_prompt(inputs: dict[str, Any], video_token_id: int):
-    import torch
-
+def _prepare_prompt(inputs: dict[str, Any]):
     labels = inputs["labels"]
     answer = (labels != -100).nonzero(as_tuple=False)
     if answer.numel() == 0:
@@ -126,9 +124,7 @@ def _prepare_prompt(inputs: dict[str, Any], video_token_id: int):
     answer_start = int(answer[0].item())
     input_ids = inputs["input_ids"][:answer_start].unsqueeze(0)
     attention_mask = inputs["attention_mask"][:answer_start].unsqueeze(0)
-    mm_token_type_ids = torch.zeros_like(input_ids)
-    mm_token_type_ids[input_ids == video_token_id] = 2
-    return input_ids, attention_mask, mm_token_type_ids
+    return input_ids, attention_mask, None
 
 
 def _cache_vision(
@@ -356,10 +352,10 @@ def _generate_five(
         ).unsqueeze(0)
         verify_ids = torch.cat((input_ids, draft_prefix), dim=1)
         verify_prefill = dict(prefill)
-        for key, value in (
-            ("attention_mask", 1), ("mm_token_type_ids", 0),
-        ):
+        for key, value in (("attention_mask", 1), ("mm_token_type_ids", 0)):
             current = verify_prefill[key]
+            if current is None:
+                continue
             suffix = current.new_full((current.shape[0], OUTPUT_TOKENS - 1), value)
             verify_prefill[key] = torch.cat((current, suffix), dim=1)
         cache.reset_to_position(0)
@@ -502,9 +498,7 @@ def _run_request(
         prefetch_latest=prefetch_latest,
     )
     vision_ms = (time.perf_counter() - vision_started) * 1000
-    input_ids, attention_mask, mm_token_type_ids = _prepare_prompt(
-        inputs, model.config.video_token_id,
-    )
+    input_ids, attention_mask, mm_token_type_ids = _prepare_prompt(inputs)
     if input_ids.shape[1] > MAX_PREFILL_TOKENS:
         raise RuntimeError(
             f"LightNav prompt has {input_ids.shape[1]} tokens; "
@@ -631,6 +625,11 @@ def main() -> int:
         action="store_true",
         help="verify the previous request's five tokens in one prefill",
     )
+    parser.add_argument(
+        "--vision-acc32",
+        action="store_true",
+        help="use FP32 accumulation in Vision linear layers",
+    )
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats must be positive")
@@ -682,7 +681,10 @@ def main() -> int:
         checkpoint,
         dtype=torch.float16,
         device="rpu",
-        rpu_execution={"prefill": {"fast_replay": True}},
+        rpu_execution={
+            "prefill": {"fast_replay": True},
+            "vision": {"linear_acc32": args.vision_acc32},
+        },
         local_files_only=True,
         trust_remote_code=False,
     )

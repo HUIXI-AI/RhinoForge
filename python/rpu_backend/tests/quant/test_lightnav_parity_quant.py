@@ -3,9 +3,7 @@ from types import SimpleNamespace
 import torch
 
 from rpu_backend.quant.convert_qwen3_vl import (
-    LIGHTNAV_ACTIVATION_LOGIT_BIAS,
     LIGHTNAV_ACTIVATION_PROFILE,
-    LIGHTNAV_ACTIVATION_VISION_LOGIT_BIAS,
     LIGHTNAV_ACTIVATION_VISION_PROFILE,
     LIGHTNAV_PARITY_PROFILE,
     is_lightnav_parity_weight,
@@ -60,20 +58,24 @@ def test_lightnav_activation_profile_keeps_full_w8_fast_path_contract():
     assert config["profile"] == LIGHTNAV_ACTIVATION_PROFILE
     assert config["vision_quantization"] == "fp16"
     assert config["activation_blend"] == 0.25
-    assert config["constrained_logit_bias"] == LIGHTNAV_ACTIVATION_LOGIT_BIAS
+    assert "constrained_logit_bias" not in config
 
     vision_config = lightnav_activation_quant_config(vision=True)
     assert vision_config["profile"] == LIGHTNAV_ACTIVATION_VISION_PROFILE
     assert vision_config["vision_quantization"] == "per_channel_on_install"
-    assert vision_config["vision_encoder_range_scale"] == 1.0
-    assert vision_config["constrained_logit_bias"] == LIGHTNAV_ACTIVATION_VISION_LOGIT_BIAS
+    assert vision_config["vision_encoder_range_scale"] == 1.04
+    assert "constrained_logit_bias" not in vision_config
 
 
 def test_lightnav_activation_biases_are_position_aligned():
     from rpu_backend.adapters.qwen3_vl import _lightnav_position_logit_biases
 
     biases = _lightnav_position_logit_biases(SimpleNamespace(
-        quant_config=lightnav_activation_quant_config(),
+        quant_config={"constrained_logit_bias": {
+            "151873": 0.03125,
+            "152162": 0.078125,
+            "152346": -0.0390625,
+        }},
     ))
     assert len(biases) == 5
     assert biases[2][151873 - 151675 + 2].item() == 0.03125
